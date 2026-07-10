@@ -1,0 +1,26 @@
+# Generated VM artifacts (templates, overlays, seeds, downloaded images)
+.var/
+
+# Local notes/runbooks
+notes/
+
+# Built apptainer images
+demo/*.sif
+
+# Generated ansible inventory
+infra/ansible/inventory/hosts.ini
+
+# Nix
+result
+result-*
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code local session state
+.claude/scheduled_tasks.lock
