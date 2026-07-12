@@ -1,0 +1,33 @@
+---
+# Stage the cluster's own SSH key onto every node so ANY claimed node can act
+# as the mpirun head for its job (the reconciler picks nodes[0] per job, not a
+# fixed rank-0) and reach the other claimed nodes without a host-key prompt.
+# The key itself never leaves the control host's filesystem except via this
+# controller-initiated copy — same key already used for control-host->VM ssh.
+- name: Ensure .ssh directory exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.ssh"
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: "0700"
+
+- name: Stage cluster private key
+  ansible.builtin.copy:
+    src: "{{ cluster_privkey_path }}"
+    dest: "/home/{{ ansible_user }}/.ssh/id_cluster"
+    owner: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Trust intra-cluster hosts without a known_hosts prompt
+  ansible.builtin.blockinfile:
+    path: "/home/{{ ansible_user }}/.ssh/config"
+    create: true
+    owner: "{{ ansible_user }}"
+    mode: "0600"
+    marker: "# {mark} ANSIBLE MANAGED — intra-cluster fabric"
+    block: |
+      Host {{ (cluster_net_cidr | default('192.168.71.0/24')).split('/')[0].rsplit('.', 1)[0] }}.*
+        User {{ ansible_user }}
+        IdentityFile ~/.ssh/id_cluster
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null

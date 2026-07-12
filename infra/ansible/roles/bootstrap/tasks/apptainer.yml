@@ -1,0 +1,18 @@
+---
+# Apptainer runtime for VM nodes (the primary runtime the cluster is moving to).
+# Rootless, HPC-native, and the same `apptainer exec` path the host GPU node uses.
+# Ubuntu's own archive does NOT package `apptainer` — universe only has the
+# unrelated `singularity-container` fork under a different binary name — so we
+# install the upstream project's own pinned, checksummed .deb release directly.
+# apt-based (deps resolved via apt, not raw dpkg), no third-party PPA trust.
+- name: Download apptainer .deb release
+  ansible.builtin.get_url:
+    url: "https://github.com/apptainer/apptainer/releases/download/v{{ cluster_apptainer_version }}/apptainer_{{ cluster_apptainer_version }}_amd64.deb"
+    dest: "/tmp/apptainer_{{ cluster_apptainer_version }}_amd64.deb"
+    checksum: "sha256:{{ cluster_apptainer_deb_sha256 }}"
+  when: ansible_facts['distribution'] == "Ubuntu"
+
+- name: Install apptainer (pinned .deb, deps resolved via apt)
+  ansible.builtin.apt:
+    deb: "/tmp/apptainer_{{ cluster_apptainer_version }}_amd64.deb"
+  when: ansible_facts['distribution'] == "Ubuntu"

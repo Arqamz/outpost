@@ -1,0 +1,45 @@
+---
+# ── bootstrap defaults ────────────────────────────────────────────────
+# Every capability is variable-driven so the SAME role serves any host.
+# These defaults are safe for local VMs: nothing GPU-specific, nothing pulled.
+
+# 1) GPU driver check — skippable (these VMs have no GPU).
+cluster_skip_driver_check: true
+cluster_min_driver_version: "550"        # asserted only when the check runs
+
+# 2) Container runtime. Apptainer is the primary (rootless, HPC-native, same
+#    `apptainer exec` path as the host GPU node); Docker kept optional.
+cluster_runtime: apptainer               # apptainer | docker (what jobs run under)
+cluster_install_apptainer: true
+# Pinned to the same version the nix dev shell puts on the host, so SIF/ABI
+# behavior matches between host GPU node and VM nodes. Bump both together.
+cluster_apptainer_version: "1.5.0"
+cluster_apptainer_deb_sha256: "fbc27204d0ec0440dfa0ae589089e4b2baf192315b4ac22dfae02b78b28981ea"
+cluster_install_docker: false
+cluster_install_container_toolkit: false # NVIDIA container toolkit — off (no GPU in VMs)
+
+# 3) MPI + fabric plugin (variable-driven).
+cluster_install_mpi: true
+cluster_mpi_packages:                    # apt names (Ubuntu/Debian parity)
+  - openmpi-bin
+  - libopenmpi-dev
+  - gcc                              # mpicc needs a C backend compiler
+cluster_fabric: tcp                      # tcp | efa | ib  (tcp today; others not wired up yet)
+
+# Intra-cluster SSH key staging — lets any claimed node act as the mpirun head
+# for its job. Same key already used for control-host->VM ssh (CLUSTER_SSH_PRIVKEY).
+cluster_stage_cluster_key: true
+cluster_privkey_path: "{{ lookup('env', 'CLUSTER_SSH_PRIVKEY') | default(lookup('env', 'HOME') + '/.ssh/outpost-cluster-ssh', true) }}"
+
+# 4) Runner image pull — DISABLED by default. Set both to enable once you
+#    provide the image reference; until then this role pulls nothing.
+cluster_pull_runner_image: false
+cluster_runner_image: ""
+
+# 5) MPI hostfile assembly.
+cluster_config_dir: /etc/cluster
+cluster_hostfile_path: "{{ cluster_config_dir }}/hostfile"
+cluster_slots_per_node: "{{ ansible_facts['processor_vcpus'] | default(2) }}"
+
+# 6) Health check gate.
+cluster_healthcheck_enabled: true

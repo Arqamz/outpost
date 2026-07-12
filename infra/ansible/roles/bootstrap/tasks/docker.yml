@@ -1,0 +1,29 @@
+---
+# Container runtime, kept optional alongside apptainer. apt-based so this
+# file would be identical on any other apt-based host.
+- name: Install Docker engine
+  ansible.builtin.apt:
+    name: [docker.io]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure Docker is running + enabled
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Add provisioning user to docker group
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: true
+
+# NVIDIA container toolkit — only relevant for a GPU-capable host running
+# docker (cluster_install_container_toolkit). Left as a clearly-marked no-op
+# here; wire it in when there's an actual docker+GPU node to support.
+- name: NVIDIA container toolkit (GPU hosts only)
+  ansible.builtin.debug:
+    msg: "container toolkit install not implemented yet; skipped"
+  when: cluster_install_container_toolkit | bool

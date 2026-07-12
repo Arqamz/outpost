@@ -1,0 +1,31 @@
+---
+# MPI runtime + fabric transport selection. Plain TCP is the only fabric wired
+# up today; EFA/IB are named as options below but not implemented yet.
+- name: Install MPI packages
+  ansible.builtin.apt:
+    name: "{{ cluster_mpi_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Select fabric transport
+  ansible.builtin.debug:
+    msg: >-
+      fabric='{{ cluster_fabric }}'
+      {{ 'TCP over the libvirt NAT net (no plugin needed)' if cluster_fabric == 'tcp'
+         else 'EFA/IB plugin install not implemented yet' }}
+
+- name: Ensure config dir exists
+  ansible.builtin.file:
+    path: "{{ cluster_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Persist fabric selection for the runner
+  ansible.builtin.copy:
+    dest: "{{ cluster_config_dir }}/fabric.env"
+    mode: "0644"
+    content: |
+      CLUSTER_FABRIC={{ cluster_fabric }}
+      OMPI_MCA_btl_tcp_if_include={{ (cluster_net_cidr | default('192.168.71.0/24')) }}
+  # Only meaningful for TCP today; harmless placeholder for other transports.

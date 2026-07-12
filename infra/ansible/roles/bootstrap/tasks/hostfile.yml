@@ -1,0 +1,15 @@
+---
+# Assemble the MPI hostfile from the live inventory. This writes one
+# cluster-wide file; real jobs get a fresh per-job hostfile built by the
+# reconciler instead (see docs/02-infrastructure.md) — this one is vestigial.
+- name: Ensure config dir
+  ansible.builtin.file:
+    path: "{{ cluster_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Write MPI hostfile
+  ansible.builtin.template:
+    src: hostfile.j2
+    dest: "{{ cluster_hostfile_path }}"
+    mode: "0644"

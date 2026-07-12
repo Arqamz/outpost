@@ -1,0 +1,28 @@
+---
+# The one bootstrap entrypoint. Today it runs against libvirt VMs; the same
+# play would run unchanged against any other apt-based host.
+- name: Cluster node bootstrap
+  hosts: nodes
+  become: true
+  gather_facts: true
+  pre_tasks:
+    # cloud-init's own first-boot package_update/install (qemu-guest-agent,
+    # python3) races the role's apt tasks for /var/lib/apt/lists/lock — SSH
+    # comes up well before that finishes. Block here instead of failing there.
+    - name: Wait for cloud-init first-boot to finish (apt lock)
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    # Every node here is a genuinely fresh VM (this repo tears down + rebuilds
+    # from scratch per job — see docs), so root's ~/.ansible/tmp never already
+    # exists. Left alone, ansible auto-vivifies it on first `become` use and
+    # warns every single time ("created with a mode of 0700 ..."). Creating it
+    # explicitly up front means that path is never hit.
+    - name: Ensure ansible's become (root) remote_tmp exists ahead of time
+      ansible.builtin.file:
+        path: /root/.ansible/tmp
+        state: directory
+        mode: "0700"
+  roles:
+    - bootstrap

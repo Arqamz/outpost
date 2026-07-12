@@ -1,0 +1,17 @@
+---
+# GPU driver presence/version gate. Skipped by default (cluster_skip_driver_check)
+# since these VMs have no GPU. Enable on a host where a missing/old driver
+# should fail the bootstrap loudly rather than silently producing junk output.
+- name: Check nvidia-smi is present
+  ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: cluster_driver
+  changed_when: false
+  failed_when: cluster_driver.rc != 0
+
+- name: Assert driver meets minimum
+  ansible.builtin.assert:
+    that:
+      - cluster_driver.stdout | length > 0
+      - (cluster_driver.stdout.split('.')[0] | int) >= (cluster_min_driver_version | int)
+    fail_msg: "driver {{ cluster_driver.stdout }} < required {{ cluster_min_driver_version }}"
+    success_msg: "driver {{ cluster_driver.stdout }} OK"

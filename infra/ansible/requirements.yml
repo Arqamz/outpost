@@ -1,0 +1,7 @@
+---
+# Galaxy collections the role depends on. Install with:
+#   ansible-galaxy collection install -r infra/ansible/requirements.yml
+# community.docker is only exercised when the runner-image pull is enabled.
+collections:
+  - name: community.docker
+    version: ">=3.4.0"

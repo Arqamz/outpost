@@ -1,0 +1,4 @@
+{# MPI hostfile — one line per live node with its slot count. #}
+{% for host in groups['nodes'] %}
+{{ hostvars[host]['ansible_host'] }} slots={{ cluster_slots_per_node }}
+{% endfor %}

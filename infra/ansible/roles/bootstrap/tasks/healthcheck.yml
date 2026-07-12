@@ -1,0 +1,36 @@
+---
+# Bootstrap health gate. Fails the play if a node came up wrong, so the
+# reconciler sees a clean bootstrap failure instead of a half-configured node.
+- name: Apptainer responds
+  ansible.builtin.command: apptainer --version
+  register: cluster_apptainer
+  changed_when: false
+  when: cluster_install_apptainer | bool
+
+- name: Docker daemon responds
+  ansible.builtin.command: docker info --format '{{ "{{" }}.ServerVersion{{ "}}" }}'
+  register: cluster_docker_info
+  changed_when: false
+  when: cluster_install_docker | bool
+
+- name: mpirun present
+  ansible.builtin.command: which mpirun
+  register: cluster_mpirun
+  changed_when: false
+  failed_when: cluster_mpirun.rc != 0
+  when: cluster_install_mpi | bool
+
+- name: Hostfile exists and is non-empty
+  ansible.builtin.stat:
+    path: "{{ cluster_hostfile_path }}"
+  register: cluster_hostfile_stat
+
+- name: Assert bootstrap health
+  ansible.builtin.assert:
+    that:
+      - cluster_hostfile_stat.stat.exists and cluster_hostfile_stat.stat.size > 0
+      - (not cluster_install_apptainer | bool) or cluster_apptainer.rc == 0
+      - (not cluster_install_docker | bool) or cluster_docker_info.rc == 0
+      - (not cluster_install_mpi | bool) or cluster_mpirun.rc == 0
+    success_msg: "node healthy (runtime + mpi + hostfile)"
+    fail_msg: "bootstrap health check failed on {{ inventory_hostname }}"

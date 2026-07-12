@@ -1,0 +1,14 @@
+---
+# Cluster-wide overrides for the bootstrap role. Override any of these per
+# host/fabric later (e.g. cluster_fabric: efa) — the role body doesn't change.
+
+# No GPU inside the VMs -> driver check is skipped by default.
+cluster_skip_driver_check: true
+
+# Fabric is plain TCP for now; other fabrics (EFA/IB/whatever) can be added
+# to the bootstrap role's mpi-fabric task when there's a reason to.
+cluster_fabric: tcp
+
+# The runner image is provided by you later; nothing is pulled until then.
+cluster_pull_runner_image: false
+cluster_runner_image: ""

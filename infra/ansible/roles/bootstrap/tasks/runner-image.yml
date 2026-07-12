@@ -1,0 +1,16 @@
+---
+# Pull the job's runner image. GUARDED OFF by default — this file only runs when
+# you have provided cluster_runner_image AND set cluster_pull_runner_image=true.
+# Until then nothing is pulled.
+- name: Pull runner image
+  community.docker.docker_image:
+    name: "{{ cluster_runner_image }}"
+    source: pull
+  register: cluster_runner_pull
+
+- name: Record runner image reference
+  ansible.builtin.copy:
+    dest: "{{ cluster_config_dir }}/runner.env"
+    mode: "0644"
+    content: |
+      CLUSTER_RUNNER_IMAGE={{ cluster_runner_image }}

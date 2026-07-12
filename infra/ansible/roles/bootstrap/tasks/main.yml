@@ -1,0 +1,43 @@
+---
+# Orchestrates the bootstrap capabilities in dependency order. Each block is a
+# separate file and each is individually gated, so a tier enables only what it
+# needs by flipping variables — the role body never changes between tiers.
+
+- name: Driver check
+  ansible.builtin.import_tasks: driver-check.yml
+  when: not cluster_skip_driver_check | bool
+  tags: [driver]
+
+- name: Container runtime — Apptainer (primary)
+  ansible.builtin.import_tasks: apptainer.yml
+  when: cluster_install_apptainer | bool
+  tags: [apptainer, runtime]
+
+- name: Container runtime — Docker (optional)
+  ansible.builtin.import_tasks: docker.yml
+  when: cluster_install_docker | bool
+  tags: [docker, runtime]
+
+- name: MPI + fabric plugin
+  ansible.builtin.import_tasks: mpi-fabric.yml
+  when: cluster_install_mpi | bool
+  tags: [mpi]
+
+- name: Intra-cluster SSH key staging (any claimed node can be the mpirun head)
+  ansible.builtin.import_tasks: ssh-fabric.yml
+  when: cluster_stage_cluster_key | bool and cluster_install_mpi | bool
+  tags: [ssh, mpi]
+
+- name: Runner image pull
+  ansible.builtin.import_tasks: runner-image.yml
+  when: cluster_pull_runner_image | bool and cluster_runner_image | length > 0
+  tags: [runner]
+
+- name: Hostfile assembly
+  ansible.builtin.import_tasks: hostfile.yml
+  tags: [hostfile]
+
+- name: Health check
+  ansible.builtin.import_tasks: healthcheck.yml
+  when: cluster_healthcheck_enabled | bool
+  tags: [health]
