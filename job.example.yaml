@@ -1,0 +1,31 @@
+# Example JobSpec — the intake half of the cluster's open interface.
+# Submit with:  cluster submit --spec job.example.yaml
+#
+# This default is a DRY-RUN: no `image`, so the run phase does nothing real and
+# nothing is pulled. It exercises the full control-plane pipeline end to end.
+
+name: control-plane-smoke
+node_count: 4              # exclusive-locks 4 CPU nodes (VMs) from the registry
+gpu: false                 # false -> lands on VMs; true -> lands on the host GPU node
+# image: ""                # empty -> dry-run marker
+
+# ── To run a REAL container, set image + command. The cluster runs ANY image
+#    and returns whatever it writes to output_dir. Examples (do not pull yet):
+#
+# A CPU job on the VMs (apptainer runs a docker ref or a .sif):
+#   image: "docker://alpine:3.20"
+#   command: ["sh", "-c", "echo hello > /out/result.txt"]
+#   output_dir: "/out"
+#
+# A GPU job on the host node (gpu: true routes it to cluster-host, apptainer --nv):
+#   name: gpu-smoke
+#   gpu: true
+#   node_count: 1          # only one GPU node exists (the host)
+#   runtime: apptainer
+#   image: "/path/to/your-image.sif"
+#   command: ["python", "run.py", "--out", "/out"]
+#   env: { CUDA_VISIBLE_DEVICES: "0" }
+#   output_dir: "/out"
+
+params:
+  note: "control-plane exercise only; no container is pulled or run"

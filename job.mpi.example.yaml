@@ -1,0 +1,20 @@
+# Example multi-node MPI JobSpec — same open interface as job.example.yaml,
+# just with launcher: mpi. The reconciler claims `node_count` VMs, builds a
+# per-job hostfile from exactly those nodes, stages the image onto each of
+# them, and launches mpirun from the head (nodes[0]) — one rank per node.
+#
+# Build the image first:      make mpi-sif
+# Submit:                     bin/cluster submit --spec job.mpi.example.yaml
+# (or: make submit-mpi)
+
+name: mpi-allreduce-smoke
+launcher: mpi              # single (default) | mpi
+node_count: 4               # -> 4 ranks, one per claimed VM
+gpu: false
+runtime: apptainer
+image: "demo/mpi_demo.sif"  # build with `make mpi-sif`
+command: ["/opt/mpi_demo"]
+output_dir: "/out"
+
+params:
+  note: "containerized multi-node MPI Allreduce smoke, launched through the reconciler"

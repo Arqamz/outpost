@@ -1,0 +1,18 @@
+# Example GPU JobSpec — same open interface, routed to the host GPU node.
+# gpu: true means the ONLY node that can satisfy it is cluster-host (the physical
+# machine's RTX card, registered as node_count=1 GPU capacity); it never
+# touches the VM pool, so it's unaffected by CPU-job contention.
+#
+# Submit with:  bin/cluster submit --spec job.gpu.example.yaml
+
+name: gpu-nvidia-smi-test
+gpu: true
+node_count: 1              # only one GPU node exists (the host) — anything >1 fails cleanly (NoCapacity)
+runtime: apptainer
+image: "docker://nvidia/cuda:12.6.3-base-ubuntu24.04"
+command: ["sh", "-c", "nvidia-smi | tee /out/nvidia-smi.txt"]
+output_dir: "/out"
+env: {}
+
+params:
+  note: "real GPU container run via apptainer --nv on cluster-host, through the reconciler"

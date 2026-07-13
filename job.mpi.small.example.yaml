@@ -1,0 +1,17 @@
+# Same as job.mpi.example.yaml but node_count: 2 — sized to demonstrate the
+# scheduler's wait-and-retry behavior when submitted alongside two node_count:4
+# jobs on an 8-VM pool (0 free until one of them tears down and releases 4).
+#
+# Submit with: bin/cluster submit --spec job.mpi.small.example.yaml
+
+name: mpi-allreduce-smoke-small
+launcher: mpi
+node_count: 2
+gpu: false
+runtime: apptainer
+image: "demo/mpi_demo.sif"
+command: ["/opt/mpi_demo"]
+output_dir: "/out"
+
+params:
+  note: "deliberately small node_count to demo capacity contention + wait-and-retry scheduling"
