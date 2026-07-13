@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Thin launcher so `cluster ...` works from anywhere inside the nix shell.
+set -euo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+export CLUSTER_ROOT="${here}"
+cd "${here}"
+exec python3 -m reconciler "$@"
