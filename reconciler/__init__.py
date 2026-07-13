@@ -10,4 +10,4 @@ Execution is dry-run by default (no VMs touched); pass --execute to wire the
 libvirt adapter + ansible in for real.
 """
 
-__all__ = ["states", "models", "store", "audit", "registry", "adapter", "reconciler"]
+__all__ = ["states", "models", "store", "audit", "registry", "adapter", "reconciler", "cli"]
