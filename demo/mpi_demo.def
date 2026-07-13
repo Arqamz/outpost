@@ -1,0 +1,22 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# Containerized version of the bare-metal mpi_demo (run-mpi-demo.sh / mpi_demo.c).
+# Built FROM the same Ubuntu release the VMs run, apt-installing the same
+# openmpi-bin package the bootstrap role installs on the host — the hybrid
+# launch (host mpirun -> `apptainer exec` per rank) needs the container's
+# libmpi to match the host orted's wire protocol.
+
+%files
+    demo/mpi_demo.c /opt/mpi_demo.c
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev gcc
+    mpicc -O3 -o /opt/mpi_demo /opt/mpi_demo.c
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%runscript
+    exec /opt/mpi_demo "$@"
