@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Outpost</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#141a24; --panel2:#1b2430; --line:#243040;
+    --txt:#e6edf3; --dim:#8b98a9; --accent:#4aa3ff;
+    --ok:#3fb950; --warn:#d29922; --hot:#f85149; --gpu:#a371f7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       background:var(--bg);color:var(--txt);padding:24px}
+  header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:18px;margin:0;letter-spacing:.3px}
+  .sub{color:var(--dim);font-size:13px}
+  .live{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .dot.off{background:var(--hot);box-shadow:0 0 8px var(--hot)}
+  .summary{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:18px;color:var(--dim);font-size:13px}
+  .summary b{color:var(--txt);font-variant-numeric:tabular-nums}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card.host{background:linear-gradient(180deg,var(--panel2),var(--panel));border-color:#33405260}
+  .card h2{font-size:14px;margin:0 0 2px;display:flex;align-items:center;gap:8px}
+  .badge{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:999px;
+         background:#26313f;color:var(--dim);font-weight:600}
+  .badge.gpu{background:#2a2140;color:var(--gpu)}
+  .meta{color:var(--dim);font-size:12px;margin-bottom:12px}
+  .metric{margin:10px 0}
+  .metric .row{display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px}
+  .metric .row .lbl{color:var(--dim)}
+  .metric .row .val{font-variant-numeric:tabular-nums}
+  .bar{height:8px;border-radius:6px;background:#0e141c;overflow:hidden;border:1px solid #1f2937}
+  .bar>span{display:block;height:100%;border-radius:6px;transition:width .5s ease,background .5s}
+  .foot{margin-top:14px;color:var(--dim);font-size:12px}
+
+  .section{margin-top:28px}
+  .section h2{font-size:14px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .section h2 .badge{background:#26313f;color:var(--dim)}
+  table.jobtable{width:100%;border-collapse:collapse;font-size:12px;background:var(--panel);
+                 border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  table.jobtable th{text-align:left;color:var(--dim);font-weight:600;padding:8px 12px;
+                     border-bottom:1px solid var(--line);white-space:nowrap}
+  table.jobtable td{padding:7px 12px;border-bottom:1px solid #1a212c;vertical-align:top}
+  table.jobtable tr:last-child td{border-bottom:none}
+  table.jobtable tbody tr{cursor:pointer}
+  table.jobtable tbody tr:hover td{background:#16202c}
+  table.jobtable tbody tr.sel td{background:#152234}
+  .empty-row td{color:var(--dim);text-align:center;padding:18px;cursor:default}
+  .empty-row:hover td{background:none !important}
+  .err{color:var(--hot);font-size:11px;margin-top:2px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .trunc{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .badge.state-submitted,.badge.state-cancelled{background:#26313f;color:var(--dim)}
+  .badge.state-provisioning,.badge.state-bootstrapping,.badge.state-running,
+  .badge.state-collecting,.badge.state-teardown,.badge.state-validating{background:#1c3350;color:var(--accent)}
+  .badge.state-promoted{background:#123321;color:var(--ok)}
+  .badge.state-failed,.badge.state-rejected{background:#3a1616;color:var(--hot)}
+
+  .logpanel{margin-top:14px;background:#0d1219;border:1px solid var(--line);border-radius:12px;
+            overflow:hidden;display:none}
+  .logpanel .logbar{display:flex;align-items:center;gap:10px;padding:8px 14px;
+                     border-bottom:1px solid var(--line);font-size:12px;color:var(--dim)}
+  .logpanel .logbar b{color:var(--txt);font-weight:600}
+  .logpanel pre{margin:0;padding:12px 14px;max-height:440px;overflow:auto;font-size:11.5px;
+                line-height:1.55;color:#c9d4e0;white-space:pre-wrap;word-break:break-all}
+  .btn{background:#1c2531;border:1px solid var(--line);color:var(--txt);border-radius:6px;
+       padding:4px 10px;font-size:11px;cursor:pointer}
+  .btn:hover{background:#26313f}
+</style>
+</head>
+<body>
+  <header>
+    <h1>Outpost</h1>
+    <span class="sub" id="uri">libvirt · cluster0 · 192.168.71.0/24</span>
+    <span class="live"><span class="dot" id="dot"></span><span id="status">connecting…</span></span>
+  </header>
+  <div class="summary" id="summary"></div>
+  <div class="grid" id="grid"></div>
+
+  <div class="section">
+    <h2>Jobs <span class="badge" id="jobcount">0</span>
+      <button class="btn" id="clearJobs" style="margin-left:auto" title="wipe job history + logs, reset nodes to available">clear jobs</button>
+    </h2>
+    <table class="jobtable">
+      <thead><tr>
+        <th>job</th><th>name</th><th>state</th><th>launcher</th><th>nodes</th><th>image</th><th>updated</th>
+      </tr></thead>
+      <tbody id="jobrows"></tbody>
+    </table>
+  </div>
+
+  <div class="logpanel" id="logpanel">
+    <div class="logbar">
+      <span>log · <b id="logtitle">—</b></span>
+      <button class="btn" id="logclose">close</button>
+      <button class="btn" id="logtimeline" style="margin-left:auto">cluster timeline</button>
+    </div>
+    <pre id="logbody"></pre>
+  </div>
+
+<script>
+const fmtMiB = m => m==null ? "—" : (m>=1024 ? (m/1024).toFixed(1)+" GiB" : Math.round(m)+" MiB");
+const clamp = v => Math.max(0, Math.min(100, v));
+function color(pct){ return pct>=85 ? "var(--hot)" : pct>=60 ? "var(--warn)" : "var(--ok)"; }
+
+function bar(label, pct, valText, tint){
+  pct = pct==null ? 0 : clamp(pct);
+  const c = tint || color(pct);
+  return `<div class="metric">
+    <div class="row"><span class="lbl">${label}</span><span class="val">${valText}</span></div>
+    <div class="bar"><span style="width:${pct}%;background:${c}"></span></div>
+  </div>`;
+}
+
+function card(n){
+  const cpu = n.cpu_pct==null ? "—" : n.cpu_pct.toFixed(0)+"%";
+  const memPct = (n.mem_used_mib!=null && n.mem_total_mib) ? n.mem_used_mib/n.mem_total_mib*100 : null;
+  const memTxt = `${fmtMiB(n.mem_used_mib)} / ${fmtMiB(n.mem_total_mib)}`;
+  let gpu = "";
+  if(n.gpu){
+    const g=n.gpu, gmem=g.mem_used_mib/g.mem_total_mib*100;
+    gpu = bar("GPU "+ (g.temp_c!=null?`· ${g.temp_c.toFixed(0)}°C`:""), g.util_pct, g.util_pct.toFixed(0)+"%", "var(--gpu)")
+        + bar("VRAM", gmem, `${fmtMiB(g.mem_used_mib)} / ${fmtMiB(g.mem_total_mib)}`, "var(--gpu)");
+  }
+  return `<div class="card ${n.kind}">
+    <h2>${n.name} <span class="badge ${n.kind==='host'?'gpu':''}">${n.kind==='host'?'gpu · host':'vm'}</span></h2>
+    <div class="meta">${n.vcpus} vCPU</div>
+    ${bar("CPU", n.cpu_pct, cpu)}
+    ${bar("RAM", memPct, memTxt)}
+    ${gpu}
+  </div>`;
+}
+
+async function tick(){
+  try{
+    const r = await fetch("/api/stats.json",{cache:"no-store"});
+    const d = await r.json();
+    document.getElementById("dot").classList.remove("off");
+    document.getElementById("status").textContent = "live · " + new Date(d.ts*1000).toLocaleTimeString();
+    const vms = d.nodes.filter(n=>n.kind==='vm');
+    const avgCpu = vms.length ? vms.reduce((a,n)=>a+(n.cpu_pct||0),0)/vms.length : 0;
+    const memUsed = d.nodes.reduce((a,n)=>a+(n.mem_used_mib||0),0);
+    document.getElementById("summary").innerHTML =
+      `nodes <b>${d.nodes.length}</b> &nbsp;·&nbsp; VMs <b>${vms.length}</b> &nbsp;·&nbsp; `+
+      `avg VM CPU <b>${avgCpu.toFixed(0)}%</b> &nbsp;·&nbsp; total RAM in use <b>${fmtMiB(memUsed)}</b>`;
+    document.getElementById("grid").innerHTML = d.nodes.map(card).join("");
+  }catch(e){
+    document.getElementById("dot").classList.add("off");
+    document.getElementById("status").textContent = "cluster unreachable";
+  }
+}
+
+// ── job queue + log viewer ─────────────────────────────────────────────────
+let selectedJob = null;
+
+// What each state actually means — shown as a hover tooltip on the badge, so
+// the dashboard is self-explanatory without needing docs open alongside it.
+const STATE_EXPLAIN = {
+  submitted:     "queued — waiting for capacity, or about to be scheduled this tick",
+  provisioning:  "claiming its nodes and making sure each is genuinely reachable",
+  bootstrapping: "installing/verifying apptainer + MPI on its nodes",
+  running:       "the container (or mpirun, for multi-node jobs) is actually executing",
+  collecting:    "copying stdout.log + output_dir from the node(s) to the drop-zone",
+  teardown:      "releasing its nodes back to the pool",
+  validating:    "running acceptance gates (currently a stub — always passes through)",
+  promoted:      "SUCCESS — terminal. Finished cleanly, gates passed, output is in the drop-zone.",
+  failed:        "FAILURE — terminal. Something in the pipeline broke (bad command, node died, " +
+                 "timed out waiting for capacity, non-zero exit, ...) — see the error below, or " +
+                 "the job's full log. Don't trust the drop-zone contents as complete.",
+  rejected:      "terminal — a gate explicitly rejected the output (not wired up yet; gates are a stub)",
+  cancelled:     "terminal — an operator cancelled this job",
+};
+
+function shortId(id){ return id ? id.replace(/^job-/,"").slice(0,8) : ""; }
+function fmtTs(ts){ return ts ? new Date(ts).toLocaleTimeString() : "—"; }
+function esc(s){ return (s??"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+function jobRow(j){
+  const got = j.assigned_nodes ? j.assigned_nodes.length : 0;
+  const nodes = `${got}/${j.node_count}`;
+  const err = j.error ? `<div class="err">${esc(j.error)}</div>` : "";
+  const explain = esc(STATE_EXPLAIN[j.state] || "");
+  return `<tr data-job="${j.job_id}" class="${selectedJob===j.job_id?'sel':''}">
+    <td class="mono">${shortId(j.job_id)}</td>
+    <td>${esc(j.name)}${err}</td>
+    <td><span class="badge state-${j.state}" title="${explain}">${j.state}</span></td>
+    <td>${j.launcher}${j.gpu?" · gpu":""}</td>
+    <td>${nodes}</td>
+    <td class="mono trunc" title="${esc(j.image)}">${esc(j.image)}</td>
+    <td>${fmtTs(j.updated_at)}</td>
+  </tr>`;
+}
+
+async function loadLog(jobId, title){
+  selectedJob = jobId;
+  document.getElementById("logpanel").style.display = "block";
+  document.getElementById("logtitle").textContent = title;
+  try{
+    const r = await fetch(`/api/logs?job=${encodeURIComponent(jobId)}`, {cache:"no-store"});
+    const txt = await r.text();
+    const body = document.getElementById("logbody");
+    const wasAtBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 24;
+    body.textContent = txt;
+    if(wasAtBottom) body.scrollTop = body.scrollHeight;
+  }catch(e){}
+}
+
+async function renderJobs(){
+  try{
+    const r = await fetch("/api/jobs.json", {cache:"no-store"});
+    const jobs = await r.json();
+    document.getElementById("jobcount").textContent = jobs.length;
+    document.getElementById("jobrows").innerHTML = jobs.length ? jobs.map(jobRow).join("") :
+      `<tr class="empty-row"><td colspan="7">no jobs submitted yet — bin/cluster submit --spec job.yaml</td></tr>`;
+    document.querySelectorAll("#jobrows tr[data-job]").forEach(tr => {
+      tr.onclick = () => {
+        const j = jobs.find(x => x.job_id === tr.dataset.job);
+        loadLog(j.job_id, `${j.name} (${shortId(j.job_id)})`);
+      };
+    });
+    if(selectedJob && selectedJob !== "__reconciler__") loadLog(selectedJob, document.getElementById("logtitle").textContent);
+  }catch(e){}
+}
+
+document.getElementById("logclose").onclick = () => {
+  selectedJob = null;
+  document.getElementById("logpanel").style.display = "none";
+};
+document.getElementById("logtimeline").onclick = () => loadLog("__reconciler__", "cluster timeline (all jobs, chronological)");
+
+document.getElementById("clearJobs").onclick = async () => {
+  if(!confirm("Clear all job history + logs, and reset every node to available?\n\nThis is for a clean demo view — it doesn't touch VMs/GPU, only the job queue and its logs.")) return;
+  let res = await (await fetch("/api/clear", {method:"POST"})).json();
+  if(!res.cleared){
+    const names = res.active.map(a => `  ${a.job_id}  ${a.state}`).join("\n");
+    const force = confirm(`${res.active.length} job(s) still active, not terminal:\n${names}\n\n` +
+      `Force clear anyway? This releases their nodes even if real infrastructure is still running for them.`);
+    if(!force) return;
+    res = await (await fetch("/api/clear?force=1", {method:"POST"})).json();
+  }
+  selectedJob = null;
+  document.getElementById("logpanel").style.display = "none";
+  renderJobs();
+};
+
+tick(); renderJobs();
+setInterval(tick, 2000);
+setInterval(renderJobs, 2000);
+setInterval(() => { if(selectedJob === "__reconciler__") loadLog("__reconciler__", document.getElementById("logtitle").textContent); }, 2000);
+</script>
+</body>
+</html>
