@@ -1,9 +1,15 @@
 # pkgs is normally supplied by flake.nix (which allow-lists terraform/packer).
 # The default here is only for a bare `nix-shell` invocation.
+#
+# openmpi is a SEPARATE arg because it must be 4.1.x to match the VMs' Ubuntu
+# 24.04 OpenMPI (see flake.nix, which passes the nixos-24.05 build, 4.1.6).
+# The default `pkgs.openmpi` fallback is only for a bare `nix-shell`, where it
+# will be whatever unstable ships (5.x) — hybrid MPI needs the flake path.
 { pkgs ? import <nixpkgs> {
     config.allowUnfreePredicate = pkg:
       builtins.elem (pkg.pname or "") [ "terraform" "packer" ];
-  } }:
+  }
+, openmpi ? pkgs.openmpi }:
 
 # Dev shell for local provisioning.
 # Everything the libvirt adapter + ansible plays need, pinned via the flake.
@@ -25,6 +31,16 @@ pkgs.mkShell {
 
     # --- container runtime (host GPU node runs jobs via apptainer --nv) ---
     apptainer
+    # proot: lets `apptainer build` run a def file's %post rootless on this host.
+    # The nix apptainer ships a non-setuid `starter` and the host has no setuid
+    # newuidmap/newgidmap, so apptainer's normal subuid fakeroot can't map — it
+    # falls back to proot-emulated root instead (see demo/build-sif.sh).
+    proot
+
+    # --- host-side MPI launcher for hybrid jobs (host GPU rank + VM ranks) ---
+    # `openmpi` here is the function arg, NOT pkgs.openmpi: the flake pins it to
+    # nixos-24.05's 4.1.6 so the host mpirun/orted matches the guests' 4.1.6.
+    openmpi
 
     # --- config management (the one bootstrap role) ---
     ansible # ansible-playbook + ansible-galaxy
@@ -71,6 +87,7 @@ pkgs.mkShell {
     echo "  qemu        : $(qemu-img --version | head -1)"
     echo "  virsh       : $(virsh --version 2>/dev/null)"
     echo "  ansible     : $(ansible --version 2>/dev/null | head -1)"
+    echo "  mpirun      : $(mpirun --version 2>/dev/null | head -1)  (must match guests' 4.1.x)"
     echo ""
     echo "  Edit infra/libvirt/config.env, then:"
     echo "    make net-up        # define the cluster0 libvirt network"
