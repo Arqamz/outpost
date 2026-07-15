@@ -38,6 +38,9 @@ class JobSpec:
     # scheduling constraints
     node_count: int = 1
     gpu: bool = False                  # true -> must land on a GPU-capable node (the host)
+    hybrid: bool = False               # true -> claim 1 GPU node (the host) + (node_count-1)
+                                       # CPU VMs and launch ONE mpirun across them;
+                                       # requires launcher: mpi and node_count >= 2
     # I/O contract
     env: dict[str, str] = field(default_factory=dict)  # env vars set inside the container
     output_dir: str = "/out"           # in-container path the job writes results to
@@ -58,6 +61,7 @@ class JobSpec:
             launcher=d.get("launcher", "single") or "single",
             node_count=int(d.get("node_count", 1)),
             gpu=bool(d.get("gpu", False)),
+            hybrid=bool(d.get("hybrid", False)),
             env={str(k): str(v) for k, v in (d.get("env", {}) or {}).items()},
             output_dir=d.get("output_dir", "/out"),
             params=d.get("params", {}) or {},
