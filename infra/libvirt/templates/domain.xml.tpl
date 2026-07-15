@@ -24,7 +24,7 @@
   <on_reboot>restart</on_reboot>
   <on_crash>destroy</on_crash>
   <devices>
-    <emulator>/run/current-system/sw/bin/qemu-system-x86_64</emulator>
+    <emulator>__EMULATOR__</emulator>
 
     <!-- Root disk: qcow2 overlay backed by the shared base template. -->
     <disk type='file' device='disk'>

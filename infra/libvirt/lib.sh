@@ -33,7 +33,20 @@ node_mac()  { printf '%s:%02x' "${CLUSTER_MAC_PREFIX}" "$(( CLUSTER_IP_BASE + $1
 node_seq() { seq 1 "${CLUSTER_NODE_COUNT}"; }
 
 # ── preconditions ─────────────────────────────────────────────────────────
-require_bin() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' — are you in the nix dev shell? (nix develop)"; }
+require_bin() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' — enter the nix dev shell (nix develop), or on Ubuntu see docs/07-ubuntu-setup.md"; }
+
+# Path to the qemu binary baked into each domain XML. CLUSTER_QEMU_EMULATOR in
+# config.env wins; empty = auto-detect. libvirtd (a system daemon) execs this
+# path itself, so it must be a stable system location — NixOS's system profile
+# first, then the standard distro path, then whatever's on PATH.
+qemu_emulator() {
+  if [[ -n "${CLUSTER_QEMU_EMULATOR:-}" ]]; then printf '%s' "${CLUSTER_QEMU_EMULATOR}"; return 0; fi
+  local p
+  for p in /run/current-system/sw/bin/qemu-system-x86_64 /usr/bin/qemu-system-x86_64; do
+    [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  command -v qemu-system-x86_64 || die "qemu-system-x86_64 not found (set CLUSTER_QEMU_EMULATOR in config.env)"
+}
 
 preflight() {
   require_bin virsh

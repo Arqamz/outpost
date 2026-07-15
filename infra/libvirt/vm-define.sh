@@ -65,6 +65,7 @@ domxml="$(mktemp --suffix=.xml)"
 sed -e "s|__NAME__|${name}|g" -e "s|__MEM_MB__|${CLUSTER_MEM_MB}|g" \
     -e "s|__VCPUS__|${CLUSTER_VCPUS}|g" -e "s|__DISK__|${overlay}|g" \
     -e "s|__SEED__|${seed}|g" -e "s|__MAC__|${mac}|g" -e "s|__NET__|${CLUSTER_NET_NAME}|g" \
+    -e "s|__EMULATOR__|$(qemu_emulator)|g" \
     "${CLUSTER_TEMPLATES_XML}/domain.xml.tpl" >"${domxml}"
 
 virt-xml-validate "${domxml}" >/dev/null 2>&1 || warn "[${name}] domain XML failed schema validation (continuing)"
