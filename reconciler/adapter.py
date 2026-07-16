@@ -75,6 +75,20 @@ def run_logged(argv: list[str], job_id: str, cwd: str | None = None, check: bool
     return proc.returncode
 
 
+def ssh_base(ip: str) -> list[str]:
+    """argv prefix for reaching a cluster node over ssh with the cluster key.
+    Module-level (not a LibvirtAdapter detail) because the hybrid MPI path on
+    the host stages images into VMs with the exact same fabric."""
+    return ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", f"{SSH_USER}@{ip}"]
+
+
+def scp_to(ip: str, src: str, dst: str, job_id: str) -> None:
+    argv = ["scp", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", src, f"{SSH_USER}@{ip}:{dst}"]
+    run_logged(argv, job_id)
+
+
 def gpu_launch_extras() -> tuple[list[str], dict]:
     """Extra --bind paths for GPU (apptainer --nv), read from the env the nix dev
     shell exports DECLARATIVELY (CLUSTER_GPU_BINDS). Nothing is detected at runtime
@@ -123,16 +137,98 @@ def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
     return argv + [spec.image] + list(spec.command)
 
 
-def mpirun_argv(np: int, hostfile: str, cidr: str, per_rank_argv: list[str]) -> list[str]:
+def fabric_if_include(nodes: list[NodeRecord]) -> tuple[str, str]:
+    """Return `(btl_if_include, oob_if_include)` — the MCA values pinning
+    OpenMPI's two TCP planes to the cluster0 fabric. They DIFFER, and both forms
+    are hard-won hybrid-launch lessons (mpirun runs on the host, whose cluster0
+    address is a bridge, virbr-cluster, sharing the box with a zoo of other
+    virtual interfaces: docker0, br-*, veth*, tailscale0, virbr0, plus the real
+    wifi/LAN nic):
+
+    - OOB (orted control channel) -> a list of each node's EXACT `/32`, e.g.
+      `192.168.71.1/32,192.168.71.11/32`. Given the `/24` subnet, OpenMPI 4.1.x's
+      OOB matcher mis-resolves among the interface zoo and rejects the bridge
+      outright ("None of the TCP networks ... could be found"); an exact /32
+      binds cleanly.
+    - BTL (rank<->rank data) -> the `/24` subnet. The inverse bug: OpenMPI 4.1.x's
+      BTL `/32` matching is broken — it "matches" EVERY interface and ends up
+      advertising the host's wifi/docker addresses (192.168.18.x, 172.x) that a
+      VM can't reach, so the first MPI collective hangs forever. The `/24` matches
+      only the two real cluster addresses (host .1, VM .1x).
+
+    Both are GLOBAL to the mpirun and forwarded to every orted, so both must be
+    valid on every node: each node matches its own /32 in the OOB list (and
+    ignores the rest — OpenMPI tolerates non-matching list entries), and every
+    node's cluster address is inside the /24."""
+    oob = ",".join(f"{n.ip}/32" for n in nodes)
+    btl = ".".join(nodes[0].ip.split(".")[:3]) + ".0/24"
+    return btl, oob
+
+
+def mpirun_argv(np: int, hostfile: str, btl_if_include: str, oob_if_include: str,
+                per_rank_argv: list[str], rsh_agent: str | None = None,
+                no_tree_spawn: bool = False) -> list[str]:
     """Wrap a per-rank container argv (from container_argv) in mpirun, one rank
     per claimed node (--map-by node) over the cluster's own TCP fabric — the MCA
-    if_include options keep mpirun off any other interface on the box."""
-    return [
+    if_include options (see fabric_if_include) keep mpirun off any other interface.
+
+    rsh_agent: how mpirun reaches remote nodes. On a head VM the default plain
+    `ssh` works (the fabric key + ~/.ssh/config are staged on every VM by the
+    bootstrap role); when mpirun runs on the HOST (hybrid jobs) it must be told
+    to use the cluster key + user explicitly. no_tree_spawn forces every remote
+    launch to originate from the head — OpenMPI's default tree spawn would make
+    one VM launch its sibling re-using the same agent string, whose key path
+    only exists on the host."""
+    argv = [
         "mpirun", "-np", str(np), "--hostfile", hostfile, "--map-by", "node",
         "--mca", "btl", "tcp,self",
-        "--mca", "btl_tcp_if_include", cidr,
-        "--mca", "oob_tcp_if_include", cidr,
-    ] + per_rank_argv
+        "--mca", "btl_tcp_if_include", btl_if_include,
+        "--mca", "oob_tcp_if_include", oob_if_include,
+    ]
+    if rsh_agent:
+        argv += ["--mca", "plm_rsh_agent", rsh_agent]
+    if no_tree_spawn:
+        argv += ["--mca", "plm_rsh_no_tree_spawn", "1"]
+    return argv + per_rank_argv
+
+
+def write_appfile(path: str, rank_lines: list[tuple[str, list[str]]]) -> None:
+    """Write an OpenMPI appfile: one `-np 1 --host <ip> <argv...>` line per rank.
+    Unlike a single shared command, an appfile lets each rank run a DIFFERENT
+    per-rank argv — which is exactly what a hybrid job needs: rank 0 (the GPU
+    host) gets `apptainer exec --nv` plus the NixOS driver binds, while the VM
+    ranks get a plain launch (no --nv warning on a GPU-less guest, and none of
+    the host-only `/nix/store` / `/run/opengl-driver` binds whose source paths
+    don't exist inside a VM — a missing bind source is a hard apptainer error).
+
+    OpenMPI's appfile parser splits each line on whitespace and does NOT honor
+    shell quoting, so every token must be whitespace-free. That holds for our
+    argv: apptainer paths live under /tmp/cluster/<job_id> and env is passed as
+    `--env KEY=VAL` with space-free values."""
+    with open(path, "w") as f:
+        for ip, argv in rank_lines:
+            f.write(f"-np 1 --host {ip} " + " ".join(argv) + "\n")
+
+
+def mpirun_appfile_argv(appfile: str, btl_if_include: str, oob_if_include: str,
+                        rsh_agent: str | None = None,
+                        no_tree_spawn: bool = False) -> list[str]:
+    """mpirun driving a per-rank appfile instead of one shared command. Global
+    options (fabric pinning via if_include — see fabric_if_include, the rsh agent,
+    tree-spawn) stay on the command line; the per-rank command AND host placement
+    come from the appfile lines, so no separate --hostfile / -np / --map-by is
+    passed here. See write_appfile and mpirun_argv for the rest of the rationale."""
+    argv = [
+        "mpirun",
+        "--mca", "btl", "tcp,self",
+        "--mca", "btl_tcp_if_include", btl_if_include,
+        "--mca", "oob_tcp_if_include", oob_if_include,
+    ]
+    if rsh_agent:
+        argv += ["--mca", "plm_rsh_agent", rsh_agent]
+    if no_tree_spawn:
+        argv += ["--mca", "plm_rsh_no_tree_spawn", "1"]
+    return argv + ["--app", appfile]
 
 
 class ProviderAdapter(ABC):
@@ -191,13 +287,21 @@ class LocalHostAdapter(ProviderAdapter):
         self.log(f"[localhost] {node.name} left running (host is not destroyed)")
 
     def bootstrap(self, nodes, job_id):
-        # Just verify the runtime exists; the host is already configured.
-        rc = subprocess.run(["apptainer", "--version"], capture_output=True).returncode
-        if rc != 0:
+        # Just verify the runtimes exist; the host is already configured.
+        if shutil.which("apptainer") is None:
             self.log("[localhost] WARNING: apptainer not found on host "
-                     "(add it via the nix dev shell before running real jobs)")
+                     "(install it before running real jobs — nix dev shell, or on "
+                     "Ubuntu the pinned .deb, see docs/07-ubuntu-setup.md)")
         else:
             self.log("[localhost] apptainer present")
+        # mpirun only matters if this host becomes a hybrid job's MPI head.
+        mpirun = shutil.which("mpirun")
+        if mpirun:
+            out = subprocess.run([mpirun, "--version"], capture_output=True, text=True).stdout
+            self.log(f"[localhost] mpirun present ({out.splitlines()[0].strip() if out else 'version unknown'})")
+        else:
+            self.log("[localhost] WARNING: mpirun not found on host — hybrid MPI jobs "
+                     "will fail (on Ubuntu: apt install openmpi-bin, matching the VMs' 4.1.x)")
 
     def run(self, nodes, job_id, spec):
         node = nodes[0]
@@ -205,6 +309,8 @@ class LocalHostAdapter(ProviderAdapter):
         os.makedirs(workdir, exist_ok=True)
         if spec.is_dry_run:
             return RunResult(job_id, node.name, None, workdir, note="no image -> dry-run")
+        if spec.launcher == "mpi" and len(nodes) > 1:
+            return self._run_mpi(nodes, job_id, spec)
         # GPU jobs get the driver bind/env the nix shell exported declaratively.
         extra_binds, extra_env = gpu_launch_extras() if spec.gpu else ([], {})
         argv = container_argv(spec, workdir, spec.output_dir, extra_binds, extra_env)
@@ -220,8 +326,76 @@ class LocalHostAdapter(ProviderAdapter):
             append_job_log(job_id, f.read())
         return RunResult(job_id, node.name, rc, workdir, stdout_path, f"apptainer exit={rc}")
 
+    def _run_mpi(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec) -> RunResult:
+        """Hybrid multi-node launch: mpirun runs ON THE HOST (nodes[0], the GPU
+        node) and spans it plus the job's VM nodes in one launch. The host's
+        appfile entry is its cluster0 bridge address — a local interface, so
+        mpirun forks rank 0 in place and only the VM ranks go over ssh (no sshd
+        needed on the host). VM ranks talk TCP back to the host on the bridge.
+        The workdir is the SAME absolute path on every node (the image + bind
+        source must exist everywhere), and the VM `cluster` user can't mkdir
+        under the operator's $HOME — /tmp is the one place both sides can. (If
+        mpirun ever fails to detect the bridge address as local, swap the host's
+        appfile `--host` value for `localhost` — the btl/oob if_include MCA
+        params, not the host string, decide which endpoints rank 0 advertises.)
+
+        Unlike the VM-headed path (LibvirtAdapter._run_mpi, one shared per-rank
+        command), this uses a per-rank APPFILE so the ranks can differ: rank 0
+        (the GPU host) gets `--nv` + the NixOS driver binds the dev shell
+        exported, while the VM ranks get a plain launch. A shared command can't
+        express that — --nv's driver binds don't exist on the guests, and a
+        missing bind source is a hard apptainer error. See write_appfile."""
+        head = nodes[0]
+        if shutil.which("mpirun") is None:
+            raise RuntimeError(
+                "mpirun not found on host — hybrid MPI needs the host's OpenMPI to "
+                "match the VMs' 4.1.x (nix dev shell pins it via flake.nix; on "
+                "Ubuntu: apt install openmpi-bin)")
+        workdir = f"/tmp/cluster/{job_id}"
+        os.makedirs(workdir, exist_ok=True)
+        image = f"{workdir}/{os.path.basename(spec.image)}"
+        appfile = f"{workdir}/appfile"
+        shutil.copy2(spec.image, image)
+        for n in nodes[1:]:
+            run_logged(ssh_base(n.ip) + [f"mkdir -p {workdir}"], job_id)
+            scp_to(n.ip, spec.image, image, job_id)
+
+        # rank 0 (host): --nv + the declaratively-exported GPU binds (on NixOS,
+        # /nix/store + /run/opengl-driver so the driver's userspace resolves).
+        rank_spec = dataclasses.replace(spec, image=image)
+        gpu_binds, _ = gpu_launch_extras()
+        host_argv = container_argv(dataclasses.replace(rank_spec, gpu=True),
+                                   workdir, spec.output_dir, extra_binds=gpu_binds)
+        # VM ranks: no GPU on the guest -> plain launch (no --nv, no host binds).
+        vm_argv = container_argv(dataclasses.replace(rank_spec, gpu=False),
+                                 workdir, spec.output_dir)
+        rank_lines = [(head.ip, host_argv)] + [(n.ip, vm_argv) for n in nodes[1:]]
+        write_appfile(appfile, rank_lines)
+
+        btl_inc, oob_inc = fabric_if_include(nodes)
+        # OpenMPI whitespace-splits the agent string into argv, so this works as
+        # long as SSH_KEY contains no spaces (the default path doesn't).
+        agent = (f"ssh -i {SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
+                 f"-o UserKnownHostsFile=/dev/null -l {SSH_USER}")
+        argv = mpirun_appfile_argv(appfile, btl_inc, oob_inc, rsh_agent=agent, no_tree_spawn=True)
+        stdout_path = f"{workdir}/stdout.log"
+        header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
+        self.log(f"[localhost] (mpirun head, {len(nodes)} ranks, per-rank appfile) {header}")
+        append_job_log(job_id, f"{now_iso()} {header}")
+        with open(stdout_path, "w") as out:
+            rc = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT).returncode
+        with open(stdout_path) as f:
+            append_job_log(job_id, f.read())
+        return RunResult(job_id, head.name, rc, workdir, stdout_path,
+                         note=f"hybrid mpirun np={len(nodes)} (appfile) exit={rc}")
+
     def collect(self, nodes, job_id, spec, dest):
-        workdir = os.path.join(RUNS_DIR, job_id)
+        # Hybrid MPI runs use the shared /tmp workdir (same path as the VM
+        # ranks — see _run_mpi); single-node host runs keep the .var/runs scratch.
+        if spec.launcher == "mpi" and len(nodes) > 1:
+            workdir = f"/tmp/cluster/{job_id}"
+        else:
+            workdir = os.path.join(RUNS_DIR, job_id)
         os.makedirs(dest, exist_ok=True)
         if os.path.isdir(workdir):
             for name in os.listdir(workdir):
@@ -251,8 +425,7 @@ class LibvirtAdapter(ProviderAdapter):
         self.log = log
 
     def _ssh_base(self, ip: str) -> list[str]:
-        return ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null", f"{SSH_USER}@{ip}"]
+        return ssh_base(ip)
 
     def provision(self, node, job_id):
         self.log(f"[libvirt] provisioning {node.name}")
@@ -309,9 +482,7 @@ class LibvirtAdapter(ProviderAdapter):
         return RunResult(job_id, head.name, rc, remote_workdir, stdout_log, note=f"remote exit={rc}")
 
     def _scp_to(self, ip: str, src: str, dst: str, job_id: str) -> None:
-        argv = ["scp", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null", src, f"{SSH_USER}@{ip}:{dst}"]
-        run_logged(argv, job_id)
+        scp_to(ip, src, dst, job_id)
 
     def _run_mpi(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
                  remote_workdir: str) -> RunResult:
@@ -324,7 +495,7 @@ class LibvirtAdapter(ProviderAdapter):
         head = nodes[0]
         remote_image = f"{remote_workdir}/{os.path.basename(spec.image)}"
         remote_hostfile = f"{remote_workdir}/hostfile"
-        cidr = ".".join(head.ip.split(".")[:3]) + ".0/24"
+        btl_inc, oob_inc = fabric_if_include(nodes)
 
         local_scratch = os.path.join(RUNS_DIR, job_id)
         os.makedirs(local_scratch, exist_ok=True)
@@ -340,7 +511,7 @@ class LibvirtAdapter(ProviderAdapter):
 
         rank_spec = dataclasses.replace(spec, image=remote_image)
         per_rank = container_argv(rank_spec, remote_workdir, spec.output_dir)
-        argv = mpirun_argv(len(nodes), remote_hostfile, cidr, per_rank)
+        argv = mpirun_argv(len(nodes), remote_hostfile, btl_inc, oob_inc, per_rank)
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
         # Same reasoning as the single-node path: tee mpirun's combined output
