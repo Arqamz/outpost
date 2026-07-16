@@ -12,6 +12,12 @@ From: ubuntu:24.04
 
 %post
     export DEBIAN_FRONTEND=noninteractive
+    # Disable apt's sandbox so a proot rootless build works (NixOS has no setuid
+    # fakeroot — see demo/build-sif.sh); harmless under native fakeroot/root.
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/00no-sandbox
+    # Skip openssh-client's `chgrp ssh /usr/bin/ssh-agent` postinst step, which
+    # proot can't do (EINVAL); ssh is unused inside the container (see cuda_axpb.def).
+    dpkg-statoverride --add root root 0755 /usr/bin/ssh-agent || true
     apt-get update
     apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev gcc
     mpicc -O3 -o /opt/mpi_demo /opt/mpi_demo.c
