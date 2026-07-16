@@ -1,0 +1,44 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+# Hybrid MPI + CUDA demo container (cuda_axpb.cu). Built FROM an NVIDIA CUDA
+# devel image (ships nvcc + the CUDA runtime) so the GPU host rank can run a
+# real kernel, and apt-installing Ubuntu 24.04's openmpi-bin (4.1.6) so the
+# container's libmpi matches the host mpirun the hybrid launch drives (the nix
+# dev shell pins the host's OpenMPI to 4.1.6 too — see flake.nix).
+#
+# CUDA 12.8 supports the host's Blackwell GPU; the kernel is compiled to
+# compute_70 PTX (not native SASS) so the driver JITs it forward to WHATEVER
+# GPU is present — portable across cards without knowing the arch at build time.
+#
+# Build (needs network for the base image + apt):  make cuda-sif
+
+%files
+    demo/cuda_axpb.cu /opt/cuda_axpb.cu
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    # Disable apt's sandbox: a proot rootless build (NixOS, no setuid fakeroot —
+    # see demo/build-sif.sh) can't emulate apt dropping to the _apt uid. Harmless
+    # under a native fakeroot/root build.
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/00no-sandbox
+    # openmpi-bin pulls openssh-client, whose postinst does `chgrp ssh
+    # /usr/bin/ssh-agent` — proot can't chgrp to an unmapped group (EINVAL) and
+    # the build aborts. openssh-client is never used inside the container (the
+    # HOST launches ranks), so pre-register a statoverride to skip that chgrp.
+    dpkg-statoverride --add root root 0755 /usr/bin/ssh-agent || true
+    apt-get update
+    apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
+    # -ccbin mpicxx lets nvcc pick up the MPI include/link flags automatically.
+    nvcc -O3 -ccbin mpicxx -gencode arch=compute_70,code=compute_70 \
+         -o /opt/cuda_axpb /opt/cuda_axpb.cu
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    # Make libcudart resolvable on every rank (also carried on the GPU-less VM
+    # ranks, which link it but never call into it — see cuda_axpb.cu).
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+%runscript
+    exec /opt/cuda_axpb "$@"
