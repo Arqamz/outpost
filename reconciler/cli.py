@@ -48,16 +48,20 @@ def _topology() -> list[tuple[int, str, str]]:
 
 def _host_node() -> NodeRecord | None:
     """The control-plane host as a GPU node, read from config.env (or None if
-    CLUSTER_GPU_HOST != 1). Registered alongside the VMs so GPU jobs land here."""
+    CLUSTER_GPU_HOST != 1). Registered alongside the VMs so GPU jobs land here.
+    Its ip is the host's cluster0 bridge address (CLUSTER_HOST_IP), not
+    127.0.0.1 — hybrid MPI hostfiles hand it to VM ranks, which must be able to
+    reach the host on it. LocalHostAdapter itself never dials the ip."""
     out = subprocess.run(
         ["bash", "-c", 'source "$0"/infra/libvirt/lib.sh; '
-         'echo "${CLUSTER_GPU_HOST:-0} ${CLUSTER_HOST_NODE_NAME:-cluster-host} ${CLUSTER_HOST_RUNTIME:-apptainer}"', REPO_ROOT],
+         'echo "${CLUSTER_GPU_HOST:-0} ${CLUSTER_HOST_NODE_NAME:-cluster-host} '
+         '${CLUSTER_HOST_RUNTIME:-apptainer} ${CLUSTER_HOST_IP:-127.0.0.1}"', REPO_ROOT],
         capture_output=True, text=True, check=True,
     ).stdout.split()
     if not out or out[0] != "1":
         return None
-    _, name, runtime = out
-    return NodeRecord(node_id=name, name=name, index=0, ip="127.0.0.1",
+    _, name, runtime, ip = out
+    return NodeRecord(node_id=name, name=name, index=0, ip=ip,
                       state=NodeState.AVAILABLE.value, gpu=True, local=True, runtime=runtime)
 
 
@@ -144,8 +148,8 @@ def cmd_nodes(args):
 
 def cmd_seed_nodes(args):
     store = _store()
-    existing = {n.node_id for n in store.list_nodes()}
-    added = 0
+    existing = {n.node_id: n for n in store.list_nodes()}
+    added = updated = 0
     nodes = [NodeRecord(node_id=name, name=name, index=idx, ip=ip,
                         state=NodeState.AVAILABLE.value)
              for idx, name, ip in _topology()]
@@ -153,11 +157,20 @@ def cmd_seed_nodes(args):
     if host:
         nodes.append(host)
     for n in nodes:
-        if n.node_id in existing:
+        old = existing.get(n.node_id)
+        if old is None:
+            store.put_node(n)
+            added += 1
             continue
-        store.put_node(n)
-        added += 1
-    print(f"seeded {added} node(s) into the registry ({len(existing)} already present)"
+        # Refresh a stale record whose config-derived identity changed (e.g.
+        # cluster-host migrating off 127.0.0.1 to its bridge address) — but only
+        # while it's idle; never rewrite a node some job currently owns.
+        if (old.state == NodeState.AVAILABLE.value and not old.owner_job and
+                (old.ip, old.gpu, old.local, old.runtime) != (n.ip, n.gpu, n.local, n.runtime)):
+            store.put_node(n)
+            updated += 1
+    print(f"seeded {added} node(s) into the registry ({len(existing)} already present"
+          + (f", {updated} refreshed" if updated else "") + ")"
           + (f"; host GPU node = {host.name}" if host else "; no host GPU node (CLUSTER_GPU_HOST != 1)"))
 
 
