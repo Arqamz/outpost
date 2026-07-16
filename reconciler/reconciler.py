@@ -192,12 +192,18 @@ class Reconciler:
     # so the phases just call the adapter unconditionally.
     def _phase_provision(self, job: JobRecord) -> None:
         spec = JobSpec.from_dict(job.spec)
-        kind = "GPU" if spec.gpu else "CPU"
+        # hybrid only makes sense as a multi-node mpirun; anything else would
+        # claim mixed pools with no launch path that can span them.
+        if spec.hybrid and (spec.launcher != "mpi" or spec.node_count < 2):
+            raise ValueError("hybrid: true requires launcher: mpi and node_count >= 2")
+        kind = (f"hybrid (1 GPU + {spec.node_count - 1} CPU)" if spec.hybrid
+                else ("GPU" if spec.gpu else "CPU"))
         # Claim BEFORE transitioning state: if the pool can't cover this job
         # (NoCapacity), the job must stay untouched in SUBMITTED so tick()'s
         # wait-and-retry path has something to retry — not a half-provisioned
         # job stuck with no assigned_nodes.
-        nodes = self.registry.claim(job.job_id, spec.node_count, require_gpu=spec.gpu)
+        nodes = self.registry.claim(job.job_id, spec.node_count,
+                                    require_gpu=spec.gpu, hybrid=spec.hybrid)
         self._set_job(job, JobState.PROVISIONING, f"claimed {spec.node_count} {kind} node(s)")
         job.assigned_nodes = [n.node_id for n in nodes]
         self.store.put_job(job)
@@ -211,7 +217,16 @@ class Reconciler:
     def _phase_bootstrap(self, job: JobRecord) -> None:
         self._set_job(job, JobState.BOOTSTRAPPING, "bootstrapping node(s)")
         nodes = [self.store.get_node(nid) for nid in job.assigned_nodes]
-        self._adapter_for(nodes[0]).bootstrap(nodes, job.job_id)
+        # Group by adapter INSTANCE, not by nodes[0]: a hybrid job's host and VM
+        # subsets each need their own bootstrap call (ansible --limit must never
+        # see cluster-host — it isn't in the inventory), while dry-run — where
+        # both keys are wired to the one NullAdapter — still makes a single call.
+        groups: dict[int, tuple[ProviderAdapter, list[NodeRecord]]] = {}
+        for n in nodes:
+            a = self._adapter_for(n)
+            groups.setdefault(id(a), (a, []))[1].append(n)
+        for adapter, subset in groups.values():
+            adapter.bootstrap(subset, job.job_id)
         for nid in job.assigned_nodes:
             self.registry.advance(nid, NodeState.READY, "bootstrapped")
 
