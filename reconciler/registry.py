@@ -30,16 +30,23 @@ class NodeRegistry:
         self.audit.record("node", node.node_id, frm.value, to.value, reason)
         return node
 
-    def claim(self, job_id: str, count: int, require_gpu: bool = False) -> list[NodeRecord]:
-        """Exclusively lock `count` matching nodes for job_id. All-or-nothing."""
+    def claim(self, job_id: str, count: int, require_gpu: bool = False,
+              hybrid: bool = False) -> list[NodeRecord]:
+        """Exclusively lock `count` matching nodes for job_id. All-or-nothing.
+
+        hybrid=True is the one shape that mixes pools: 1 GPU node + (count-1)
+        CPU nodes, claimed GPU-first so claimed[0] is always the host — the
+        phases rely on that ordering to pick the adapter that drives the job."""
+        needs = ([True] + [False] * (count - 1)) if hybrid else [require_gpu] * count
         claimed: list[NodeRecord] = []
-        for _ in range(count):
-            n = self.store.claim_node(job_id, require_gpu=require_gpu)  # atomic AVAILABLE -> CLAIMED
+        for need_gpu in needs:
+            n = self.store.claim_node(job_id, require_gpu=need_gpu)  # atomic AVAILABLE -> CLAIMED
             if n is None:
                 for c in claimed:               # roll back partial claim
                     self.release(c.node_id, reason=f"rollback claim for {job_id}")
-                kind = "GPU" if require_gpu else "CPU"
-                raise NoCapacity(f"need {count} {kind} node(s), pool exhausted after {len(claimed)}")
+                kind = (f"1 GPU + {count - 1} CPU" if hybrid
+                        else f"{count} {'GPU' if require_gpu else 'CPU'}")
+                raise NoCapacity(f"need {kind} node(s), pool exhausted after {len(claimed)}")
             self.audit.record("node", n.node_id, NodeState.AVAILABLE.value,
                               NodeState.CLAIMED.value, f"claimed by {job_id}")
             claimed.append(n)
