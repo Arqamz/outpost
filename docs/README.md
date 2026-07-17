@@ -19,6 +19,7 @@ Read in order:
 | 4 | [04-job-lifecycle.md](04-job-lifecycle.md) | how a job flows submit→promote; dry-run vs execute |
 | 5 | [05-gpu-and-apptainer.md](05-gpu-and-apptainer.md) | the host GPU node + running containers with apptainer |
 | 6 | [06-interface-contract.md](06-interface-contract.md) | the open interface anything driving this cluster targets (intake + egress) |
+| 7 | [07-ubuntu-setup.md](07-ubuntu-setup.md) | running the whole thing on a native Ubuntu host (no Nix): install → cluster up → dashboard → jobs, incl. host-only and hybrid (VM + host GPU) runbooks |
 
 Quickstart lives in the top-level [../README.md](../README.md); day-to-day
 command reference lives in [../CLAUDE.md](../CLAUDE.md).
