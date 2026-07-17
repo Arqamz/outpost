@@ -65,6 +65,11 @@ today's defaults in one file. Change any of them for your own machine:
 All *client* tooling (qemu, virsh, ansible, cloud-utils, terraform, packer, …)
 is pinned in the Nix dev shell — you do **not** need it installed globally.
 
+**No Nix?** On a native Ubuntu host, follow
+[`docs/07-ubuntu-setup.md`](docs/07-ubuntu-setup.md) instead — apt-based
+install of the same tooling plus `source env.sh` in place of the dev shell,
+with runbooks for a host-only GPU node (0 VMs) and a hybrid VM + host-GPU job.
+
 ## Quickstart
 
 Generate the dedicated cluster SSH key referenced from `config.env` (path
@@ -138,7 +143,7 @@ and a cross-job timeline view. Reads the same store and `.var/logs/` files
 ### Multi-node MPI jobs
 
 ```bash
-make mpi-sif         # build demo/mpi_demo.sif once (needs apptainer --fakeroot or sudo)
+make mpi-sif         # build demo/mpi_demo.sif once (rootless via build-sif.sh; proot on NixOS)
 make submit-mpi       # submit job.mpi.example.yaml (node_count: 4)
 make reconcile        # ... repeat to PROMOTED (or `cluster reconcile --execute` to loop)
 ```
@@ -207,6 +212,8 @@ job.example.yaml                   sample JobSpec (dry-run)
 job.mpi.example.yaml               multi-node MPI JobSpec (node_count: 4)
 job.mpi.small.example.yaml         multi-node MPI JobSpec (node_count: 2)
 job.gpu.example.yaml               GPU JobSpec (nvidia-smi via apptainer --nv)
+job.hybrid.example.yaml            hybrid JobSpec (host GPU node + VM in ONE mpirun)
+job.hybrid.cuda.example.yaml       hybrid JobSpec (VM CPU rank -> host GPU rank, y=a*x+b)
 ```
 
 ## Running a real job
@@ -241,6 +248,19 @@ gpu: true
 node_count: 1
 image: "/path/to/job.sif"      # or docker://…
 command: ["python", "run.py", "--out", "/out"]
+output_dir: "/out"
+```
+
+**Hybrid** (`hybrid: true` — the host GPU node **and** VM CPU node(s) in ONE
+`mpirun`, launched from the host; the only shape that mixes the two pools):
+```yaml
+name: hybrid-job
+launcher: mpi
+hybrid: true                   # 1 GPU node (the host) + (node_count-1) CPU VMs
+node_count: 2
+gpu: true
+image: "demo/mpi_demo.sif"     # host mpirun must match the VMs' OpenMPI (4.1.x)
+command: ["/opt/mpi_demo"]
 output_dir: "/out"
 ```
 

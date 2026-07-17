@@ -40,6 +40,8 @@ collected. See `docs/04-job-lifecycle.md` and `docs/06-interface-contract.md`.
 - **No separate executor layer** (deliberate). Running a container is what an
   adapter does once it owns a node. Flexibility comes from the generic JobSpec.
 - Work **inside the nix dev shell** (`nix develop`); all tooling is pinned there.
+  On a non-nix host (native Ubuntu), `source env.sh` + the apt install list in
+  `docs/07-ubuntu-setup.md` replace it.
 - Reconciler defaults to **dry-run** (`NullAdapter`); `--execute` uses real adapters.
 - A job that can't get capacity **waits and retries** (not an immediate failure)
   up to `CLUSTER_CAPACITY_WAIT_TIMEOUT` (default 600s), then fails cleanly. Jobs
@@ -64,12 +66,14 @@ reconciler/                 the control plane (Python package)
   cli.py                    cluster commands (incl. logs / reconciler-log)
 demo/                       mpi_demo.c/.def/.sif, run-mpi-demo.sh (bare), run-scheduling-demo.sh
 viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer
-docs/                       01-architecture … 06-interface-contract
+docs/                       01-architecture … 07-ubuntu-setup (native Ubuntu, no nix)
 bin/cluster             CLI launcher (python -m reconciler)
 job.example.yaml            sample generic JobSpec (dry-run)
 job.mpi.example.yaml        multi-node MPI JobSpec (node_count: 4)
 job.mpi.small.example.yaml  multi-node MPI JobSpec (node_count: 2, for contention demos)
 job.gpu.example.yaml        GPU JobSpec (nvidia-smi via apptainer --nv)
+job.hybrid.example.yaml     hybrid JobSpec (host GPU node + VM in ONE mpirun)
+env.sh                      source on a non-nix host (Ubuntu) in place of the dev shell
 ```
 
 ## Commands
@@ -102,6 +106,7 @@ cluster clear-jobs [--force]  # demo reset: wipe job/audit history + replay logs
 # one-shot demos
 make mpi-sif                     # build demo/mpi_demo.sif (needed once for MPI job specs)
 make submit-mpi                  # submit job.mpi.example.yaml
+make submit-hybrid               # submit job.hybrid.example.yaml (host GPU + VM, one mpirun)
 make demo-scheduling             # submit 4 jobs (2x pool-filling MPI, 1 waiting, 1 GPU), tick live
 ```
 
@@ -140,6 +145,28 @@ and launches real `mpirun` from the head node — a **hybrid** launch where
 (`apptainer exec <image> <cmd>`) runs inside the container. See
 `demo/mpi_demo.def` for how the demo container is built to match.
 
+`JobSpec.hybrid: true` (requires `launcher: mpi`, `node_count >= 2`) is the
+one job shape that mixes pools: it claims 1 GPU node (the host) + the rest as
+CPU VMs (host always `nodes[0]`) and `LocalHostAdapter._run_mpi` launches one
+`mpirun` FROM THE HOST spanning all of them — rank 0 forked locally (the
+host's cluster0 bridge address is a local interface; no sshd on the host), VM
+ranks over ssh with the cluster key (`plm_rsh_agent`, tree spawn disabled).
+Needs `mpirun` on the host matching the guests' OpenMPI 4.1.x — the nix dev
+shell pins it to 4.1.6 via a second flake input (`nixpkgs-mpi` = nixos-24.05),
+since unstable ships 5.x. The hybrid launch uses a **per-rank OpenMPI appfile**
+(`write_appfile` / `mpirun --app`), not one shared command: rank 0 (the GPU
+host) gets `apptainer exec --nv` + the `CLUSTER_GPU_BINDS` driver binds, while
+the VM ranks get a plain launch — the binds' source paths (e.g. NixOS's
+`/nix/store`) don't exist inside a VM and a missing bind source is a hard
+apptainer error, so only the host rank, which needs them, carries them.
+Fabric pinning is split (`fabric_if_include`): OOB uses a **per-node `/32`
+list**, BTL uses the **`/24` subnet** — running mpirun on the host (bridge +
+docker/veth/tailscale/wifi interfaces) trips two opposite OpenMPI 4.1.x
+matching bugs (`/24` makes OOB reject the bridge; `/32` makes BTL "match" every
+interface and advertise unreachable wifi/docker addrs → MPI hangs). Live-
+verified end to end: `job.hybrid.cuda.example.yaml` (VM CPU rank → host RTX
+GPU rank, `y=a*x+b`) reached `promoted`, `max |error| 0`.
+
 **Jobs advance concurrently**, not one at a time: `tick()` runs each active
 job's phase on its own worker thread (capped at `CLUSTER_RECONCILE_WORKERS`,
 default 8), and per-job node loops (provisioning/tearing down N nodes) are
@@ -148,7 +175,8 @@ one job never blocks any other job's progress.
 
 ## Scheduling
 
-`gpu: true` jobs claim GPU nodes (only `cluster-host`); `gpu: false` jobs claim VMs.
+`gpu: true` jobs claim GPU nodes (only `cluster-host`); `gpu: false` jobs claim VMs;
+`hybrid: true` claims 1 GPU node + (node_count-1) VMs (GPU-first, all-or-nothing).
 Claims are atomic (fcntl / `find_one_and_update`) = exclusive locks. A job that
 can't get enough capacity right now **waits and retries every tick** (it is
 NOT failed immediately) until either it succeeds or `CLUSTER_CAPACITY_WAIT_TIMEOUT`
@@ -159,8 +187,9 @@ always time out this way — there is one GPU node.
 ## The open interface (contract with whatever drives it)
 
 - **Intake:** a `JobSpec` doc in `jobs` — `name, image, command, runtime,
-  launcher, node_count, gpu, env, output_dir, params`. `image=""` → dry-run.
-  `launcher: "mpi"` + `node_count > 1` → real multi-node `mpirun`.
+  launcher, node_count, gpu, hybrid, env, output_dir, params`. `image=""` → dry-run.
+  `launcher: "mpi"` + `node_count > 1` → real multi-node `mpirun`;
+  `hybrid: true` → the mpirun spans the host GPU node + VMs.
 - **Egress:** artifacts land in `${CLUSTER_DROPZONE}/<job_id>/` — `stdout.log`
   (the container's captured stdout+stderr, guaranteed for every adapter/launch
   path) plus whatever the job wrote to `output_dir`; `jobs.drop_path`/`run`

@@ -22,6 +22,7 @@ is intentionally generic — the cluster runs *any* container:
 | `launcher` | str | `"single"` (default) — one node, or `"mpi"` — real multi-node `mpirun` across the `node_count` claimed nodes (ignored if `node_count == 1`) |
 | `node_count` | int | how many nodes to claim |
 | `gpu` | bool | `true` → schedule on a GPU node (the host); `false` → VMs |
+| `hybrid` | bool | `true` → claim 1 GPU node (the host) **+** `node_count-1` CPU VMs and launch ONE `mpirun` spanning them (requires `launcher: mpi`, `node_count >= 2`) — the only job shape that mixes the two pools |
 | `env` | map | env vars set inside the container |
 | `output_dir` | str | in-container path the job writes results to (bound to the host) |
 | `params` | map | opaque passthrough (ignored by the cluster) |
