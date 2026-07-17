@@ -8,7 +8,7 @@ printf '%-14s %-10s %-16s %-8s %-6s\n' "----" "-----" "--" "-----" "---"
 for i in $(node_seq); do
   name="$(node_name "$i")"; ip="$(node_ip "$i")"
   state="absent"; dom_exists "${name}" && state="$(virsh domstate "${name}" 2>/dev/null)"
-  lease="no"; virsh net-dhcp-leases "${CLUSTER_NET_NAME}" 2>/dev/null | grep -q "${ip}" && lease="yes"
+  lease="no"; grep -q "${ip}" <<<"$(virsh net-dhcp-leases "${CLUSTER_NET_NAME}" 2>/dev/null)" && lease="yes"
   ssh="-"; [[ "${state}" == "running" ]] && { nc -z -w1 "${ip}" 22 2>/dev/null && ssh="up" || ssh="down"; }
   printf '%-14s %-10s %-16s %-8s %-6s\n' "${name}" "${state}" "${ip}" "${lease}" "${ssh}"
 done

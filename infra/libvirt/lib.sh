@@ -56,9 +56,13 @@ preflight() {
 }
 
 net_exists()    { virsh net-info "${CLUSTER_NET_NAME}" >/dev/null 2>&1; }
-net_active()    { virsh net-info "${CLUSTER_NET_NAME}" 2>/dev/null | grep -q 'Active:.*yes'; }
+# NB: match against a captured string, not a live `virsh ... | grep -q` pipe.
+# `grep -q` exits on first match and closes the pipe; with `set -o pipefail`
+# (set at top of file) the producer then dies of SIGPIPE (141) and that becomes
+# the pipeline's status — a spurious "false" even when the pattern matched.
+net_active()    { grep -q 'Active:.*yes' <<<"$(virsh net-info "${CLUSTER_NET_NAME}" 2>/dev/null)"; }
 dom_exists()    { virsh dominfo "$1" >/dev/null 2>&1; }
-dom_running()   { virsh domstate "$1" 2>/dev/null | grep -q 'running'; }
+dom_running()   { grep -q 'running' <<<"$(virsh domstate "$1" 2>/dev/null)"; }
 
 ensure_dirs() { mkdir -p "${CLUSTER_TEMPLATE_DIR}" "${CLUSTER_OVERLAY_DIR}" "${CLUSTER_SEED_DIR}" "${CLUSTER_INVENTORY_DIR}"; }
 
