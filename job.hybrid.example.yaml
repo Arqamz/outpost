@@ -1,0 +1,19 @@
+# Hybrid MPI job: ONE mpirun spanning the host GPU node AND VM CPU node(s).
+#
+# hybrid: true claims 1 GPU node (the host) + (node_count - 1) CPU VMs. mpirun
+# runs on the host: rank 0 is forked locally (the host's cluster0 bridge
+# address is a local interface), VM ranks are launched over ssh with the
+# cluster key, and all ranks talk TCP on the cluster0 network. No sshd is
+# needed on the host. Requires mpirun on the host matching the VMs' OpenMPI
+# (Ubuntu: apt install openmpi-bin) and the demo image (make mpi-sif).
+name: hybrid-mpi-smoke
+launcher: mpi
+hybrid: true               # 1 GPU node (the host) + (node_count-1) CPU VMs
+node_count: 2
+gpu: true                  # --nv on every rank; GPU-less VM ranks warn + continue
+runtime: apptainer
+image: "demo/mpi_demo.sif"
+command: ["/opt/mpi_demo"]
+output_dir: "/out"
+params:
+  note: "host GPU rank + VM CPU rank in one mpirun over the cluster0 TCP fabric"

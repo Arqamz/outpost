@@ -1,0 +1,23 @@
+# Hybrid MPI + CUDA job: ONE mpirun spanning the host GPU node AND a VM CPU node,
+# where the VM rank generates data on the CPU and the host rank runs a real CUDA
+# kernel (y = a*x + b) on it — exercising the full VM-CPU -> host-GPU data path.
+#
+# hybrid: true claims 1 GPU node (the host) + (node_count - 1) CPU VMs. The host
+# rank (rank 0) launches with `apptainer exec --nv` + the driver binds; the VM
+# rank launches plain (no GPU) — the reconciler builds a per-rank OpenMPI appfile
+# so the two ranks differ (see LocalHostAdapter._run_mpi / write_appfile).
+#
+# Requires: mpirun on the host matching the VMs' OpenMPI 4.1.6 (nix dev shell
+# pins it via flake.nix) and the demo image built with `make cuda-sif` (needs a
+# CUDA 12.8+ GPU driver — this host's Blackwell qualifies).
+name: hybrid-cuda-axpb
+launcher: mpi
+hybrid: true               # 1 GPU node (the host) + (node_count-1) CPU VMs
+node_count: 2
+gpu: true                  # host rank gets --nv + driver binds; VM rank runs plain
+runtime: apptainer
+image: "demo/cuda_axpb.sif"
+command: ["/opt/cuda_axpb"]
+output_dir: "/out"
+params:
+  note: "VM CPU rank generates x, host GPU rank runs y=a*x+b on the real GPU and validates"
