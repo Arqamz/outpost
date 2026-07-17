@@ -5,8 +5,8 @@ ANS := infra/ansible
 
 .PHONY: help net-up net-down template cluster-up cluster-down status \
         inventory bootstrap bootstrap-check fail clean \
-        seed-nodes submit reconcile jobs mpi-demo mpi-sif submit-mpi dashboard \
-        demo-scheduling
+        seed-nodes submit reconcile jobs mpi-demo mpi-sif submit-mpi submit-hybrid \
+        cuda-sif submit-hybrid-cuda dashboard demo-scheduling
 
 help:
 	@echo "Cluster targets:"
@@ -25,9 +25,12 @@ help:
 	@echo "  make seed-nodes    register nodes in the reconciler (VMs + host GPU node)"
 	@echo "  make submit        submit job.example.yaml"
 	@echo "  make submit-mpi    submit job.mpi.example.yaml (containerized multi-node MPI)"
+	@echo "  make submit-hybrid submit job.hybrid.example.yaml (host GPU + VM in one mpirun)"
+	@echo "  make submit-hybrid-cuda submit job.hybrid.cuda.example.yaml (VM CPU -> host GPU Ax+B)"
 	@echo "  make reconcile     drive the state machine one tick (--once)"
 	@echo "  make jobs          list jobs + states"
 	@echo "  make mpi-sif       build demo/mpi_demo.sif (containerized MPI demo)"
+	@echo "  make cuda-sif      build demo/cuda_axpb.sif (MPI+CUDA hybrid demo)"
 	@echo "  make demo-scheduling  submit 4 jobs (contention + wait + GPU) and tick live"
 	@echo "  --- log lookup ---"
 	@echo "  bin/cluster logs <job-id>     full per-job replay transcript"
@@ -55,6 +58,8 @@ clean: cluster-down net-down
 seed-nodes: ; bin/cluster seed-nodes
 submit:     ; bin/cluster submit --spec job.example.yaml
 submit-mpi: ; bin/cluster submit --spec job.mpi.example.yaml
+submit-hybrid: ; bin/cluster submit --spec job.hybrid.example.yaml
+submit-hybrid-cuda: ; bin/cluster submit --spec job.hybrid.cuda.example.yaml
 reconcile:  ; bin/cluster reconcile --once
 jobs:       ; bin/cluster list
 
@@ -62,7 +67,12 @@ jobs:       ; bin/cluster list
 mpi-demo:   ; demo/run-mpi-demo.sh
 
 # --- containerized MPI demo (apptainer image for the reconciler's mpi launcher) ---
-mpi-sif:    ; apptainer build demo/mpi_demo.sif demo/mpi_demo.def
+# build-sif.sh picks native fakeroot vs a proot rootless build per host (NixOS
+# has no setuid fakeroot; see the script). Run inside the nix dev shell (proot).
+mpi-sif:    ; demo/build-sif.sh demo/mpi_demo.sif demo/mpi_demo.def
+
+# --- containerized MPI+CUDA hybrid demo (VM CPU rank -> host GPU rank Ax+B) ---
+cuda-sif:   ; demo/build-sif.sh demo/cuda_axpb.sif demo/cuda_axpb.def
 
 # --- scheduling demo: 4 jobs (2x pool-filling MPI, 1 waiting MPI, 1 GPU), ticked live ---
 demo-scheduling: ; demo/run-scheduling-demo.sh
