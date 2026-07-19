@@ -11,6 +11,7 @@ correct under concurrency.
 from __future__ import annotations
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterable
@@ -67,52 +68,76 @@ except ImportError:  # pragma: no cover
 class FileStore(Store):
     def __init__(self, path: str):
         self.path = path
+        # Lock lives on its OWN stable file, never on the data file: the data
+        # file is replaced atomically (see _atomic_write), which would swap the
+        # inode a flock is held on. A dedicated lock inode keeps the exclusive
+        # read-modify-write correct across the rename and across processes.
+        self.lock_path = path + ".lock"
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
+        # Recreate on a missing OR zero-byte file: a full disk (ENOSPC) used to
+        # truncate the data file to empty mid-write, which then crashed every
+        # reader with a JSONDecodeError. Self-heal instead of wedging the store.
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
             self._write({COL_JOBS: {}, COL_NODES: {}, COL_AUDIT: []})
+
+    def _atomic_write(self, data: dict) -> None:
+        # Write a temp file in the same dir, fsync, then os.replace() over the
+        # target — an atomic rename. If serialization or the write fails (e.g.
+        # ENOSPC), the live file is never touched, so it can't be left empty or
+        # half-written; the temp is discarded. This is what makes the store
+        # crash-safe on a full disk.
+        d = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _load(self) -> dict:
+        with open(self.path) as f:
+            return json.load(f)
 
     @contextmanager
     def _locked(self):
         # Exclusive advisory lock around a read-modify-write; this is what gives
         # claim_node its atomicity across separate CLI processes/threads.
-        f = open(self.path, "r+")
+        lf = open(self.lock_path, "w")
         try:
             if fcntl:
-                fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            data = json.load(f)
-            yield data, f
-            f.seek(0); f.truncate()
-            json.dump(data, f, indent=2)
-            f.flush()   # push the write out BEFORE unlocking (see below), else a
-            os.fsync(f.fileno())  # waiting reader/writer can acquire the lock the
-        finally:                 # instant we unlock and still see stale/truncated
-            # content the OS hasn't made visible yet. Unlock (and close, which
-            # would implicitly unlock anyway) only after the flush lands, so
-            # nothing that was waiting on this lock can observe a half-write.
+                fcntl.flock(lf, fcntl.LOCK_EX)
+            data = self._load()
+            yield data, lf
+            self._atomic_write(data)
+        finally:
             if fcntl:
-                fcntl.flock(f, fcntl.LOCK_UN)
-            f.close()
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            lf.close()
 
     def _read(self) -> dict:
         # Shared lock: blocks only while a writer holds _locked()'s exclusive
-        # lock, so this can never observe the file mid truncate-then-rewrite.
-        # Concurrent readers don't block each other (LOCK_SH is shared). This
-        # matters once callers aren't strictly serial — reconciler.tick() now
-        # advances jobs from a thread pool, so unlocked reads here used to be
-        # able to land exactly between _locked()'s truncate() and its write.
-        with open(self.path) as f:
+        # lock, so this never observes the file mid-write (and os.replace is
+        # atomic regardless). Concurrent readers don't block each other. Matters
+        # now that reconciler.tick() advances jobs from a thread pool.
+        lf = open(self.lock_path, "w")
+        try:
             if fcntl:
-                fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                return json.load(f)
-            finally:
-                if fcntl:
-                    fcntl.flock(f, fcntl.LOCK_UN)
+                fcntl.flock(lf, fcntl.LOCK_SH)
+            return self._load()
+        finally:
+            if fcntl:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            lf.close()
 
     def _write(self, data: dict) -> None:
-        with open(self.path, "w") as f:
-            json.dump(data, f, indent=2)
+        self._atomic_write(data)
 
     def put_job(self, job: JobRecord) -> None:
         job.updated_at = now_iso()
