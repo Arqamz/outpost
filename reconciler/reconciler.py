@@ -277,9 +277,19 @@ class Reconciler:
             if nid in bad:
                 self.registry.quarantine(nid, f"failed job {job.job_id}: {reason}")
             else:
-                # Healthy node not implicated -> return to pool.
+                # Healthy node not implicated -> tear the VM down and return to
+                # pool. Deprovision, not just release: the pool is ephemeral (see
+                # _phase_teardown), so releasing the claim WITHOUT destroying the
+                # VM orphans a running domain that no job owns and nothing later
+                # tears down. deprovision is wrapped so a teardown error on the
+                # failure path never masks the job's real failure reason.
                 node = self.store.get_node(nid)
                 if node and NodeState(node.state) not in (NodeState.AVAILABLE, NodeState.QUARANTINED):
+                    try:
+                        self._adapter_for(node).deprovision(node, job.job_id)
+                    except Exception as e:  # noqa: BLE001 — keep the original failure
+                        self.log(f"[reconciler] post-failure deprovision of {nid} "
+                                 f"failed (VM may need manual cleanup): {e}")
                     self.registry.release(nid, f"released after job {job.job_id} failure")
         self._set_job(job, JobState.FAILED, reason)
 
