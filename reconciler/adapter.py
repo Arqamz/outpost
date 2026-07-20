@@ -16,7 +16,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 from .models import NodeRecord, JobSpec, RunResult
 from .store import now_iso
@@ -451,11 +453,58 @@ class LibvirtAdapter(ProviderAdapter):
         # path. Without it, connections fall back to ambient SSH defaults and
         # intermittently fail host-key verification with no prompt to answer it.
         self.log(f"[libvirt] bootstrapping {[n.name for n in nodes]}")
-        with self._inventory_lock:
-            run_logged([os.path.join(LIBVIRT_DIR, "gen-inventory.sh")], job_id)
+        shared = os.path.join(ANSIBLE_DIR, "inventory", "hosts.ini")
+        job_inventory = os.path.join(ANSIBLE_DIR, "inventory", f"hosts-{job_id}.ini")
+        want = {n.name for n in nodes}
+        # gen-inventory.sh rewrites ONE shared hosts.ini listing every running
+        # domain cluster-wide, and it only lists domains virsh reports 'running'.
+        # Under concurrent jobs that shared file is a race on two axes:
+        #   1) a freshly-provisioned VM can miss the 'running' window (domstate
+        #      lags the start) -> this job's node is absent from the file;
+        #   2) another job's gen-inventory rewrite can be read half-written, so
+        #      ansible parses the host line but not the trailing [nodes:vars]
+        #      (losing ansible_user=cluster + the key path) and falls back to the
+        #      host user -> "Permission denied (publickey)" UNREACHABLE (exit 4).
+        # Both silently corrupted runs on 2026-07-21. Fix: under the lock,
+        # regenerate until every requested node is present, then snapshot the file
+        # to a PER-JOB inventory ansible reads alone — no shared mutable state for
+        # a concurrent writer to tear. Fail closed if the nodes never appear.
+        deadline = time.monotonic() + 120
+        while True:
+            with self._inventory_lock:
+                run_logged([os.path.join(LIBVIRT_DIR, "gen-inventory.sh")], job_id)
+                ready = want <= self._inventory_hosts(shared)
+                if ready:
+                    shutil.copy2(shared, job_inventory)  # atomic snapshot, still locked
+            if ready:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"bootstrap aborted: {sorted(want - self._inventory_hosts(shared))} "
+                    f"not in the ansible inventory after 120s (domain not 'running'?) "
+                    f"— refusing to run the play on zero hosts and mark it bootstrapped")
+            time.sleep(5)
         limit = ",".join(n.name for n in nodes)
-        run_logged(["ansible-playbook", "-i", os.path.join(ANSIBLE_DIR, "inventory", "hosts.ini"),
-                   "--limit", limit, "site.yml"], job_id, cwd=ANSIBLE_DIR)
+        try:
+            run_logged(["ansible-playbook", "-i", job_inventory,
+                       "--limit", limit, "site.yml"], job_id, cwd=ANSIBLE_DIR)
+        finally:
+            try:
+                os.remove(job_inventory)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _inventory_hosts(inventory: str) -> set[str]:
+        """Host names in the generated inventory's [nodes] group (each line is
+        `<name> ansible_host=<ip>`; skip comments, blanks, and [section]/vars)."""
+        hosts: set[str] = set()
+        for line in Path(inventory).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", "[")) or "ansible_host=" not in line:
+                continue
+            hosts.add(line.split()[0])
+        return hosts
 
     def run(self, nodes, job_id, spec):
         head = nodes[0]
