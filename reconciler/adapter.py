@@ -28,6 +28,16 @@ def _log_stderr(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _is_staging_artifact(name: str) -> bool:
+    """Staging files that MUST NOT be collected into the drop-zone: the per-node
+    container image (a ~5 GB SIF staged into the workdir) and the MPI hostfile.
+    collect() ships the whole workdir, so pulling the image back duplicated it
+    once per job and filled /home to 100% (2026-07-21) — corrupting the state
+    file mid-write. The image is content-addressed + cached (.var/sif-cache) and
+    fully regenerable; only stdout.log + the output_dir files are real results."""
+    return name.endswith(".sif") or name == "hostfile"
+
+
 REPO_ROOT = os.environ.get("CLUSTER_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIBVIRT_DIR = os.path.join(REPO_ROOT, "infra", "libvirt")
 ANSIBLE_DIR = os.path.join(REPO_ROOT, "infra", "ansible")
@@ -401,6 +411,8 @@ class LocalHostAdapter(ProviderAdapter):
         os.makedirs(dest, exist_ok=True)
         if os.path.isdir(workdir):
             for name in os.listdir(workdir):
+                if _is_staging_artifact(name):
+                    continue
                 src = os.path.join(workdir, name)
                 dst = os.path.join(dest, name)
                 if os.path.isdir(src):
