@@ -81,6 +81,11 @@ pkgs.mkShell {
     export CLUSTER_GPU_LD_LIBRARY_PATH="${pkgs.glibc}/lib:/run/opengl-driver/lib"
     # apptainer image cache stays inside the repo (.var is gitignored)
     export APPTAINER_CACHEDIR="$CLUSTER_ROOT/.var/apptainer-cache"
+    # OCI->SIF conversion unpacks a full rootfs (25G+ for NGC images) into its
+    # tmpdir — that must be disk, not the default /tmp tmpfs, or big pulls die
+    # with ENOSPC mid-unpack.
+    export APPTAINER_TMPDIR="$CLUSTER_ROOT/.var/tmp"
+    mkdir -p "$APPTAINER_TMPDIR"
 
     echo "── outpost dev shell ─────────────────────────────────────────────"
     echo "  libvirt URI : $LIBVIRT_DEFAULT_URI"

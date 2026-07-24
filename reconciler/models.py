@@ -111,7 +111,22 @@ class NodeRecord:
     gpu: bool = False                   # has a usable GPU (the host does)
     local: bool = False                 # the control-plane host itself; never libvirt-provisioned
     runtime: str = "apptainer"          # container runtime available on the node
+    # which adapter drives this node's lifecycle + workloads. "" is derived
+    # (local -> "local", else "libvirt") so records written before this field
+    # keep their old routing. "static-ssh" = a pre-provisioned ssh box (e.g. an
+    # EC2 instance) that we don't provision/destroy, only run containers on.
+    provider: str = ""
+    # per-node ssh identity, for a static node that uses its own credentials
+    # (e.g. EC2's `ubuntu` user + its keypair) instead of the cluster fabric's.
+    # "" -> fall back to the cluster-wide CLUSTER_SSH_USER / CLUSTER_SSH_PRIVKEY.
+    ssh_user: str = ""
+    ssh_key: str = ""
     updated_at: str | None = None
+
+    @property
+    def adapter_key(self) -> str:
+        """The adapters-dict key that routes this node (see Reconciler._adapter_for)."""
+        return self.provider or ("local" if self.local else "libvirt")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -120,7 +135,8 @@ class NodeRecord:
     def from_dict(d: dict) -> "NodeRecord":
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
-                "gpu", "local", "runtime", "updated_at"}
+                "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
+                "updated_at"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 

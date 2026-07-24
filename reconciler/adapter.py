@@ -10,7 +10,10 @@ implements the same five methods.
 """
 from __future__ import annotations
 import dataclasses
+import fcntl
+import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -43,6 +46,7 @@ LIBVIRT_DIR = os.path.join(REPO_ROOT, "infra", "libvirt")
 ANSIBLE_DIR = os.path.join(REPO_ROOT, "infra", "ansible")
 RUNS_DIR = os.path.join(REPO_ROOT, ".var", "runs")   # per-job host workdirs
 LOGS_DIR = os.path.join(REPO_ROOT, ".var", "logs")   # replay transcripts (gitignored)
+SIF_CACHE_DIR = os.path.join(REPO_ROOT, ".var", "sif-cache")  # docker://→SIF, keyed by digest
 
 # SSH params for reaching VMs (match infra/libvirt/config.env defaults).
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
@@ -87,18 +91,65 @@ def run_logged(argv: list[str], job_id: str, cwd: str | None = None, check: bool
     return proc.returncode
 
 
-def ssh_base(ip: str) -> list[str]:
-    """argv prefix for reaching a cluster node over ssh with the cluster key.
-    Module-level (not a LibvirtAdapter detail) because the hybrid MPI path on
-    the host stages images into VMs with the exact same fabric."""
-    return ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null", f"{SSH_USER}@{ip}"]
+def node_ssh_id(node: NodeRecord) -> tuple[str, str]:
+    """(ssh_user, ssh_key) for reaching a node — its own credentials if set (a
+    static/EC2 node uses `ubuntu` + its keypair), else the cluster-wide default."""
+    return node.ssh_user or SSH_USER, node.ssh_key or SSH_KEY
 
 
-def scp_to(ip: str, src: str, dst: str, job_id: str) -> None:
-    argv = ["scp", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null", src, f"{SSH_USER}@{ip}:{dst}"]
+def ssh_base(ip: str, user: str | None = None, key: str | None = None) -> list[str]:
+    """argv prefix for reaching a cluster node over ssh. Module-level (not a
+    LibvirtAdapter detail) because the hybrid MPI path on the host stages images
+    into VMs with the exact same fabric. user/key default to the cluster fabric's;
+    a static node passes its own (see node_ssh_id)."""
+    return ["ssh", "-i", key or SSH_KEY, "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", f"{user or SSH_USER}@{ip}"]
+
+
+def scp_to(ip: str, src: str, dst: str, job_id: str,
+           user: str | None = None, key: str | None = None) -> None:
+    argv = ["scp", "-i", key or SSH_KEY, "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", src, f"{user or SSH_USER}@{ip}:{dst}"]
     run_logged(argv, job_id)
+
+
+def _sif_cache_name(ref: str) -> str:
+    """A stable per-image SIF filename — the content digest when the ref is
+    digest-pinned (the norm), else a hash of the ref string."""
+    m = re.search(r"@sha256:([0-9a-f]{64})", ref)
+    key = f"sha256-{m.group(1)}" if m else hashlib.sha256(ref.encode()).hexdigest()[:16]
+    return f"{key}.sif"
+
+
+def ensure_local_sif(image: str, job_id: str) -> str:
+    """Resolve a job image to a LOCAL .sif path for MPI staging.
+
+    Single-node runs hand `image` straight to `apptainer exec`, which consumes a
+    `docker://…@digest` ref directly. MPI staging can't: it scp's the image file
+    onto every rank's node, so a registry ref must be materialized into a real
+    SIF on the host first. A path that's already a local file passes through.
+
+    The SIF is built ONCE per image digest into a shared cache and reused across
+    jobs — a `--runs 3` batch (three jobs) or repeated suites all share one
+    build. Building per-job instead duplicated a ~5G SIF per job AND ran the
+    concurrent ~26G rootfs unpacks that filled the disk. The flock serializes a
+    cold-cache stampede (the batch's first jobs racing to build the same SIF):
+    the winner builds, the rest block then reuse."""
+    if os.path.isfile(image):
+        return image
+    if "://" not in image and not image.startswith(("docker-daemon:", "oci:", "sif:")):
+        raise RuntimeError(
+            f"job image {image!r} is neither a local file nor a pullable ref "
+            "(expected a .sif path or docker://…@sha256:…)")
+    os.makedirs(SIF_CACHE_DIR, exist_ok=True)
+    cached = os.path.join(SIF_CACHE_DIR, _sif_cache_name(image))
+    with open(cached + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if not os.path.isfile(cached):
+            tmp = f"{cached}.{job_id}.tmp"   # build to tmp, atomic-rename in on success
+            run_logged(["apptainer", "build", "--force", tmp, image], job_id)
+            os.replace(tmp, cached)
+    return cached
 
 
 def gpu_launch_extras() -> tuple[list[str], dict]:
@@ -365,12 +416,18 @@ class LocalHostAdapter(ProviderAdapter):
                 "Ubuntu: apt install openmpi-bin)")
         workdir = f"/tmp/cluster/{job_id}"
         os.makedirs(workdir, exist_ok=True)
-        image = f"{workdir}/{os.path.basename(spec.image)}"
+        # The image must sit at the SAME absolute path on the host and every VM
+        # (the appfile references one path for all ranks). Materialize a
+        # docker://…@digest ref into a SIF at that shared path; a local .sif is
+        # copied there. Either way `image` is workdir/image.sif everywhere.
+        image = f"{workdir}/image.sif"
+        src = ensure_local_sif(spec.image, job_id)
+        if os.path.abspath(src) != os.path.abspath(image):
+            shutil.copy2(src, image)
         appfile = f"{workdir}/appfile"
-        shutil.copy2(spec.image, image)
         for n in nodes[1:]:
             run_logged(ssh_base(n.ip) + [f"mkdir -p {workdir}"], job_id)
-            scp_to(n.ip, spec.image, image, job_id)
+            scp_to(n.ip, image, image, job_id)
 
         # rank 0 (host): --nv + the declaratively-exported GPU binds (on NixOS,
         # /nix/store + /run/opengl-driver so the driver's userspace resolves).
@@ -438,8 +495,8 @@ class LibvirtAdapter(ProviderAdapter):
     def __init__(self, log=_log_stderr):
         self.log = log
 
-    def _ssh_base(self, ip: str) -> list[str]:
-        return ssh_base(ip)
+    def _ssh_base(self, node: NodeRecord) -> list[str]:
+        return ssh_base(node.ip, *node_ssh_id(node))
 
     def provision(self, node, job_id):
         self.log(f"[libvirt] provisioning {node.name}")
@@ -539,11 +596,11 @@ class LibvirtAdapter(ProviderAdapter):
         remote = (f"mkdir -p {remote_workdir} && ({inner}) 2>&1 | tee {stdout_log}; "
                   f"exit ${{PIPESTATUS[0]}}")
         self.log(f"[libvirt] ssh {head.name}: {inner}")
-        rc = run_logged(self._ssh_base(head.ip) + [remote], job_id, check=False)
+        rc = run_logged(self._ssh_base(head) + [remote], job_id, check=False)
         return RunResult(job_id, head.name, rc, remote_workdir, stdout_log, note=f"remote exit={rc}")
 
-    def _scp_to(self, ip: str, src: str, dst: str, job_id: str) -> None:
-        scp_to(ip, src, dst, job_id)
+    def _scp_to(self, node: NodeRecord, src: str, dst: str, job_id: str) -> None:
+        scp_to(node.ip, src, dst, job_id, *node_ssh_id(node))
 
     def _run_mpi(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
                  remote_workdir: str) -> RunResult:
@@ -554,21 +611,25 @@ class LibvirtAdapter(ProviderAdapter):
         from the nodes THIS job claimed, not the cluster-wide 8) and staged
         fresh onto every claimed node under remote_workdir."""
         head = nodes[0]
-        remote_image = f"{remote_workdir}/{os.path.basename(spec.image)}"
         remote_hostfile = f"{remote_workdir}/hostfile"
         btl_inc, oob_inc = fabric_if_include(nodes)
 
         local_scratch = os.path.join(RUNS_DIR, job_id)
         os.makedirs(local_scratch, exist_ok=True)
+        # A docker://…@digest ref is materialized into a real SIF here before
+        # it can be scp'd onto each rank's node (single-node execs the ref
+        # directly, but staging needs a file).
+        local_image = ensure_local_sif(spec.image, job_id)
+        remote_image = f"{remote_workdir}/{os.path.basename(local_image)}"
         local_hostfile = os.path.join(local_scratch, "hostfile")
         with open(local_hostfile, "w") as f:
             for n in nodes:
                 f.write(f"{n.ip} slots=1\n")
 
         for n in nodes:
-            run_logged(self._ssh_base(n.ip) + [f"mkdir -p {remote_workdir}"], job_id)
-            self._scp_to(n.ip, spec.image, remote_image, job_id)
-        self._scp_to(head.ip, local_hostfile, remote_hostfile, job_id)
+            run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
+            self._scp_to(n, local_image, remote_image, job_id)
+        self._scp_to(head, local_hostfile, remote_hostfile, job_id)
 
         rank_spec = dataclasses.replace(spec, image=remote_image)
         per_rank = container_argv(rank_spec, remote_workdir, spec.output_dir)
@@ -580,7 +641,7 @@ class LibvirtAdapter(ProviderAdapter):
         # process) into the head's workdir so collect() ships it to the drop-zone.
         remote = f"({inner}) 2>&1 | tee {stdout_log}; exit ${{PIPESTATUS[0]}}"
         self.log(f"[libvirt] ssh {head.name} (mpirun head, {len(nodes)} ranks): {inner}")
-        rc = run_logged(self._ssh_base(head.ip) + [remote], job_id, check=False)
+        rc = run_logged(self._ssh_base(head) + [remote], job_id, check=False)
         return RunResult(job_id, head.name, rc, remote_workdir, stdout_log,
                          note=f"mpirun np={len(nodes)} exit={rc}")
 
@@ -588,7 +649,16 @@ class LibvirtAdapter(ProviderAdapter):
         head = nodes[0]
         remote_workdir = f"/tmp/cluster/{job_id}"
         os.makedirs(dest, exist_ok=True)
-        run_logged(["scp", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
+        # Drop the staged image (a ~5 GB SIF) + hostfile on the head BEFORE the
+        # recursive scp — see _is_staging_artifact. scp -r has no exclude, and
+        # the remote /tmp workdir is discarded when the VM is torn down, so
+        # removing them here just keeps them out of the drop-zone (they filled
+        # /home to 100% otherwise). The image is cached + regenerable.
+        run_logged(self._ssh_base(head) +
+                   [f"rm -f {remote_workdir}/*.sif {remote_workdir}/hostfile"],
+                   job_id, check=False)
+        user, key = node_ssh_id(head)
+        run_logged(["scp", "-i", key, "-o", "StrictHostKeyChecking=no",
                    "-o", "UserKnownHostsFile=/dev/null", "-r",
-                   f"{SSH_USER}@{head.ip}:{remote_workdir}/.", dest], job_id, check=False)
+                   f"{user}@{head.ip}:{remote_workdir}/.", dest], job_id, check=False)
         return dest
