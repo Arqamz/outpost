@@ -1,0 +1,78 @@
+# Outpost CPU-worker launch template (AWS EC2).
+#
+# Pass it straight to the AWS CLI as a YAML input — no flags:
+#
+#   aws ec2 create-launch-template --cli-input-yaml file://infra/aws/launch-template.yaml
+#
+# (Already have gtl-t0-cpu-preflight and just want a new version? Swap the verb:
+#   aws ec2 create-launch-template-version \
+#       --launch-template-name gtl-t0-cpu-preflight \
+#       --cli-input-yaml file://infra/aws/launch-template.yaml
+#  — in that case delete the LaunchTemplateName line below and keep only
+#  LaunchTemplateData.)
+#
+# The AMI / KeyName / SubnetId / security-group below are filled in for this
+# account (eu-north-1); swap them if you reuse this elsewhere.
+
+LaunchTemplateName: gtl-t0-cpu-preflight
+VersionDescription: Outpost static CPU worker — apptainer, on-demand, public IP for ssh
+LaunchTemplateData:
+  # PLAIN Ubuntu 22.04 LTS (amd64) — NOT the SQL-Server AMI from the old
+  # template: that one carries a SQL Server Standard license surcharge for
+  # software this worker never runs. Find the current plain image with:
+  #   aws ssm get-parameter --name \
+  #     /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+  #     --query Parameter.Value --output text
+  ImageId: ami-03b292fa1437b64db          # plain Canonical Ubuntu 22.04 amd64 (eu-north-1, 2026-07-14) — NOT the SQL-Server AMI
+  InstanceType: m5.xlarge                 # 4 vCPU / 16 GiB
+  KeyName: outpost-ec2                    # the key pair you import (see README) — authorizes ssh as `ubuntu`
+
+  # On-demand (~$0.20/hr): durable — won't be reclaimed. Spot (~$0.07/hr) is
+  # cheaper but AWS can terminate it on 2 min notice, and m5.xlarge spot in
+  # eu-north-1 was reclaimed for no-capacity within an hour (2026-07-22). To use
+  # spot instead, uncomment:
+  # InstanceMarketOptions:
+  #   MarketType: spot
+
+  # The PRIMARY network interface (device index 0). This is where a public IP +
+  # the security group are forced, so ssh from the control plane works even if
+  # the subnet doesn't auto-assign public IPv4. Do NOT also set a top-level
+  # SecurityGroupIds — a NetworkInterfaces block that carries Groups conflicts
+  # with it and the launch fails. This is the primary NIC, not a second card
+  # (m5.xlarge supports only one).
+  NetworkInterfaces:
+    - DeviceIndex: 0
+      AssociatePublicIpAddress: true
+      DeleteOnTermination: true
+      SubnetId: subnet-0592616bf8764a9ea  # eu-north-1a, vpc-05e3610ed098c641b (auto-assigns public IP)
+      Groups:
+        - sg-096de9e999b9d459d            # default SG — MUST first be given an inbound tcp/22 rule (see README / note below)
+
+  BlockDeviceMappings:
+    - DeviceName: /dev/sda1               # root; 8 GiB is too small once apptainer + a ~5 GB SIF land
+      Ebs:
+        VolumeSize: 30
+        VolumeType: gp3
+        DeleteOnTermination: true
+
+  MetadataOptions:                        # IMDSv2 required (matches the org's other templates)
+    HttpTokens: required
+    HttpEndpoint: enabled
+    HttpPutResponseHopLimit: 2
+
+  TagSpecifications:
+    - ResourceType: instance
+      Tags:
+        - Key: Project
+          Value: GTL
+        - Key: Tier
+          Value: T0
+        - Key: Role
+          Value: outpost-cpu-worker
+
+  # Installs apptainer 1.5.0 on first boot so the node is ready to run jobs.
+  # UserData MUST be base64. Generate the value with:
+  #   base64 -w0 infra/aws/user-data.sh
+  # then paste it below (uncomment). Or bake apptainer into a custom AMI instead
+  # and leave this out — StaticSshAdapter.bootstrap fails closed if it's missing.
+  # UserData: <BASE64_OF_user-data.sh>

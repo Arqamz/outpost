@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.environ.get("CLUSTER_ROOT") or os.path.dirname(HERE)
 sys.path.insert(0, REPO_ROOT)  # viz/ is a sibling of reconciler/, not a package under it
 
-from reconciler.adapter import job_log_path            # noqa: E402
+from reconciler.adapter import job_log_path, ssh_base, node_ssh_id  # noqa: E402
 from reconciler.reconciler import GLOBAL_LOG, clear_jobs  # noqa: E402
 from reconciler.store import open_store                 # noqa: E402
 
@@ -31,6 +31,11 @@ LOG_TAIL_LINES = int(os.environ.get("CLUSTER_DASH_LOG_TAIL", "1000"))
 URI = os.environ.get("LIBVIRT_DEFAULT_URI", "qemu:///system")
 PORT = int(os.environ.get("CLUSTER_DASH_PORT", "8087"))
 _prev: dict = {}   # sampler state for delta-based CPU%
+# static-ssh nodes are probed over ssh (slow, ~seconds); cache the probe so the
+# 2s stats poll doesn't pay an ssh round-trip every time (which stacked requests
+# and tore down mid-write on refresh -> BrokenPipe). Refresh at most every TTL.
+_static_cache: dict = {"ts": 0.0, "data": []}
+STATIC_TTL = float(os.environ.get("CLUSTER_DASH_STATIC_TTL", "5"))
 
 
 def _virsh(*a) -> str:
@@ -118,9 +123,67 @@ def _host_node(now: float) -> dict:
             "mem_total_mib": round(mem_total / 1024), "gpu": gpu}
 
 
+def _static_nodes(now: float) -> list[dict]:
+    """Registry nodes reached over ssh (provider=static-ssh, e.g. EC2) — they
+    have no libvirt domain, so _vm_nodes never sees them. One short ssh round-trip
+    per node reads /proc/stat + /proc/meminfo + nproc (same figures as _host_node,
+    just remote); CPU% is a delta between polls keyed per node. Best-effort: an
+    unreachable node (spot reclaimed, sg change) still shows up with reachable:
+    false and null stats rather than vanishing from the grid.
+
+    Cached for STATIC_TTL seconds: the ssh probe is slow relative to the 2s poll,
+    so without this every poll paid an ssh round-trip, stacking requests that got
+    torn down mid-write on a page refresh (BrokenPipe)."""
+    if now - _static_cache["ts"] < STATIC_TTL:
+        return _static_cache["data"]
+    out = []
+    try:
+        nodes = [n for n in open_store(STATE_PATH).list_nodes() if n.provider == "static-ssh"]
+    except Exception:
+        return out
+    for n in nodes:
+        argv = ssh_base(n.ip, *node_ssh_id(n))
+        argv[1:1] = ["-o", "ConnectTimeout=2", "-o", "BatchMode=yes"]
+        argv += ["head -n1 /proc/stat; "
+                 "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; nproc"]
+        card = {"name": n.name, "kind": "remote", "vcpus": None, "cpu_pct": None,
+                "mem_used_mib": None, "mem_total_mib": None, "reachable": False}
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=4)
+            lines = r.stdout.split("\n")
+            vals = list(map(int, lines[0].split()[1:]))       # cpu aggregate line
+            mi = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    mi[k.strip()] = int(v.strip().split()[0])  # KiB
+            vcpus = int([ln for ln in lines if ln.strip().isdigit()][-1])
+        except Exception:
+            out.append(card)
+            continue
+        card["reachable"] = True
+        card["vcpus"] = vcpus
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        total = sum(vals)
+        key = f"__static__{n.name}"
+        prev = _prev.get(key)
+        _prev[key] = (total, idle)
+        if prev:
+            dt, di = total - prev[0], idle - prev[1]
+            if dt > 0:
+                card["cpu_pct"] = max(0.0, min(100.0, (1 - di / dt) * 100))
+        mem_total = mi.get("MemTotal", 0)
+        card["mem_total_mib"] = round(mem_total / 1024) if mem_total else None
+        card["mem_used_mib"] = round((mem_total - mi.get("MemAvailable", 0)) / 1024) if mem_total else None
+        out.append(card)
+    out.sort(key=lambda x: x["name"])
+    _static_cache["ts"], _static_cache["data"] = now, out
+    return out
+
+
 def collect() -> dict:
     now = time.time()
-    return {"ts": now, "nodes": [_host_node(now)] + _vm_nodes(now)}
+    return {"ts": now, "nodes": [_host_node(now)] + _vm_nodes(now) + _static_nodes(now)}
 
 
 def _jobs() -> list[dict]:
@@ -162,13 +225,22 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    def _write(self, body: bytes) -> None:
+        """Write a response body, tolerating a client that already hung up. The
+        2s poll + page refreshes routinely close a connection mid-response, so a
+        BrokenPipe/reset here is normal, not a crash worth a traceback."""
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _json(self, obj) -> None:
         body = json.dumps(obj).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._write(body)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -190,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write(body)
         else:
             try:
                 with open(os.path.join(HERE, "cluster.html"), "rb") as f:
@@ -199,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._write(body)
             except FileNotFoundError:
                 self.send_error(404)
 

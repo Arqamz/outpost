@@ -1,0 +1,17 @@
+# Static SSH worker manifest — join a pre-provisioned, already-running host
+# (e.g. an EC2 instance) as a plain CPU worker:  cluster add-node --spec <this>
+#
+# The cluster does NOT provision or destroy this node (it already exists); it
+# only runs containers on it over ssh + apptainer (StaticSshAdapter). Scheduling
+# treats it exactly like a VM — a `gpu: false, launcher: single` job claims it.
+# Requires apptainer already installed on the host (bake it into the AMI / via
+# user-data — see infra/aws/). Spot reclamation surfaces as an ssh failure and
+# takes the normal failure -> quarantine path.
+
+name: ec2-cpu-0            # unique node name in the registry
+ip: 203.0.113.7           # public IP/DNS reachable over ssh from THIS control plane
+                          #   (or a Tailscale/VPN address — AWS isn't on cluster0)
+ssh_user: ubuntu          # the AMI's login user (Ubuntu = ubuntu); "" -> cluster default
+ssh_key: ~/.ssh/outpost-ec2   # PRIVATE key on this control-plane host; "" -> cluster default
+gpu: false                # CPU worker (this instance type has no GPU)
+runtime: apptainer        # container runtime present on the node

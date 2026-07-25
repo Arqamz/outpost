@@ -662,3 +662,38 @@ class LibvirtAdapter(ProviderAdapter):
                    "-o", "UserKnownHostsFile=/dev/null", "-r",
                    f"{user}@{head.ip}:{remote_workdir}/.", dest], job_id, check=False)
         return dest
+
+
+class StaticSshAdapter(LibvirtAdapter):
+    """A pre-provisioned, already-running SSH host joined as a plain CPU worker
+    (e.g. an EC2 instance). It is reached over ssh + apptainer exactly like a
+    libvirt VM, so run()/collect() (and the per-node ssh identity now honored by
+    _ssh_base/_scp_to) are inherited UNCHANGED — the whole point is that the
+    workload path was never libvirt-specific.
+
+    What differs is lifecycle: the instance's existence is not ours to manage.
+    provision/deprovision are no-ops (like LocalHostAdapter for the host — we
+    neither boot nor destroy it), and bootstrap can't use the libvirt-derived
+    inventory (gen-inventory.sh only knows about virsh domains). Following the
+    golden rule that the cluster installs nothing on its own, bootstrap only
+    VERIFIES the node is reachable and already has apptainer, failing closed if
+    not — bake apptainer into the AMI (the pinned .deb, docs/07-ubuntu-setup.md)
+    before joining the node, rather than having a job die later in run()."""
+    name = "static-ssh"
+
+    def provision(self, node, job_id):
+        self.log(f"[static-ssh] {node.name} already up ({node.ip}) — no provisioning")
+
+    def deprovision(self, node, job_id):
+        self.log(f"[static-ssh] {node.name} left running (not ours to destroy)")
+
+    def bootstrap(self, nodes, job_id):
+        for n in nodes:
+            self.log(f"[static-ssh] verifying {n.name} ({n.ip}): reachable + apptainer present")
+            rc = run_logged(self._ssh_base(n) + ["command -v apptainer"], job_id, check=False)
+            if rc != 0:
+                raise RuntimeError(
+                    f"static-ssh node {n.name} ({n.ip}): unreachable over ssh, or no "
+                    "apptainer on PATH. Confirm the security group allows ssh from this "
+                    "host and the cluster key is authorized, and bake apptainer into the "
+                    "image (pinned .deb, docs/07-ubuntu-setup.md) before joining it.")

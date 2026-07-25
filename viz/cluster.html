@@ -24,6 +24,8 @@
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
   .card.host{background:linear-gradient(180deg,var(--panel2),var(--panel));border-color:#33405260}
+  .card.remote{border-color:#2f6f5e60}
+  .card.off{opacity:.5}
   .card h2{font-size:14px;margin:0 0 2px;display:flex;align-items:center;gap:8px}
   .badge{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:999px;
          background:#26313f;color:var(--dim);font-weight:600}
@@ -126,9 +128,12 @@ function card(n){
     gpu = bar("GPU "+ (g.temp_c!=null?`· ${g.temp_c.toFixed(0)}°C`:""), g.util_pct, g.util_pct.toFixed(0)+"%", "var(--gpu)")
         + bar("VRAM", gmem, `${fmtMiB(g.mem_used_mib)} / ${fmtMiB(g.mem_total_mib)}`, "var(--gpu)");
   }
-  return `<div class="card ${n.kind}">
-    <h2>${n.name} <span class="badge ${n.kind==='host'?'gpu':''}">${n.kind==='host'?'gpu · host':'vm'}</span></h2>
-    <div class="meta">${n.vcpus} vCPU</div>
+  const label = n.kind==='host' ? 'gpu · host' : (n.kind==='remote' ? 'cpu · ec2' : 'vm');
+  const offline = (n.kind==='remote' && n.reachable===false);
+  const meta = offline ? 'unreachable' : `${n.vcpus==null?'—':n.vcpus} vCPU`;
+  return `<div class="card ${n.kind}${offline?' off':''}">
+    <h2>${n.name} <span class="badge ${n.kind==='host'?'gpu':''}">${label}</span></h2>
+    <div class="meta">${meta}</div>
     ${bar("CPU", n.cpu_pct, cpu)}
     ${bar("RAM", memPct, memTxt)}
     ${gpu}
@@ -141,12 +146,14 @@ async function tick(){
     const d = await r.json();
     document.getElementById("dot").classList.remove("off");
     document.getElementById("status").textContent = "live · " + new Date(d.ts*1000).toLocaleTimeString();
-    const vms = d.nodes.filter(n=>n.kind==='vm');
-    const avgCpu = vms.length ? vms.reduce((a,n)=>a+(n.cpu_pct||0),0)/vms.length : 0;
+    const workers = d.nodes.filter(n=>n.kind==='vm'||n.kind==='remote');
+    const avgCpu = workers.length ? workers.reduce((a,n)=>a+(n.cpu_pct||0),0)/workers.length : 0;
     const memUsed = d.nodes.reduce((a,n)=>a+(n.mem_used_mib||0),0);
+    const remote = d.nodes.filter(n=>n.kind==='remote').length;
     document.getElementById("summary").innerHTML =
-      `nodes <b>${d.nodes.length}</b> &nbsp;·&nbsp; VMs <b>${vms.length}</b> &nbsp;·&nbsp; `+
-      `avg VM CPU <b>${avgCpu.toFixed(0)}%</b> &nbsp;·&nbsp; total RAM in use <b>${fmtMiB(memUsed)}</b>`;
+      `nodes <b>${d.nodes.length}</b> &nbsp;·&nbsp; workers <b>${workers.length}</b>`+
+      (remote?` <span style="opacity:.7">(${remote} ec2)</span>`:``)+` &nbsp;·&nbsp; `+
+      `avg worker CPU <b>${avgCpu.toFixed(0)}%</b> &nbsp;·&nbsp; total RAM in use <b>${fmtMiB(memUsed)}</b>`;
     document.getElementById("grid").innerHTML = d.nodes.map(card).join("");
   }catch(e){
     document.getElementById("dot").classList.add("off");

@@ -1,0 +1,28 @@
+# Dummy CPU-only job to prove EC2 ingestion end to end.
+# Submit with:  cluster submit --spec job.ec2.example.yaml
+#              cluster reconcile --once --execute      # (or --interval N to watch)
+#
+# Single node, CPU, real container -> lands on the only available CPU node,
+# which right now is the static-ssh EC2 worker (ec2-cpu-0). The StaticSshAdapter
+# ssh'es in, apptainer-runs alpine, and collects stdout to the drop-zone. If it
+# reaches `promoted` with real output, EC2 received and ran the job.
+#
+# NOTE: pulling docker://alpine needs network ON THE EC2 NODE (it has it); the
+# control plane itself pulls nothing.
+
+name: ec2-ingestion-smoke
+node_count: 1
+gpu: false
+launcher: single
+runtime: apptainer
+image: "docker://alpine:3.20"
+# Prove it actually ran on the EC2 box: print its hostname + uname into the log
+# and drop a file to the drop-zone.
+command:
+  - "sh"
+  - "-c"
+  - "echo \"ran on: $(hostname) / $(uname -a)\"; echo ok > /out/result.txt; cat /out/result.txt"
+output_dir: "/out"
+
+params:
+  note: "EC2 static-ssh ingestion smoke test"

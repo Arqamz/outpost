@@ -10,6 +10,8 @@ the nodes. Commands:
     logs <job_id> [--tail N]   full replay transcript for one job (every command + output)
     nodes                      the NodeRegistry (with gpu/local capabilities)
     seed-nodes                 populate nodes from config (VMs + host GPU node)
+    add-node --spec node.yaml  join a pre-provisioned ssh host (e.g. EC2) as a worker
+    remove-node <name>         deregister a node (does not touch the machine)
     fail-node <name> [--inject]   quarantine a node + fail its job (failure-injection test)
     clear-jobs [--force]       wipe job history + audit + replay logs (demo reset)
 """
@@ -143,7 +145,38 @@ def cmd_nodes(args):
     for n in _store().list_nodes():
         caps = ("gpu" if n.gpu else "cpu") + ("/local" if n.local else "")
         print(f"{n.name:<14} idx={n.index} {n.ip:<15} {n.state:<12} "
-              f"{caps:<10} {n.runtime:<10} owner={n.owner_job or '-'}")
+              f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}")
+
+
+def cmd_add_node(args):
+    """Register a pre-provisioned, already-running ssh host (e.g. an EC2
+    instance) as a worker, from a YAML manifest (see node.ec2.example.yaml).
+    Unlike seed-nodes (which derives libvirt VMs + the host from config), this
+    joins ONE static node the cluster doesn't provision or destroy — it only
+    runs containers on it (StaticSshAdapter). index=-1 marks it as not driven by
+    the libvirt index-based wrappers."""
+    import yaml
+    with open(args.spec) as f:
+        d = yaml.safe_load(f) or {}
+    missing = [k for k in ("name", "ip") if not d.get(k)]
+    if missing:
+        sys.exit(f"node spec {args.spec} missing required field(s): {', '.join(missing)}")
+    store = _store()
+    if store.get_node(d["name"]):
+        sys.exit(f"node already registered: {d['name']} (remove it first, or pick another name)")
+    key = d.get("ssh_key", "") or ""
+    node = NodeRecord(
+        node_id=d["name"], name=d["name"], index=-1, ip=str(d["ip"]),
+        state=NodeState.AVAILABLE.value, gpu=bool(d.get("gpu", False)), local=False,
+        runtime=d.get("runtime", "apptainer"), provider="static-ssh",
+        ssh_user=d.get("ssh_user", "") or "",
+        ssh_key=os.path.expanduser(key) if key else "",
+    )
+    store.put_node(node)
+    print(f"added static-ssh node {node.name} at {node.ip} "
+          f"({'gpu' if node.gpu else 'cpu'}, ssh {node.ssh_user or '<cluster-default>'}"
+          f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}). "
+          f"Bake apptainer into the image before running real jobs.")
 
 
 def cmd_seed_nodes(args):
@@ -172,6 +205,22 @@ def cmd_seed_nodes(args):
     print(f"seeded {added} node(s) into the registry ({len(existing)} already present"
           + (f", {updated} refreshed" if updated else "") + ")"
           + (f"; host GPU node = {host.name}" if host else "; no host GPU node (CLUSTER_GPU_HOST != 1)"))
+
+
+def cmd_remove_node(args):
+    """Remove a node from the registry. Does NOT touch the underlying machine
+    (destroying a libvirt VM is `make cluster-down`; terminating an EC2 instance
+    is done in AWS) — this just deregisters it so the scheduler stops considering
+    it. Refuses a node a job currently owns unless --force."""
+    store = _store()
+    node = store.get_node(args.name)
+    if not node:
+        sys.exit(f"no such node in registry: {args.name}")
+    if node.owner_job and not args.force:
+        sys.exit(f"{args.name} is in use by {node.owner_job} (state {node.state}); "
+                 f"re-run with --force to deregister anyway")
+    store.delete_node(args.name)
+    print(f"removed node {args.name} ({node.adapter_key}, was {node.state})")
 
 
 def cmd_fail_node(args):
@@ -220,6 +269,13 @@ def main(argv=None):
     s.set_defaults(fn=cmd_reconciler_log)
     sub.add_parser("nodes").set_defaults(fn=cmd_nodes)
     sub.add_parser("seed-nodes").set_defaults(fn=cmd_seed_nodes)
+    s = sub.add_parser("add-node", help="join a pre-provisioned ssh host (e.g. EC2) as a worker")
+    s.add_argument("--spec", required=True, help="node manifest YAML (see node.ec2.example.yaml)")
+    s.set_defaults(fn=cmd_add_node)
+    s = sub.add_parser("remove-node", help="deregister a node from the registry (leaves the machine alone)")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="remove even if a job currently owns it")
+    s.set_defaults(fn=cmd_remove_node)
     s = sub.add_parser("fail-node"); s.add_argument("name")
     s.add_argument("--inject", action="store_true", help="also hard-kill the VM via inject-failure.sh")
     s.add_argument("--reason", default="injected failure"); s.set_defaults(fn=cmd_fail_node)

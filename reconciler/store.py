@@ -36,6 +36,7 @@ class Store:
     def put_node(self, node: NodeRecord) -> None: raise NotImplementedError
     def get_node(self, node_id: str) -> NodeRecord | None: raise NotImplementedError
     def list_nodes(self) -> list[NodeRecord]: raise NotImplementedError
+    def delete_node(self, node_id: str) -> bool: raise NotImplementedError  # True if it existed
 
     def claim_node(self, job_id: str, require_gpu: bool = False) -> NodeRecord | None:
         """Atomically move one AVAILABLE node -> CLAIMED(owner=job_id).
@@ -164,6 +165,10 @@ class FileStore(Store):
     def list_nodes(self):
         return [NodeRecord.from_dict(v) for v in self._read().get(COL_NODES, {}).values()]
 
+    def delete_node(self, node_id: str) -> bool:
+        with self._locked() as (d, _):
+            return d[COL_NODES].pop(node_id, None) is not None
+
     def claim_node(self, job_id, require_gpu=False):
         with self._locked() as (d, _):
             for nid, nd in d[COL_NODES].items():
@@ -221,6 +226,9 @@ class MongoStore(Store):
 
     def list_nodes(self):
         return [NodeRecord.from_dict(d) for d in self.nodes.find()]
+
+    def delete_node(self, node_id: str) -> bool:
+        return self.nodes.delete_one({"node_id": node_id}).deleted_count > 0
 
     def claim_node(self, job_id, require_gpu=False):
         # find_one_and_update is atomic server-side -> exclusive lock.

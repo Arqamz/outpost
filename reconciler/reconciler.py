@@ -22,7 +22,8 @@ import time
 from datetime import datetime, timezone
 
 from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
-                      LocalHostAdapter, REPO_ROOT, LOGS_DIR, append_job_log)
+                      LocalHostAdapter, StaticSshAdapter, REPO_ROOT, LOGS_DIR,
+                      append_job_log)
 from .audit import Audit
 from .models import JobRecord, JobSpec, NodeRecord
 from .registry import NodeRegistry, NoCapacity  # NoCapacity: a submitted job waits, it doesn't fail
@@ -75,16 +76,18 @@ class Reconciler:
         self.max_workers = max_workers
         if adapters is None:
             if execute:
-                # Real adapters, chosen per node: local host vs libvirt VM.
-                adapters = {"local": LocalHostAdapter(log), "remote": LibvirtAdapter(log)}
+                # Real adapters, chosen per node by its provider (NodeRecord.adapter_key):
+                # the control-plane host, a libvirt VM, or a static/EC2 ssh box.
+                adapters = {"local": LocalHostAdapter(log), "libvirt": LibvirtAdapter(log),
+                            "static-ssh": StaticSshAdapter(log)}
             else:
                 null = NullAdapter(log)          # dry-run: everything no-ops
-                adapters = {"local": null, "remote": null}
+                adapters = {"local": null, "libvirt": null, "static-ssh": null}
         self.adapters = adapters
 
     def _adapter_for(self, node: NodeRecord) -> ProviderAdapter:
-        """A node's `local` flag decides which adapter drives it."""
-        return self.adapters["local" if node.local else "remote"]
+        """A node's provider (its `adapter_key`) decides which adapter drives it."""
+        return self.adapters[node.adapter_key]
 
     def _parallel_for_each(self, items: list, fn) -> None:
         """Run fn(item) for every item concurrently (capped at self.max_workers)

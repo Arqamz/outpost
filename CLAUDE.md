@@ -60,8 +60,9 @@ reconciler/                 the control plane (Python package)
   models.py                 JobSpec (incl. launcher), JobRecord, NodeRecord, RunResult
   store.py                  FileStore (default, fcntl shared/exclusive locked) | MongoStore
   registry.py               NodeRegistry: claim/release/quarantine (exclusive locks)
-  adapter.py                ProviderAdapter ABC + Libvirt/LocalHost/Null; container_argv(),
-                             mpirun_argv(), run_logged()/append_job_log() (replay logs)
+  adapter.py                ProviderAdapter ABC + Libvirt/LocalHost/StaticSsh/Null;
+                             container_argv(), mpirun_argv(), run_logged()/append_job_log()
+                             (replay logs); per-node ssh identity (node_ssh_id)
   reconciler.py             the driver: submit, concurrent tick, phases, wait/timeout, failure
   cli.py                    cluster commands (incl. logs / reconciler-log)
 demo/                       mpi_demo.c/.def/.sif, run-mpi-demo.sh (bare), run-scheduling-demo.sh
@@ -134,8 +135,21 @@ Nodes: `available → claimed → provisioned → ready → busy → draining �
 
 Per phase the reconciler calls `adapter.{provision,bootstrap,run,collect,
 deprovision}` (each now also takes `job_id`, for per-job replay logging).
-Adapter is chosen per node: `node.local` → `LocalHostAdapter` (apptainer `--nv`
-in-process), else `LibvirtAdapter` (ssh+apptainer into the VM).
+Adapter is chosen per node by its provider (`NodeRecord.adapter_key`):
+`local` → `LocalHostAdapter` (apptainer `--nv` in-process); `libvirt` (default)
+→ `LibvirtAdapter` (ssh+apptainer into the VM); `static-ssh` → `StaticSshAdapter`
+— a **pre-provisioned, already-running ssh host** (e.g. an EC2 instance) joined
+as a plain CPU worker. StaticSsh inherits Libvirt's `run`/`collect` unchanged
+(the workload path was never libvirt-specific — just ssh+apptainer against
+`node.ip`); only lifecycle differs: provision/deprovision are no-ops (not ours
+to boot or destroy) and bootstrap just verifies reachability + apptainer
+(installs nothing — bake it into the image). Register one with `cluster
+add-node --spec node.ec2.example.yaml` (a YAML manifest: name/ip/ssh_user/
+ssh_key/gpu/runtime); per-node `ssh_user`/`ssh_key` let it use its own
+credentials instead of the cluster fabric's. AWS launch template + first-boot
+apptainer install + full walkthrough live in `infra/aws/`. Spot reclamation surfaces as an ssh failure → the existing
+failure→quarantine path. Keep static nodes `launcher: single` (multi-node
+`mpirun` across a WAN is latency-bound and trips the hybrid fabric pinning).
 
 `JobSpec.launcher` selects the run path: `"single"` (default) runs the
 container on one node; `"mpi"` (with `node_count > 1`) builds a per-job

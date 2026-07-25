@@ -4,6 +4,10 @@
 # Local notes/runbooks
 notes/
 
+# Live static-node manifest — holds a real instance IP that changes per launch.
+# node.ec2.example.yaml is the committed template; node.ec2.yaml is per-machine.
+node.ec2.yaml
+
 # Built apptainer images
 demo/*.sif
 
