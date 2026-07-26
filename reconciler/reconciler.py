@@ -22,8 +22,8 @@ import time
 from datetime import datetime, timezone
 
 from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
-                      LocalHostAdapter, StaticSshAdapter, REPO_ROOT, LOGS_DIR,
-                      append_job_log)
+                      LocalHostAdapter, StaticSshAdapter, KubernetesAdapter,
+                      REPO_ROOT, LOGS_DIR, append_job_log)
 from .audit import Audit
 from .models import JobRecord, JobSpec, NodeRecord
 from .registry import NodeRegistry, NoCapacity  # NoCapacity: a submitted job waits, it doesn't fail
@@ -79,10 +79,10 @@ class Reconciler:
                 # Real adapters, chosen per node by its provider (NodeRecord.adapter_key):
                 # the control-plane host, a libvirt VM, or a static/EC2 ssh box.
                 adapters = {"local": LocalHostAdapter(log), "libvirt": LibvirtAdapter(log),
-                            "static-ssh": StaticSshAdapter(log)}
+                            "static-ssh": StaticSshAdapter(log), "k8s": KubernetesAdapter(log)}
             else:
                 null = NullAdapter(log)          # dry-run: everything no-ops
-                adapters = {"local": null, "libvirt": null, "static-ssh": null}
+                adapters = {"local": null, "libvirt": null, "static-ssh": null, "k8s": null}
         self.adapters = adapters
 
     def _adapter_for(self, node: NodeRecord) -> ProviderAdapter:
@@ -199,15 +199,27 @@ class Reconciler:
         # claim mixed pools with no launch path that can span them.
         if spec.hybrid and (spec.launcher != "mpi" or spec.node_count < 2):
             raise ValueError("hybrid: true requires launcher: mpi and node_count >= 2")
-        kind = (f"hybrid (1 GPU + {spec.node_count - 1} CPU)" if spec.hybrid
-                else ("GPU" if spec.gpu else "CPU"))
         # Claim BEFORE transitioning state: if the pool can't cover this job
         # (NoCapacity), the job must stay untouched in SUBMITTED so tick()'s
         # wait-and-retry path has something to retry — not a half-provisioned
         # job stuck with no assigned_nodes.
-        nodes = self.registry.claim(job.job_id, spec.node_count,
-                                    require_gpu=spec.gpu, hybrid=spec.hybrid)
-        self._set_job(job, JobState.PROVISIONING, f"claimed {spec.node_count} {kind} node(s)")
+        if spec.backend == "k8s":
+            # A k8s job claims exactly ONE slot (the whole cluster is modelled as
+            # a small pool of interchangeable k8s slots); node_count is the gang
+            # size, realized as N pods inside the KubernetesAdapter's run().
+            # params.k8s_context optionally pins the job to one cluster (e.g. the
+            # 48GB L20 vs the 16GB 5060 Ti) when several are registered.
+            target_ctx = spec.params.get("k8s_context") or None
+            kind = f"k8s (gang x{spec.node_count}{f' @ {target_ctx}' if target_ctx else ''})"
+            nodes = self.registry.claim(job.job_id, 1, backend="k8s", kube_context=target_ctx)
+            claimed_n = 1
+        else:
+            kind = (f"hybrid (1 GPU + {spec.node_count - 1} CPU)" if spec.hybrid
+                    else ("GPU" if spec.gpu else "CPU"))
+            nodes = self.registry.claim(job.job_id, spec.node_count,
+                                        require_gpu=spec.gpu, hybrid=spec.hybrid)
+            claimed_n = spec.node_count
+        self._set_job(job, JobState.PROVISIONING, f"claimed {claimed_n} {kind} node(s)")
         job.assigned_nodes = [n.node_id for n in nodes]
         self.store.put_job(job)
 

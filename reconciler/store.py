@@ -38,13 +38,31 @@ class Store:
     def list_nodes(self) -> list[NodeRecord]: raise NotImplementedError
     def delete_node(self, node_id: str) -> bool: raise NotImplementedError  # True if it existed
 
-    def claim_node(self, job_id: str, require_gpu: bool = False) -> NodeRecord | None:
+    def claim_node(self, job_id: str, require_gpu: bool = False,
+                   provider: str | None = None,
+                   kube_context: str | None = None) -> NodeRecord | None:
         """Atomically move one AVAILABLE node -> CLAIMED(owner=job_id).
 
-        require_gpu=True matches only GPU-capable nodes; False matches only
-        non-GPU nodes (so CPU jobs never squat the host GPU). None if none match.
+        provider set (e.g. "k8s") -> match ONLY nodes on that backend, ignoring
+        require_gpu (a k8s slot is picked by backend, not by the gpu flag). This
+        is how a `backend: k8s` job claims a k8s slot instead of a VM/host.
+
+        kube_context set (only meaningful with provider="k8s") -> match ONLY
+        slots on that cluster, so a job can target the L20 vs the 5060 Ti when
+        several k8s clusters are registered. None -> any slot of the backend.
+
+        provider=None (default, the VM/host/static pool) -> require_gpu=True
+        matches only GPU-capable nodes; False matches only non-GPU nodes (so CPU
+        jobs never squat the host GPU) AND backend nodes (provider "k8s") are
+        excluded, so a normal job never grabs a k8s slot. None if none match.
         """
         raise NotImplementedError
+
+    @staticmethod
+    def _node_provider(nd: dict) -> str:
+        """Effective provider of a stored node dict — mirrors NodeRecord.adapter_key
+        so claim_node can filter by backend without rehydrating a NodeRecord."""
+        return nd.get("provider") or ("local" if nd.get("local") else "libvirt")
 
     # audit ----------------------------------------------------------------
     def append_audit(self, entry: dict) -> None: raise NotImplementedError
@@ -169,13 +187,22 @@ class FileStore(Store):
         with self._locked() as (d, _):
             return d[COL_NODES].pop(node_id, None) is not None
 
-    def claim_node(self, job_id, require_gpu=False):
+    def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None):
         with self._locked() as (d, _):
             for nid, nd in d[COL_NODES].items():
                 if nd["state"] != NodeState.AVAILABLE.value:
                     continue
-                if bool(nd.get("gpu", False)) != bool(require_gpu):
-                    continue
+                np = self._node_provider(nd)
+                if provider is not None:
+                    if np != provider:
+                        continue
+                    if kube_context is not None and nd.get("kube_context", "") != kube_context:
+                        continue
+                else:
+                    if np == "k8s":            # backend slot, only via explicit provider
+                        continue
+                    if bool(nd.get("gpu", False)) != bool(require_gpu):
+                        continue
                 nd["state"] = NodeState.CLAIMED.value
                 nd["owner_job"] = job_id
                 nd["updated_at"] = now_iso()
@@ -230,10 +257,19 @@ class MongoStore(Store):
     def delete_node(self, node_id: str) -> bool:
         return self.nodes.delete_one({"node_id": node_id}).deleted_count > 0
 
-    def claim_node(self, job_id, require_gpu=False):
+    def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None):
         # find_one_and_update is atomic server-side -> exclusive lock.
+        if provider is not None:
+            q = {"state": NodeState.AVAILABLE.value, "provider": provider}
+            if kube_context is not None:
+                q["kube_context"] = kube_context
+        else:
+            # A normal claim never grabs a backend slot (provider "k8s"); "" and
+            # unset both mean the VM/host/static pool, so $nin covers them.
+            q = {"state": NodeState.AVAILABLE.value, "gpu": bool(require_gpu),
+                 "provider": {"$nin": ["k8s"]}}
         d = self.nodes.find_one_and_update(
-            {"state": NodeState.AVAILABLE.value, "gpu": bool(require_gpu)},
+            q,
             {"$set": {"state": NodeState.CLAIMED.value, "owner_job": job_id, "updated_at": now_iso()}},
             return_document=True,  # ReturnDocument.AFTER
         )
