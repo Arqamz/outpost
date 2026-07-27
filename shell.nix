@@ -37,6 +37,17 @@ pkgs.mkShell {
     # falls back to proot-emulated root instead (see demo/build-sif.sh).
     proot
 
+    # --- Kubernetes backend spike (HAMi + KAI: simulate N-GPU on one GPU) ---
+    # Client-side only, like the libvirt tooling above: KinD builds the cluster
+    # in docker, kubectl/helm drive it. The cluster + the NVIDIA device plugin
+    # are stood up by hand for now (infra/k8s/), not wired into the reconciler —
+    # see docs/08-kubernetes-backend.md. GPU-into-KinD needs a *system* change
+    # (nvidia as docker's default-runtime); this shell can't make it, same as it
+    # can't start libvirtd.
+    kind
+    kubectl
+    kubernetes-helm
+
     # --- host-side MPI launcher for hybrid jobs (host GPU rank + VM ranks) ---
     # `openmpi` here is the function arg, NOT pkgs.openmpi: the flake pins it to
     # nixos-24.05's 4.1.6 so the host mpirun/orted matches the guests' 4.1.6.

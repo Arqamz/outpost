@@ -52,6 +52,35 @@ SIF_CACHE_DIR = os.path.join(REPO_ROOT, ".var", "sif-cache")  # docker://→SIF,
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
 SSH_KEY = os.environ.get("CLUSTER_SSH_PRIVKEY", os.path.expanduser("~/.ssh/outpost-cluster-ssh"))
 
+# ── Kubernetes (KAI + HAMi) backend params ──────────────────────────────────
+# The whole cluster + KAI + HAMi are stood up out of band by infra/k8s/setup.sh;
+# the adapter only templates kubectl against it. All env-overridable so a
+# differently-installed cluster (other queue, other CRD version) needs no code
+# change. Defaults verified live against the `outpost` kind cluster 2026-07-30.
+K8S_NAMESPACE_PREFIX = os.environ.get("CLUSTER_K8S_NS_PREFIX", "outpost-")
+K8S_PODGROUP_APIVERSION = os.environ.get("CLUSTER_K8S_PODGROUP_APIVERSION",
+                                         "scheduling.run.ai/v2alpha2")
+K8S_QUEUE = os.environ.get("CLUSTER_K8S_QUEUE", "default-queue")          # KAI queue
+K8S_GPU_MEMORY_MB = int(os.environ.get("CLUSTER_K8S_GPU_MEMORY_MB", "2048"))  # HAMi cap/rank
+K8S_SCHEDULER = os.environ.get("CLUSTER_K8S_SCHEDULER", "kai-scheduler")
+K8S_CONTEXT = os.environ.get("CLUSTER_K8S_CONTEXT", "")                   # kubectl --context
+K8S_RUN_TIMEOUT_S = float(os.environ.get("CLUSTER_K8S_RUN_TIMEOUT", "1800"))
+K8S_POLL_INTERVAL_S = float(os.environ.get("CLUSTER_K8S_POLL_INTERVAL", "5"))
+# Distributed rendezvous: every gang gets a headless Service so ranks resolve
+# each other by DNS, and rank 0's stable name is injected as MASTER_ADDR — the
+# env torchrun / c10d / NCCL-over-TCP expect. Named "gang" so a pod's FQDN is
+# rank-<i>.gang.<ns>.svc.cluster.local (pod hostname=rank-<i>, subdomain=gang).
+K8S_RDZV_SERVICE = "gang"
+K8S_MASTER_PORT = os.environ.get("CLUSTER_K8S_MASTER_PORT", "29500")
+# N ranks share ONE physical GPU, so intra-device P2P is the known-broken NCCL
+# transport here — disable it by default (a real multi-GPU box would not). A
+# job's own env wins (it's merged after), so this is only a sane default.
+K8S_DEFAULT_ENV = {"NCCL_P2P_DISABLE": "1"}
+# Container-waiting reasons that will never resolve on their own — fail the gang
+# fast instead of waiting out the whole run timeout on e.g. a bad image ref.
+K8S_FATAL_WAIT_REASONS = {"ImagePullBackOff", "ErrImagePull", "InvalidImageName",
+                          "CreateContainerConfigError", "CreateContainerError"}
+
 
 def job_log_path(job_id: str) -> str:
     return os.path.join(LOGS_DIR, f"{job_id}.log")
@@ -697,3 +726,267 @@ class StaticSshAdapter(LibvirtAdapter):
                     "apptainer on PATH. Confirm the security group allows ssh from this "
                     "host and the cluster key is authorized, and bake apptainer into the "
                     "image (pinned .deb, docs/07-ubuntu-setup.md) before joining it.")
+
+
+class KubernetesAdapter(ProviderAdapter):
+    """A whole Kubernetes cluster (KAI scheduler + HAMi-core isolation) as a
+    backend. Unlike every other adapter, a k8s registry "node" is a SLOT, not a
+    machine: the cluster schedules its own pods, so the registry models the
+    cluster as a small pool of interchangeable slots and each job claims one.
+    The N-way parallelism a job asks for (spec.node_count) is realized INSIDE
+    run() as a GANG of N pods sharing the one physical GPU — KAI co-schedules
+    them (an explicit PodGroup, minMember=N) and HAMi-core hard-caps each rank's
+    VRAM via the `gpu-memory` annotation. This is the "multi-GPU on one GPU"
+    simulator; faithful for topology/scheduling/init, not for throughput (the
+    ranks time-slice one SM array). See docs/08-kubernetes-backend.md.
+
+    Nothing here installs anything (golden rule): the cluster + KAI + HAMi are
+    stood up out of band by infra/k8s/setup.sh. provision/bootstrap only VERIFY
+    the pieces exist and fail closed with a pointer if not. run() renders a
+    Namespace + PodGroup + N Pods and applies them; collect() ships each rank's
+    logs to the drop-zone; deprovision() deletes the job's namespace (leaving
+    the cluster standing, exactly like LocalHost/StaticSsh leave their machine).
+
+    The manifest shape was verified live before this landed: a pre-created
+    PodGroup + pods carrying the `pod-group-name` annotation bind to that gang
+    (KAI's auto-grouper does NOT create per-pod groups instead), and HAMi injects
+    CUDA_DEVICE_MEMORY_LIMIT per rank."""
+    name = "k8s"
+
+    def __init__(self, log=_log_stderr):
+        self.log = log
+
+    # ── kubectl plumbing ─────────────────────────────────────────────────
+    @staticmethod
+    def _context_of(node: NodeRecord) -> str:
+        """Which kube-context this slot targets: its own if set (multi-cluster:
+        the L20's cluster vs the 5060 Ti's), else the global CLUSTER_K8S_CONTEXT."""
+        return node.kube_context or K8S_CONTEXT
+
+    def _kubectl_base(self, context: str = "") -> list[str]:
+        return ["kubectl"] + (["--context", context] if context else [])
+
+    def _kubectl(self, args: list[str], job_id: str, context: str = "", check: bool = True) -> int:
+        """A kubectl call whose output streams live into the job's replay log
+        (apply/delete/verify) — same treatment every other adapter's commands get."""
+        return run_logged(self._kubectl_base(context) + args, job_id, check=check)
+
+    def _kubectl_out(self, args: list[str], context: str = "") -> tuple[int, str]:
+        """A kubectl call whose stdout we parse (polling phases, fetching logs) —
+        captured, not streamed, so it doesn't spam the replay log every 5s."""
+        proc = subprocess.run(self._kubectl_base(context) + args, capture_output=True, text=True)
+        return proc.returncode, proc.stdout
+
+    @staticmethod
+    def _namespace(job_id: str) -> str:
+        # job_id is `job-<12 hex>`, so this is a valid DNS-1123 label (<=63 chars).
+        return f"{K8S_NAMESPACE_PREFIX}{job_id}"
+
+    @staticmethod
+    def _image_ref(image: str) -> str:
+        """A JobSpec image for k8s must be an OCI ref containerd can pull. Accept
+        a `docker://` ref (the same form apptainer takes) by stripping the scheme;
+        reject a local .sif / path / other scheme with a clear message — the k8s
+        backend pulls images, it can't run a host SIF."""
+        ref = image[len("docker://"):] if image.startswith("docker://") else image
+        if ref.endswith(".sif") or "://" in ref or ref.startswith(("/", "./", "../")):
+            raise RuntimeError(
+                f"k8s backend needs an OCI image ref (e.g. 'nvidia/cuda:12.6.3-base-ubuntu24.04' "
+                f"or 'docker://…'), got {image!r} — it pulls via containerd, not a local SIF.")
+        return ref
+
+    # ── node lifecycle (verify only; the cluster is managed out of band) ──
+    def provision(self, node, job_id):
+        ctx = self._context_of(node)
+        self.log(f"[k8s] verifying cluster reachable + KAI up (slot {node.name}"
+                 f"{f', context {ctx}' if ctx else ''})")
+        if self._kubectl(["get", "nodes"], job_id, context=ctx, check=False) != 0:
+            raise RuntimeError(
+                f"k8s cluster unreachable (`kubectl {f'--context {ctx} ' if ctx else ''}get nodes` "
+                "failed). Stand it up first with infra/k8s/setup.sh, and set the slot's "
+                "kube_context / CLUSTER_K8S_CONTEXT / KUBECONFIG if it isn't your current "
+                "kube-context.")
+        rc, out = self._kubectl_out(["get", "pods", "-n", "kai-scheduler",
+                                     "--field-selector=status.phase=Running", "-o", "name"],
+                                    context=ctx)
+        if rc != 0 or not out.strip():
+            raise RuntimeError(
+                "KAI scheduler is not Running in namespace 'kai-scheduler' — run "
+                "infra/k8s/setup.sh (installs KAI + the HAMi-core isolator).")
+
+    def deprovision(self, node, job_id):
+        ctx = self._context_of(node)
+        ns = self._namespace(job_id)
+        self.log(f"[k8s] deleting namespace {ns} (cascades pods + PodGroup); cluster left standing")
+        # --wait=false: teardown shouldn't block the tick on namespace GC; a
+        # lingering terminating namespace doesn't affect a later job (each job
+        # gets its own uniquely-named namespace).
+        self._kubectl(["delete", "namespace", ns, "--ignore-not-found", "--wait=false"],
+                      job_id, context=ctx, check=False)
+
+    def bootstrap(self, nodes, job_id):
+        # Verify the scheduling prerequisites exist. Installs NOTHING (golden
+        # rule) — setup.sh owns the install; a missing piece is a clear failure
+        # here, not a mysterious pod-never-schedules later.
+        ctx = self._context_of(nodes[0])
+        self.log(f"[k8s] verifying scheduling prerequisites (queue={K8S_QUEUE}"
+                 f"{f', context {ctx}' if ctx else ''})")
+        for args, what in (
+            (["get", "queue", K8S_QUEUE], f"KAI queue {K8S_QUEUE!r}"),
+            (["get", "runtimeclass", "nvidia"], "RuntimeClass 'nvidia' (isolator injects it)"),
+            (["get", "crd", "podgroups.scheduling.run.ai"], "the PodGroup CRD (KAI)"),
+        ):
+            if self._kubectl(args, job_id, context=ctx, check=False) != 0:
+                raise RuntimeError(f"{what} not found — run infra/k8s/setup.sh")
+
+    # ── workload lifecycle ────────────────────────────────────────────────
+    def run(self, nodes, job_id, spec):
+        slot = nodes[0]
+        ctx = self._context_of(slot)
+        workdir = os.path.join(RUNS_DIR, job_id)
+        os.makedirs(workdir, exist_ok=True)
+        if spec.is_dry_run:
+            return RunResult(job_id, slot.name, None, workdir, note="no image -> dry-run")
+        n = max(1, spec.node_count)                    # node_count == gang size here
+        ns = self._namespace(job_id)
+        manifest = self._render_manifests(job_id, spec, n)
+        manifest_path = os.path.join(workdir, "manifests.yaml")
+        with open(manifest_path, "w") as f:
+            f.write(manifest)
+        gpu_mem = spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB)
+        self.log(f"[k8s] applying gang: ns={ns} minMember={n} image={self._image_ref(spec.image)} "
+                 f"gpu-memory={gpu_mem}MiB/rank queue={spec.params.get('queue', K8S_QUEUE)}"
+                 f"{f' context={ctx}' if ctx else ''}")
+        self._kubectl(["apply", "-f", manifest_path], job_id, context=ctx)
+        rc = self._await_gang(ns, n, job_id, ctx)
+        stdout_path = self._capture_logs(ns, n, job_id, workdir, ctx)
+        return RunResult(job_id, slot.name, rc, workdir, stdout_path,
+                         note=f"k8s gang np={n} (ns {ns}) exit={rc}")
+
+    def _render_manifests(self, job_id: str, spec: JobSpec, n: int) -> str:
+        """Render the Namespace + headless Service + PodGroup + N Pod docs for one
+        gang. Pure (no cluster calls) so it's unit-testable. Pods ask for a GPU
+        *fraction* via the `gpu-memory` annotation (NOT an `nvidia.com/gpu`
+        resource request, which would consume the whole card), attach to the
+        explicit PodGroup via `pod-group-name`, and are placed by KAI
+        (`schedulerName`). Each pod gets a stable DNS name via the headless
+        Service (`hostname`/`subdomain`) and the standard distributed-rendezvous
+        env (RANK, WORLD_SIZE, MASTER_ADDR=rank-0's FQDN, MASTER_PORT), so a real
+        multi-rank workload (torchrun / c10d / NCCL-over-TCP / MPI-over-TCP) can
+        form a communicator across the gang — not just N independent pods."""
+        import yaml
+        ns = self._namespace(job_id)
+        image = self._image_ref(spec.image)
+        pg_name = f"pg-{job_id}"
+        gpu_mem = str(spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB))
+        queue = str(spec.params.get("queue", K8S_QUEUE))
+        master_port = str(spec.params.get("master_port", K8S_MASTER_PORT))
+        master_addr = f"rank-0.{K8S_RDZV_SERVICE}.{ns}.svc.cluster.local"
+        docs: list[dict] = [
+            {"apiVersion": "v1", "kind": "Namespace",
+             "metadata": {"name": ns, "labels": {"outpost-job": job_id}}},
+            # Headless Service: gives each pod (hostname=rank-<i>, subdomain=gang)
+            # a DNS A record. publishNotReadyAddresses so ranks resolve during
+            # startup rendezvous (the pods carry no readiness probe).
+            {"apiVersion": "v1", "kind": "Service",
+             "metadata": {"name": K8S_RDZV_SERVICE, "namespace": ns},
+             "spec": {"clusterIP": "None", "publishNotReadyAddresses": True,
+                      "selector": {"outpost-job": job_id},
+                      "ports": [{"name": "rdzv", "port": int(master_port)}]}},
+            {"apiVersion": K8S_PODGROUP_APIVERSION, "kind": "PodGroup",
+             "metadata": {"name": pg_name, "namespace": ns},
+             "spec": {"minMember": n, "queue": queue}},
+        ]
+        for i in range(n):
+            # order: sane defaults, then rendezvous, then the job's own env last
+            # so a spec can override any of them.
+            merged = {**K8S_DEFAULT_ENV,
+                      "RANK": str(i), "WORLD_SIZE": str(n),
+                      "MASTER_ADDR": master_addr, "MASTER_PORT": master_port,
+                      **spec.env}
+            env = [{"name": k, "value": v} for k, v in merged.items()]
+            container: dict = {"name": "rank", "image": image,
+                               "imagePullPolicy": "IfNotPresent", "env": env}
+            if spec.command:                            # else use the image entrypoint
+                container["command"] = list(spec.command)
+            docs.append({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": f"rank-{i}", "namespace": ns,
+                    "labels": {"kai.scheduler/queue": queue,
+                               "outpost-job": job_id, "outpost-rank": str(i)},
+                    "annotations": {"pod-group-name": pg_name, "gpu-memory": gpu_mem},
+                },
+                "spec": {"schedulerName": K8S_SCHEDULER, "restartPolicy": "Never",
+                         "hostname": f"rank-{i}", "subdomain": K8S_RDZV_SERVICE,
+                         "containers": [container]},
+            })
+        return yaml.safe_dump_all(docs, default_flow_style=False, sort_keys=False)
+
+    def _await_gang(self, ns: str, n: int, job_id: str, context: str = "") -> int:
+        """Poll until all N pods are terminal (Succeeded/Failed) or the run
+        timeout elapses. Fail fast on an unrecoverable image/create error rather
+        than waiting out the whole timeout. Returns the WORST rank exit code (0
+        iff every rank succeeded) so the reconciler fails the job on any nonzero
+        rank, exactly like a nonzero apptainer/mpirun exit on the other paths."""
+        deadline = time.monotonic() + K8S_RUN_TIMEOUT_S
+        while True:
+            _, phase_out = self._kubectl_out(["get", "pods", "-n", ns, "-o",
+                "jsonpath={range .items[*]}{.metadata.name}={.status.phase};{end}"], context=context)
+            phases = dict(p.split("=", 1) for p in phase_out.strip(";").split(";") if "=" in p)
+            _, wait_out = self._kubectl_out(["get", "pods", "-n", ns, "-o",
+                "jsonpath={range .items[*]}{.metadata.name}="
+                "{.status.containerStatuses[0].state.waiting.reason};{end}"], context=context)
+            waiting = dict(w.split("=", 1) for w in wait_out.strip(";").split(";") if "=" in w)
+            fatal = {p: r for p, r in waiting.items() if r in K8S_FATAL_WAIT_REASONS}
+            terminal = {p: v for p, v in phases.items() if v in ("Succeeded", "Failed")}
+            msg = f"[k8s] {ns}: {len(terminal)}/{n} pods terminal (phases={phases})"
+            self.log(msg)
+            append_job_log(job_id, f"{now_iso()} {msg}")
+            if fatal:
+                raise RuntimeError(f"k8s gang in {ns} has unrecoverable pod(s): {fatal} "
+                                   "(check the image ref / pull access)")
+            if len(phases) >= n and len(terminal) == len(phases):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"k8s gang in {ns} did not finish within "
+                                   f"{K8S_RUN_TIMEOUT_S:.0f}s (phases={phases})")
+            time.sleep(K8S_POLL_INTERVAL_S)
+        _, code_out = self._kubectl_out(["get", "pods", "-n", ns, "-o",
+            "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.exitCode}"
+            ";{end}"], context=context)
+        codes = [int(c) for c in code_out.strip(";").split(";") if c.strip().lstrip("-").isdigit()]
+        return max(codes) if codes else 1              # no exit codes at all -> treat as failure
+
+    def _capture_logs(self, ns: str, n: int, job_id: str, workdir: str, context: str = "") -> str:
+        """Fetch each rank's logs into workdir: per-rank rank-<i>.log plus a
+        concatenated stdout.log (the guaranteed egress artifact every adapter
+        produces). Runs while the namespace still exists (collect precedes
+        teardown), so the Succeeded pods' logs are still available."""
+        combined = os.path.join(workdir, "stdout.log")
+        with open(combined, "w") as agg:
+            for i in range(n):
+                pod = f"rank-{i}"
+                _, out = self._kubectl_out(["logs", "-n", ns, pod], context=context)
+                with open(os.path.join(workdir, f"{pod}.log"), "w") as rf:
+                    rf.write(out)
+                agg.write(f"=== {pod} ===\n{out}\n")
+                append_job_log(job_id, f"{now_iso()} [k8s] {ns}/{pod} logs:\n{out}")
+        return combined
+
+    def collect(self, nodes, job_id, spec, dest):
+        # The run already pulled every rank's logs into .var/runs/<job_id>; just
+        # ship that workdir to the drop-zone (same copy pattern as LocalHost).
+        workdir = os.path.join(RUNS_DIR, job_id)
+        os.makedirs(dest, exist_ok=True)
+        if os.path.isdir(workdir):
+            for name in os.listdir(workdir):
+                if _is_staging_artifact(name):
+                    continue
+                src = os.path.join(workdir, name)
+                dst = os.path.join(dest, name)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst)
+        return dest
