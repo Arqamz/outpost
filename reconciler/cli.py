@@ -67,6 +67,53 @@ def _host_node() -> NodeRecord | None:
                       state=NodeState.AVAILABLE.value, gpu=True, local=True, runtime=runtime)
 
 
+def _k8s_slots() -> list[NodeRecord]:
+    """The k8s backend's slot pool, read from config.env (empty unless
+    CLUSTER_K8S_BACKEND=1). Each slot is an interchangeable registry node
+    (provider 'k8s', gpu, no ip/ssh — the KubernetesAdapter talks to the cluster,
+    not a machine); a `backend: k8s` job claims one and renders its own gang of
+    pods. Slot count just bounds how many gangs Outpost hands KAI concurrently.
+
+    Multi-cluster: CLUSTER_K8S_CLUSTERS lets several k8s clusters live under one
+    control plane (e.g. the VM's L20 + the PC's 5060 Ti). Format is a
+    comma-separated list of `name:kube_context:slots`, e.g.
+    `vm:kind-vm:8,pc:kind-pc:4` -> slots `k8s-vm-0..7` (context kind-vm) +
+    `k8s-pc-0..3` (context kind-pc). A `backend: k8s` job targets one via
+    params.k8s_context (matching kube_context), else lands on any free slot.
+    Unset -> a single cluster: CLUSTER_K8S_SLOTS slots named `<prefix>-<i>` with
+    kube_context = CLUSTER_K8S_CONTEXT (the current context when also empty)."""
+    # Echo each var on its own line so CLUSTER_K8S_CLUSTERS (which may embed ':'
+    # and ',') isn't whitespace-split like the space-joined form was.
+    out = subprocess.run(
+        ["bash", "-c", 'source "$0"/infra/libvirt/lib.sh; '
+         'echo "${CLUSTER_K8S_BACKEND:-0}"; echo "${CLUSTER_K8S_SLOTS:-4}"; '
+         'echo "${CLUSTER_K8S_SLOT_PREFIX:-k8s-slot}"; echo "${CLUSTER_K8S_CLUSTERS:-}"; '
+         'echo "${CLUSTER_K8S_CONTEXT:-}"', REPO_ROOT],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    backend, slots, prefix, clusters, context = (out + [""] * 5)[:5]
+    if backend.strip() != "1":
+        return []
+
+    def mk(name: str, n: int, ctx: str) -> list[NodeRecord]:
+        return [NodeRecord(node_id=f"{name}-{i}", name=f"{name}-{i}", index=-1, ip="",
+                           state=NodeState.AVAILABLE.value, gpu=True, local=False,
+                           runtime="k8s", provider="k8s", kube_context=ctx)
+                for i in range(n)]
+
+    if clusters.strip():
+        nodes: list[NodeRecord] = []
+        for entry in clusters.split(","):
+            parts = [p.strip() for p in entry.split(":")]
+            if len(parts) != 3 or not parts[0]:
+                sys.exit(f"bad CLUSTER_K8S_CLUSTERS entry {entry!r} "
+                         "(expected name:kube_context:slots)")
+            name, ctx, n = parts
+            nodes += mk(f"{prefix}-{name}", int(n), ctx)
+        return nodes
+    return mk(prefix, int(slots), context.strip())
+
+
 def cmd_submit(args):
     import yaml
     with open(args.spec) as f:
@@ -144,8 +191,11 @@ def cmd_reconciler_log(args):
 def cmd_nodes(args):
     for n in _store().list_nodes():
         caps = ("gpu" if n.gpu else "cpu") + ("/local" if n.local else "")
-        print(f"{n.name:<14} idx={n.index} {n.ip:<15} {n.state:<12} "
-              f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}")
+        extra = ""
+        if n.kube_context:
+            extra += f" ctx={n.kube_context}"
+        print(f"{n.name:<16} idx={n.index} {n.ip:<15} {n.state:<12} "
+              f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}{extra}")
 
 
 def cmd_add_node(args):
@@ -189,6 +239,8 @@ def cmd_seed_nodes(args):
     host = _host_node()
     if host:
         nodes.append(host)
+    k8s_slots = _k8s_slots()
+    nodes.extend(k8s_slots)
     for n in nodes:
         old = existing.get(n.node_id)
         if old is None:
@@ -204,7 +256,9 @@ def cmd_seed_nodes(args):
             updated += 1
     print(f"seeded {added} node(s) into the registry ({len(existing)} already present"
           + (f", {updated} refreshed" if updated else "") + ")"
-          + (f"; host GPU node = {host.name}" if host else "; no host GPU node (CLUSTER_GPU_HOST != 1)"))
+          + (f"; host GPU node = {host.name}" if host else "; no host GPU node (CLUSTER_GPU_HOST != 1)")
+          + (f"; {len(k8s_slots)} k8s slot(s) = {k8s_slots[0].name}..{k8s_slots[-1].name}"
+             if k8s_slots else "; no k8s backend (CLUSTER_K8S_BACKEND != 1)"))
 
 
 def cmd_remove_node(args):
