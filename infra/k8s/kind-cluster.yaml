@@ -1,0 +1,50 @@
+# KinD cluster for the HAMi + KAI GPU-sharing spike (single node = control-plane
+# also schedulable, so the one GPU node runs the workload pods).
+#
+#   kind create cluster --name outpost --config infra/k8s/kind-cluster.yaml
+#
+# GPU into the node is a TWO-part problem on NixOS (see nixos-gpu-kind.md):
+#   1. GPU into the NODE container: docker's default runtime = nvidia +
+#      accept-nvidia-visible-devices-as-volume-mounts, triggered by the
+#      /dev/null -> /var/run/nvidia-container-devices/all extraMount below.
+#   2. GPU into NESTED PODS (the device plugin + workloads): the node's OWN
+#      containerd must use the nvidia runtime too, else pods get plain runc with
+#      no driver. That's the containerdConfigPatches + the /nix/store mount (so
+#      the nix-built runtime binary + driver closure resolve) + the node-side
+#      runtime config file, all below.
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: outpost
+# Register the nvidia runtime in the node's containerd and make it the default,
+# so every pod is created through it (containerd v2 / io.containerd.grpc.v1.cri).
+containerdConfigPatches:
+  - |
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "nvidia"
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+      runtime_type = "io.containerd.runc.v2"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+        BinaryName = "/nix/store/l3n697nj6n6nx3hjxm28izzmqb3qlwms-nvidia-container-toolkit-1.19.1-tools/bin/nvidia-container-runtime"
+        SystemdCgroup = true
+nodes:
+  - role: control-plane
+    extraMounts:
+      # (1) inject all host GPUs into the node via the volume-mounts strategy —
+      #     only the DESTINATION path is read by the runtime as the request.
+      - hostPath: /dev/null
+        containerPath: /var/run/nvidia-container-devices/all
+      # (2a) the nix closure the nvidia runtime + driver libs live in (ro).
+      - hostPath: /nix/store
+        containerPath: /nix/store
+        readOnly: true
+      # (2b) the node's nvidia-container-runtime config (mode=cdi).
+      - hostPath: ./infra/k8s/node-nvidia-runtime-config.toml
+        containerPath: /etc/nvidia-container-runtime/config.toml
+        readOnly: true
+      # (2c) the host's CDI spec — mode=cdi injects the driver paths it names
+      #      (they resolve because /nix/store is mounted at 2a).
+      - hostPath: /var/run/cdi
+        containerPath: /var/run/cdi
+        readOnly: true
+    # NOTE: no `taints: []` patch — kind untaints a single control-plane node
+    # itself; pre-clearing it makes kind's own taint-removal step fail.

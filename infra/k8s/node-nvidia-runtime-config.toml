@@ -1,0 +1,38 @@
+# nvidia-container-runtime config used by the kind node's INNER containerd
+# (mounted to /etc/nvidia-container-runtime/config.toml, see kind-cluster.yaml).
+#
+# mode = "legacy": the hook injects the node's driver into any container whose
+# env sets NVIDIA_VISIBLE_DEVICES (nvidia images default it to "all") — this is
+# what lets the device-plugin pod itself get NVML, and workload pods get the GPU
+# the plugin allocates them. (The HOST runtime stays mode=cdi; this is only the
+# nested node's copy.)
+#
+# no-cgroups = true: skip device-cgroup setup, which the nested (kind) container
+# can't always manage — the /dev/nvidia* nodes are already present in the node.
+#
+# ⚠ The /nix/store paths are pinned to the CURRENT system generation. If a
+# nixos-rebuild bumps the driver or toolkit, regenerate them (they're printed by
+# `find /nix/store -name nvidia-container-cli` etc.). A spike shortcut, not a
+# durable wiring — the eventual KubernetesAdapter shouldn't hardcode these.
+disable-require = true
+[nvidia-container-cli]
+environment = []
+ldconfig = "@/sbin/ldconfig"
+load-kmods = true
+no-cgroups = true
+path = "/nix/store/a5h93jam4lkar6gskjn5lzg2134f4wab-libnvidia-container-1.17.8/bin/nvidia-container-cli"
+[nvidia-container-runtime]
+# CDI, not legacy: on NixOS the driver lives at non-standard /nix/store paths
+# that legacy-mode nvidia-container-cli can't discover (nvidia-smi ends up not
+# injected). CDI is the mechanism proven to work on this host
+# (`docker run --device nvidia.com/gpu=all` lists the GPU) — it injects exactly
+# the paths named in the CDI spec (mounted into the node, see kind-cluster.yaml).
+# NVIDIA_VISIBLE_DEVICES=all is mapped to the CDI device nvidia.com/gpu=all.
+mode = "cdi"
+[nvidia-container-runtime-hook]
+path = "/nix/store/l3n697nj6n6nx3hjxm28izzmqb3qlwms-nvidia-container-toolkit-1.19.1-tools/bin/nvidia-container-runtime-hook"
+[nvidia-ctk]
+# The runtime generates a createContainer hook that execs nvidia-ctk; its path
+# defaults to /usr/bin/nvidia-ctk (absent in the node). Point it at the nix one,
+# else container creation fails with "fork/exec /usr/bin/nvidia-ctk: no such file".
+path = "/nix/store/vsvz8f6ygffcsfjbzg19hdqszj6lzib4-nvidia-container-toolkit-1.19.1/bin/nvidia-ctk"
