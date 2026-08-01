@@ -1,0 +1,24 @@
+# Kubernetes-backend JobSpec — simulate an N-GPU job on ONE GPU via HAMi + KAI.
+# `backend: k8s` routes to the KubernetesAdapter (docs/08-kubernetes-backend.md);
+# the cluster + KAI + HAMi are stood up out of band by infra/k8s/setup.sh.
+#
+# Reframing vs a VM/GPU job: node_count here is the GANG SIZE (number of pods /
+# ranks), and ALL ranks land on the single physical GPU as HAMi vGPU slices.
+# The job claims exactly one registry node (k8s-cluster), not node_count nodes —
+# the N-way parallelism lives inside the pod group, not in the node pool.
+
+name: nccl-allreduce-sim-4
+backend: k8s               # NEW field: route to the KubernetesAdapter / the one k8s node
+image: "docker://nvidia/cuda:12.6.3-base-ubuntu24.04"
+command: ["bash", "-c", "nvidia-smi -L; echo \"rank ${RANK:-?} cap=$CUDA_DEVICE_MEMORY_LIMIT\""]
+node_count: 4             # gang size: 4 pods, ALL on the one physical GPU
+gpu: true
+output_dir: "/out"
+env: {}
+
+params:
+  gpu_memory_mb: 4096     # HAMi hard VRAM cap per rank -> pod annotation gpu-memory
+  queue: default-queue    # KAI queue (kai.scheduler/queue)
+  note: >
+    Faithful for topology/init/scheduling; NOT for throughput — the 4 ranks
+    time-slice one SM array. See docs/08-kubernetes-backend.md.

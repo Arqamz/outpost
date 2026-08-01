@@ -1,0 +1,10 @@
+name: k8s-nccl-gang
+backend: k8s
+image: "nvcr.io/nvidia/hpc-benchmarks:26.02"
+command: ["/usr/local/bin/all_reduce_perf_mpi", "-b", "1M", "-e", "256M", "-f", "2", "-g", "1"]
+node_count: 2
+gpu: true
+output_dir: /out
+params:
+  gpu_memory_mb: 6000
+  queue: default-queue
