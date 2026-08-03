@@ -77,5 +77,12 @@ cuda-sif:   ; demo/build-sif.sh demo/cuda_axpb.sif demo/cuda_axpb.def
 # --- scheduling demo: 4 jobs (2x pool-filling MPI, 1 waiting MPI, 1 GPU), ticked live ---
 demo-scheduling: ; demo/run-scheduling-demo.sh
 
+# --- Kubernetes (KAI + HAMi) backend: multi-GPU-on-one-GPU via `backend: k8s` ---
+# k8s-up stands up the cluster + KAI + HAMi (idempotent; re-run after kind delete).
+# Then CLUSTER_K8S_BACKEND=1 seed, submit a k8s job, or run the concurrency demo.
+k8s-up:      ; infra/k8s/setup.sh
+submit-k8s:  ; bin/cluster submit --spec job.k8s.small.example.yaml
+demo-k8s-scheduling: ; demo/run-k8s-scheduling-demo.sh
+
 # --- live dashboard (per-VM CPU/RAM + host GPU + job queue + per-job logs) ---
 dashboard:  ; python3 viz/dashboard.py
