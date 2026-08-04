@@ -194,6 +194,8 @@ def cmd_nodes(args):
         extra = ""
         if n.kube_context:
             extra += f" ctx={n.kube_context}"
+        if n.gpu_binds:
+            extra += f" binds={n.gpu_binds}"
         print(f"{n.name:<16} idx={n.index} {n.ip:<15} {n.state:<12} "
               f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}{extra}")
 
@@ -221,11 +223,15 @@ def cmd_add_node(args):
         runtime=d.get("runtime", "apptainer"), provider="static-ssh",
         ssh_user=d.get("ssh_user", "") or "",
         ssh_key=os.path.expanduser(key) if key else "",
+        # gpu_binds: this node's OWN `apptainer --nv` driver binds (a NixOS GPU
+        # worker needs /nix/store,/run/opengl-driver; Ubuntu leaves it empty).
+        gpu_binds=d.get("gpu_binds", "") or "",
     )
     store.put_node(node)
     print(f"added static-ssh node {node.name} at {node.ip} "
           f"({'gpu' if node.gpu else 'cpu'}, ssh {node.ssh_user or '<cluster-default>'}"
-          f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}). "
+          f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}"
+          f"{f', gpu_binds={node.gpu_binds}' if node.gpu_binds else ''}). "
           f"Bake apptainer into the image before running real jobs.")
 
 

@@ -127,6 +127,13 @@ class NodeRecord:
     # "" -> fall back to the cluster-wide CLUSTER_SSH_USER / CLUSTER_SSH_PRIVKEY.
     ssh_user: str = ""
     ssh_key: str = ""
+    # per-node GPU driver binds for `apptainer --nv` (comma-sep --bind paths),
+    # overriding the control plane's global CLUSTER_GPU_BINDS. The point is a
+    # REMOTE gpu worker whose driver libs live somewhere non-standard: a NixOS
+    # box reached over ssh needs "/nix/store,/run/opengl-driver" (its own paths,
+    # which exist on that node), while an Ubuntu worker wants "" (--nv self-
+    # detects). Only consulted for gpu runs; empty = plain --nv.
+    gpu_binds: str = ""
     # for a k8s-backend slot: which kube-context (i.e. which cluster) it targets,
     # so several k8s clusters (e.g. the VM's L20 + the PC's 5060 Ti) can live
     # under ONE control plane. "" -> the adapter's global CLUSTER_K8S_CONTEXT
@@ -147,7 +154,7 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "kube_context", "updated_at"}
+                "gpu_binds", "kube_context", "updated_at"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 

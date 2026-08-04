@@ -126,6 +126,20 @@ def node_ssh_id(node: NodeRecord) -> tuple[str, str]:
     return node.ssh_user or SSH_USER, node.ssh_key or SSH_KEY
 
 
+def node_gpu_binds(node: NodeRecord) -> list[str]:
+    """`apptainer --nv` driver binds to use when running a GPU job ON THIS node.
+    node.gpu_binds (comma-sep) if set — the REMOTE node's own driver paths, which
+    must exist there (a NixOS worker: /nix/store,/run/opengl-driver; an Ubuntu
+    worker: empty, --nv self-detects). Falls back to the control plane's global
+    CLUSTER_GPU_BINDS only for a LOCAL node (same filesystem as the control
+    plane), so a remote worker never inherits the control plane's host paths."""
+    if node.gpu_binds:
+        return [b for b in node.gpu_binds.split(",") if b]
+    if node.local:
+        return [b for b in os.environ.get("CLUSTER_GPU_BINDS", "").split(",") if b]
+    return []
+
+
 def ssh_base(ip: str, user: str | None = None, key: str | None = None) -> list[str]:
     """argv prefix for reaching a cluster node over ssh. Module-level (not a
     LibvirtAdapter detail) because the hybrid MPI path on the host stages images
@@ -611,7 +625,14 @@ class LibvirtAdapter(ProviderAdapter):
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
         if spec.launcher == "mpi" and len(nodes) > 1:
             return self._run_mpi(nodes, job_id, spec, remote_workdir)
-        argv = container_argv(spec, remote_workdir, spec.output_dir)
+        # A GPU job on a remote node adds the node's OWN driver binds for
+        # `apptainer --nv` (node.gpu_binds), whose source paths must exist ON
+        # THAT node — a NixOS worker needs /nix/store,/run/opengl-driver; an
+        # Ubuntu worker sets none (--nv self-detects). This is the remote
+        # counterpart of the host's CLUSTER_GPU_BINDS (LocalHostAdapter), except
+        # it's per-node because it's the REMOTE box's filesystem, not ours.
+        extra_binds = node_gpu_binds(head) if spec.gpu else []
+        argv = container_argv(spec, remote_workdir, spec.output_dir, extra_binds=extra_binds)
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
         # tee into the workdir (not just captured by run_logged's replay log):
