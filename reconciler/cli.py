@@ -2,11 +2,14 @@
 
 Talks to the store (file by default, Mongo via CLUSTER_MONGO_URI); it does NOT run on
 the nodes. Commands:
-    submit --spec job.yaml     write a JobSpec into jobs
+    submit --spec job.yaml     write a JobSpec into jobs (--spec - reads YAML from stdin,
+                               so `ssh tashkil submit < job.yaml` works)
     reconcile [--once] [--execute]   drive the state machine
     list                       jobs + states
     status <job_id>            one job + its audit trail
     result <job_id>            print where the job's artifacts landed (egress)
+    fetch <job_id>             stream a tar of the job's drop-zone artifacts to stdout
+                               (egress over the wire: `ssh tashkil fetch <id> | tar x`)
     logs <job_id> [--tail N]   full replay transcript for one job (every command + output)
     nodes                      the NodeRegistry (with gpu/local capabilities)
     seed-nodes                 populate nodes from config (VMs + host GPU node)
@@ -116,10 +119,35 @@ def _k8s_slots() -> list[NodeRecord]:
 
 def cmd_submit(args):
     import yaml
-    with open(args.spec) as f:
-        spec = JobSpec.from_dict(yaml.safe_load(f))
+    # --spec - reads the JobSpec from stdin so the same intake works over a pipe
+    # (the ssh gateway: `ssh tashkil submit < job.yaml`) as from a local file.
+    if args.spec == "-":
+        spec = JobSpec.from_dict(yaml.safe_load(sys.stdin))
+    else:
+        with open(args.spec) as f:
+            spec = JobSpec.from_dict(yaml.safe_load(f))
     r = Reconciler(_store())
     print(r.submit(spec))
+
+
+def cmd_fetch(args):
+    """Egress over the wire: stream a tar of the job's drop-zone dir to stdout.
+    The remote counterpart to `result` — where `result` prints the server-side
+    path, `fetch` ships the bytes, so `ssh tashkil fetch <id> | tar x` lands
+    every artifact (stdout.log + whatever the job wrote) locally. Reads the same
+    ${CLUSTER_DROPZONE}/<id>/ that `collect` populated."""
+    from .reconciler import DROPZONE
+    job = _store().get_job(args.job_id)
+    if not job:
+        sys.exit(f"no such job: {args.job_id}")
+    src = os.path.join(DROPZONE, args.job_id)
+    if not os.path.isdir(src):
+        sys.exit(f"no artifacts for {args.job_id} yet (state {job.state}; expected {src})")
+    # Stream the tar straight to the inherited stdout fd (zero-copy over ssh),
+    # with job_id as the top-level member so `tar x` yields <job_id>/... . Fixed
+    # argv, no shell — nothing here is interpolated from an untrusted string.
+    sys.stdout.flush()
+    os.execvp("tar", ["tar", "-C", DROPZONE, "-cf", "-", args.job_id])
 
 
 def cmd_reconcile(args):
@@ -321,6 +349,8 @@ def main(argv=None):
     sub.add_parser("list").set_defaults(fn=cmd_list)
     s = sub.add_parser("status"); s.add_argument("job_id"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("result"); s.add_argument("job_id"); s.set_defaults(fn=cmd_result)
+    s = sub.add_parser("fetch", help="stream a tar of a job's drop-zone artifacts to stdout")
+    s.add_argument("job_id"); s.set_defaults(fn=cmd_fetch)
     s = sub.add_parser("logs"); s.add_argument("job_id")
     s.add_argument("--tail", type=int, default=0, help="show only the last N lines")
     s.set_defaults(fn=cmd_logs)
