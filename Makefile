@@ -6,7 +6,7 @@ ANS := infra/ansible
 .PHONY: help net-up net-down template cluster-up cluster-down status \
         inventory bootstrap bootstrap-check fail clean \
         seed-nodes submit reconcile jobs mpi-demo mpi-sif submit-mpi submit-hybrid \
-        cuda-sif submit-hybrid-cuda dashboard demo-scheduling
+        cuda-sif submit-hybrid-cuda dashboard demo-scheduling gateway-install
 
 help:
 	@echo "Cluster targets:"
@@ -32,6 +32,8 @@ help:
 	@echo "  make mpi-sif       build demo/mpi_demo.sif (containerized MPI demo)"
 	@echo "  make cuda-sif      build demo/cuda_axpb.sif (MPI+CUDA hybrid demo)"
 	@echo "  make demo-scheduling  submit 4 jobs (contention + wait + GPU) and tick live"
+	@echo "  --- ssh gateway ---"
+	@echo "  make gateway-install KEY=~/k.pub   install 'ssh tashkil' job portal (root)"
 	@echo "  --- log lookup ---"
 	@echo "  bin/cluster logs <job-id>     full per-job replay transcript"
 	@echo "  bin/cluster reconciler-log    cross-job chronological narration"
@@ -83,6 +85,11 @@ demo-scheduling: ; demo/run-scheduling-demo.sh
 k8s-up:      ; infra/k8s/setup.sh
 submit-k8s:  ; bin/cluster submit --spec job.k8s.small.example.yaml
 demo-k8s-scheduling: ; demo/run-k8s-scheduling-demo.sh
+
+# --- ssh gateway (`ssh tashkil ...`): install the forced-command job portal ---
+# Needs root + a client public key: make gateway-install KEY=~/keys/laptop.pub
+# See docs/10-ssh-gateway.md. Re-run to authorize more keys (idempotent).
+gateway-install: ; sudo infra/gateway/install.sh --key "$(KEY)"
 
 # --- live dashboard (per-VM CPU/RAM + host GPU + job queue + per-job logs) ---
 dashboard:  ; python3 viz/dashboard.py
