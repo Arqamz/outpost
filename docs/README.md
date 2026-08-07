@@ -5,9 +5,11 @@ on the resources it manages (local KVM VMs + the host GPU), and returns *any*
 output it produces. The interface is deliberately open — JobSpec in,
 drop-zone out — so anything can drive it, not just a single blessed caller.
 
-Apptainer on VMs is the only backend today. KinD, Slinky/Slurm, and
-multi-node distribution are planned for later — the reconciler/adapter split
-means adding one won't touch the JobSpec contract.
+Two execution backends exist: **apptainer** (on libvirt VMs, the host GPU, or
+static-ssh workers — including remote GPU boxes) and **Kubernetes + KAI/HAMi**
+(GPU sliced into a gang of pods). One control plane can span multiple machines
+and both backends at once (see doc 9). Slinky/Slurm is still planned — the
+reconciler/adapter split means adding one won't touch the JobSpec contract.
 
 Read in order:
 
@@ -20,6 +22,9 @@ Read in order:
 | 5 | [05-gpu-and-apptainer.md](05-gpu-and-apptainer.md) | the host GPU node + running containers with apptainer |
 | 6 | [06-interface-contract.md](06-interface-contract.md) | the open interface anything driving this cluster targets (intake + egress) |
 | 7 | [07-ubuntu-setup.md](07-ubuntu-setup.md) | running the whole thing on a native Ubuntu host (no Nix): install → cluster up → dashboard → jobs, incl. host-only and hybrid (VM + host GPU) runbooks |
+| 8 | [08-kubernetes-backend.md](08-kubernetes-backend.md) | the Kubernetes backend (HAMi + KAI): `backend: k8s` runs a job as a gang of N pods sharing one GPU, VRAM-capped per rank, with pod-DNS rendezvous — design, honest limits, quick start |
+| 9 | [09-multi-machine-cluster.md](09-multi-machine-cluster.md) | one control plane across two machines + all fabrics: VM control plane, the PC joined as a static-ssh GPU worker AND its own k8s cluster, per-cluster slot targeting |
+| 10 | [10-ssh-gateway.md](10-ssh-gateway.md) | `ssh tashkil` — a forced-command front door that puts the open interface (JobSpec in over stdin, artifacts out over a stdout tar) behind one ssh alias, job-portal only (no admin), with a client wrapper |
 
 Quickstart lives in the top-level [../README.md](../README.md); day-to-day
 command reference lives in [../CLAUDE.md](../CLAUDE.md).
