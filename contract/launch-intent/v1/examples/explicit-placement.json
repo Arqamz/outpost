@@ -1,0 +1,36 @@
+{
+  "schema_version": "launch-intent/v1",
+  "approval": "auto",
+  "process": {
+    "ranks_per_node": 2,
+    "threads_per_rank": 4
+  },
+  "cpu": {
+    "cores_per_rank": 4,
+    "strategy": "explicit",
+    "binding_unit": "core",
+    "smt": "allow_siblings",
+    "allow_overlap": false,
+    "explicit_cpu_ids": [
+      [0, 1, 2, 3],
+      [8, 9, 10, 11]
+    ]
+  },
+  "memory": {
+    "strategy": "none"
+  },
+  "gpu": {
+    "gpus_per_rank": 1,
+    "strategy": "explicit",
+    "ordering": "fastest_first",
+    "allow_sharing": false,
+    "explicit_gpu_uuids": [
+      "GPU-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "GPU-c3d4e5f6-7890-abcd-ef12-34567890abcd"
+    ]
+  },
+  "validation": {
+    "mode": "advisory",
+    "require_preflight": false
+  }
+}

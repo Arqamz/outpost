@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any
 import uuid
 
+from . import launch_models
 from .states import JobState, NodeState
 
 # MongoDB collection names (also the JSON keys in the file store).
@@ -45,6 +46,11 @@ class JobSpec:
     env: dict[str, str] = field(default_factory=dict)  # env vars set inside the container
     output_dir: str = "/out"           # in-container path the job writes results to
     params: dict[str, Any] = field(default_factory=dict)  # opaque passthrough
+    # semantic placement request (contract/launch-intent/v1). None = the caller has
+    # no placement opinion, which is the pre-existing behaviour and the default.
+    # Unlike `params`, this is NOT opaque passthrough: it is validated on parse and
+    # a block we cannot honour refuses the job (see launch_models).
+    launch: dict[str, Any] | None = None
     # legacy label (kept so old specs still parse)
     workload: str = ""
 
@@ -53,6 +59,14 @@ class JobSpec:
         cmd = d.get("command", []) or []
         if isinstance(cmd, str):
             cmd = cmd.split()
+        # Every other field here is best-effort: an unrecognised key is dropped and
+        # a missing one defaults, which is right for a deliberately open interface.
+        # `launch` is the exception and must stay one — a placement request that is
+        # quietly discarded produces a run that succeeds, parses, and measures a
+        # machine configuration nobody chose. So it validates, and it raises.
+        launch = d.get("launch")
+        if launch is not None:
+            launch = launch_models.parse(launch)
         return JobSpec(
             name=d["name"],
             image=d.get("image", "") or "",
@@ -65,6 +79,7 @@ class JobSpec:
             env={str(k): str(v) for k, v in (d.get("env", {}) or {}).items()},
             output_dir=d.get("output_dir", "/out"),
             params=d.get("params", {}) or {},
+            launch=launch,
             workload=d.get("workload", "") or "",
         )
 
@@ -83,6 +98,14 @@ class JobRecord:
     run: dict | None = None             # serialized RunResult once the run phase completes
     drop_path: str | None = None        # where collected artifacts landed (egress half)
     error: str | None = None
+    # Resolved placement, once a planning phase has produced one. Lives on the
+    # record rather than only in the drop-zone because a caller has to be able to
+    # SEE the plan before execution, and the drop-zone is not written until
+    # collect. Both default, so records written before these existed still parse
+    # (from_dict is JobRecord(**d): missing keys default, unknown keys raise) —
+    # which is what makes this an additive change with no store migration.
+    plan: dict | None = None
+    plan_status: str = "none"           # none | planning | ready | approved | stale | failed
     created_at: str | None = None
     updated_at: str | None = None
 

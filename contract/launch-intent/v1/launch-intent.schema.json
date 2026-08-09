@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tashkil.io/schema/launch-intent/v1/launch-intent.schema.json",
+  "title": "Launch Intent (launch-intent/v1)",
+  "description": "A launcher- and runtime-independent description of the process placement a benchmark run requires: how many ranks, how many cores and threads each gets, how those cores relate to the rank's GPU and NUMA node, and how strictly the request must be honoured. It travels as the OPTIONAL `launch` block inside a JobSpec. The emitter constructs it from benchmark defaults and engineer overrides; it names no CPU ids, no device indices, and no launcher flags, because none of those are knowable before resources are allocated. A planning-capable runtime validates it, discovers the topology it actually allocated, and resolves it into an exact per-rank plan. NULL CONVENTION (mirrored from the fingerprint schema): an inapplicable or deferred value is always JSON null, never an empty string or empty array — null on a field means 'resolve this against the discovered topology', not 'ignore it'. STRICTNESS: additionalProperties is false everywhere and every block is required, because a runtime must never silently drop a placement request it does not understand; the emitter materialises every field from its defaults before submission. VERSIONING: `schema_version` is the compatibility boundary — a runtime that does not recognise the exact string, or that cannot plan at all, MUST reject the job rather than execute it unplanned.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "approval",
+    "process",
+    "cpu",
+    "memory",
+    "gpu",
+    "validation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "launch-intent/v1",
+      "description": "Compatibility boundary. An unrecognised value MUST cause the receiving runtime to reject the job, naming the version — never to fall back to unplanned execution."
+    },
+    "approval": {
+      "enum": ["auto", "manual"],
+      "description": "Who releases the resolved plan for execution. 'auto': the runtime proceeds as soon as the plan resolves and passes validation (repeatable runs of an already-reviewed placement). 'manual': the job parks awaiting an explicit approval before any workload starts. Declared alongside the placement it applies to, so a reviewed intent and its review requirement travel together."
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ranks_per_node", "threads_per_rank"],
+      "properties": {
+        "ranks_per_node": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Ranks to place on each allocated node. null = derive from the discovered GPU count (one rank per GPU), which requires gpu.strategy 'one_per_rank'; this is what makes an intent portable across nodes with differing GPU counts. An explicit integer is a hard requirement: if the allocation cannot supply it, planning fails rather than silently placing fewer ranks."
+        },
+        "threads_per_rank": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Threads each rank should run (drives OMP_NUM_THREADS and equivalents). Distinct from cpu.cores_per_rank: a rank may be given more cores than threads (headroom reserved from other ranks) or fewer (deliberate oversubscription)."
+        }
+      }
+    },
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cores_per_rank",
+        "strategy",
+        "binding_unit",
+        "smt",
+        "allow_overlap",
+        "explicit_cpu_ids"
+      ],
+      "properties": {
+        "cores_per_rank": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "CPU cores to assign to each rank, counted in units of `binding_unit`. null = do not constrain the rank's cpuset (the allocation's own cpuset still applies)."
+        },
+        "strategy": {
+          "enum": ["none", "closest_to_gpu", "explicit"],
+          "description": "How the resolver picks each rank's cores. 'none': no affinity requested. 'closest_to_gpu': choose cores sharing a NUMA node with the rank's assigned GPU — this requires topology that actually exposes GPU-to-NUMA locality, so it fails under validation.mode 'strict' when the discovered topology cannot support the claim. 'explicit': use explicit_cpu_ids verbatim."
+        },
+        "binding_unit": {
+          "enum": ["none", "hwthread", "core", "numa", "socket"],
+          "description": "The granularity the launcher binds at. 'core' binds a physical core (both SMT siblings when smt is 'allow_siblings'); 'hwthread' binds individual processing units. 'none' renders no binding directive even when a cpuset was resolved."
+        },
+        "smt": {
+          "enum": ["physical_only", "allow_siblings"],
+          "description": "'physical_only': never count two SMT siblings as two cores — the resolver assigns one processing unit per physical core. 'allow_siblings': siblings are assignable independently. Getting this wrong silently halves or doubles effective core counts, which is why it is explicit rather than inferred."
+        },
+        "allow_overlap": {
+          "type": "boolean",
+          "description": "Whether two ranks may share a CPU id. false = an overlapping resolution is a validation failure."
+        },
+        "explicit_cpu_ids": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "integer", "minimum": 0 }
+          },
+          "description": "Per-rank CPU id lists, indexed by LOCAL rank (position 0 is each node's local rank 0), so one list applies to every allocated node. Required when strategy is 'explicit' and forbidden otherwise, so a leftover list can never sit inert beside a policy that ignores it. Ids are validated to exist inside the allocation's allowed cpuset on every node."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "strategy": { "const": "explicit" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "properties": { "explicit_cpu_ids": { "type": "array" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "not": { "const": "explicit" } } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "properties": { "explicit_cpu_ids": { "type": "null" } }
+          }
+        }
+      ]
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy"],
+      "properties": {
+        "strategy": {
+          "enum": ["none", "local", "interleave"],
+          "description": "NUMA memory placement. 'local': allocate on the NUMA node(s) hosting the rank's cores. 'interleave': spread across the rank's NUMA nodes. 'none': no memory policy requested. A launcher that cannot express the requested policy must reject it under validation.mode 'strict' rather than drop it."
+        }
+      }
+    },
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gpus_per_rank",
+        "strategy",
+        "ordering",
+        "allow_sharing",
+        "explicit_gpu_uuids"
+      ],
+      "properties": {
+        "gpus_per_rank": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "GPUs visible to each rank. 0 for a CPU-only benchmark."
+        },
+        "strategy": {
+          "enum": ["none", "one_per_rank", "explicit"],
+          "description": "'one_per_rank': assign a distinct discovered GPU to each rank. 'explicit': use explicit_gpu_uuids verbatim. 'none': make no GPU assignment (the workload sees whatever the container exposes)."
+        },
+        "ordering": {
+          "enum": ["pci_bus", "fastest_first"],
+          "description": "The device order each rank's visible index is derived from, so an application-visible device index is reproducible across runs rather than depending on driver enumeration order."
+        },
+        "allow_sharing": {
+          "type": "boolean",
+          "description": "Whether two ranks may be assigned the same physical GPU. false = a duplicate assignment is a validation failure."
+        },
+        "explicit_gpu_uuids": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Per-rank GPU UUIDs, indexed by LOCAL rank, matching the cpu.explicit_cpu_ids convention. Required when strategy is 'explicit' and forbidden otherwise. Each UUID is validated to exist on the node the rank lands on."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "strategy": { "const": "explicit" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "properties": { "explicit_gpu_uuids": { "type": "array" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "not": { "const": "explicit" } } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "properties": { "explicit_gpu_uuids": { "type": "null" } }
+          }
+        }
+      ]
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "require_preflight"],
+      "properties": {
+        "mode": {
+          "enum": ["strict", "advisory"],
+          "description": "'strict': any requirement the discovered topology or the selected launcher cannot satisfy fails the job, naming what was unsupported. 'advisory': unsatisfiable OPTIONAL requirements are dropped with a recorded warning; a requirement whose loss would change what the benchmark measures still fails. Strict requirements are never silently downgraded under either mode."
+        },
+        "require_preflight": {
+          "type": "boolean",
+          "description": "Whether a rank-level placement probe must run, and its observations be reconciled against the resolved plan, before the benchmark payload starts. false skips the probe; a plan/observation mismatch is always recorded rather than suppressed."
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "process": {
+            "properties": { "ranks_per_node": { "type": "null" } },
+            "required": ["ranks_per_node"]
+          }
+        },
+        "required": ["process"]
+      },
+      "then": {
+        "properties": {
+          "gpu": {
+            "properties": { "strategy": { "const": "one_per_rank" } },
+            "required": ["strategy"]
+          }
+        },
+        "required": ["gpu"],
+        "description": "A null ranks_per_node is only meaningful when there is something to derive the rank count FROM. One rank per discovered GPU is that rule; with any other GPU strategy the count would be unknowable and the job would launch a rank count nobody chose."
+      }
+    }
+  ]
+}
