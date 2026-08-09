@@ -1,0 +1,79 @@
+{
+  "probe_version": "1",
+  "hostname": "cluster-host",
+  "scope": "host",
+  "allowed_cpus": "0-7",
+  "online_cpus": "0-7",
+  "cpus": [
+    {
+      "id": 0,
+      "core": 0,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 1,
+      "core": 1,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 2,
+      "core": 2,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 3,
+      "core": 3,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 4,
+      "core": 0,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 5,
+      "core": 1,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 6,
+      "core": 2,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 7,
+      "core": 3,
+      "socket": 0,
+      "numa": 0
+    }
+  ],
+  "numa": [
+    {
+      "id": 0,
+      "cpulist": "0-7",
+      "memory_mib": 64000
+    }
+  ],
+  "gpus": [
+    {
+      "index": 0,
+      "uuid": "GPU-dev00001-0000-0000-0000-000000000001",
+      "pci_bus_id": "00000000:01:00.0",
+      "memory_mib": 16380,
+      "name": "NVIDIA GeForce RTX 5060 Ti",
+      "numa": 0
+    }
+  ],
+  "topo_matrix": "\tGPU0\tCPU Affinity\tNUMA Affinity\nGPU0\t X \t0-7\t0\n",
+  "launcher": {
+    "type": "openmpi",
+    "version": "4.1.6"
+  }
+}

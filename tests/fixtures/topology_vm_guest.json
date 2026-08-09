@@ -1,0 +1,28 @@
+{
+  "probe_version": "1",
+  "hostname": "cluster-node-01",
+  "scope": "guest",
+  "allowed_cpus": "0-1",
+  "online_cpus": "0-1",
+  "cpus": [
+    {
+      "id": 0,
+      "core": 0,
+      "socket": 0,
+      "numa": null
+    },
+    {
+      "id": 1,
+      "core": 1,
+      "socket": 0,
+      "numa": null
+    }
+  ],
+  "numa": [],
+  "gpus": [],
+  "topo_matrix": null,
+  "launcher": {
+    "type": "openmpi",
+    "version": "4.1.6"
+  }
+}

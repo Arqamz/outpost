@@ -1,0 +1,1052 @@
+{
+  "probe_version": "1",
+  "hostname": "gpu-node-02",
+  "scope": "container",
+  "allowed_cpus": "0-7,80-87",
+  "online_cpus": "0-159",
+  "cpus": [
+    {
+      "id": 0,
+      "core": 0,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 1,
+      "core": 1,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 2,
+      "core": 2,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 3,
+      "core": 3,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 4,
+      "core": 4,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 5,
+      "core": 5,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 6,
+      "core": 6,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 7,
+      "core": 7,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 8,
+      "core": 8,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 9,
+      "core": 9,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 10,
+      "core": 10,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 11,
+      "core": 11,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 12,
+      "core": 12,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 13,
+      "core": 13,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 14,
+      "core": 14,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 15,
+      "core": 15,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 16,
+      "core": 16,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 17,
+      "core": 17,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 18,
+      "core": 18,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 19,
+      "core": 19,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 20,
+      "core": 20,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 21,
+      "core": 21,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 22,
+      "core": 22,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 23,
+      "core": 23,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 24,
+      "core": 24,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 25,
+      "core": 25,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 26,
+      "core": 26,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 27,
+      "core": 27,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 28,
+      "core": 28,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 29,
+      "core": 29,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 30,
+      "core": 30,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 31,
+      "core": 31,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 32,
+      "core": 32,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 33,
+      "core": 33,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 34,
+      "core": 34,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 35,
+      "core": 35,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 36,
+      "core": 36,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 37,
+      "core": 37,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 38,
+      "core": 38,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 39,
+      "core": 39,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 40,
+      "core": 0,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 41,
+      "core": 1,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 42,
+      "core": 2,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 43,
+      "core": 3,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 44,
+      "core": 4,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 45,
+      "core": 5,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 46,
+      "core": 6,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 47,
+      "core": 7,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 48,
+      "core": 8,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 49,
+      "core": 9,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 50,
+      "core": 10,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 51,
+      "core": 11,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 52,
+      "core": 12,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 53,
+      "core": 13,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 54,
+      "core": 14,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 55,
+      "core": 15,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 56,
+      "core": 16,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 57,
+      "core": 17,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 58,
+      "core": 18,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 59,
+      "core": 19,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 60,
+      "core": 20,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 61,
+      "core": 21,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 62,
+      "core": 22,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 63,
+      "core": 23,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 64,
+      "core": 24,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 65,
+      "core": 25,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 66,
+      "core": 26,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 67,
+      "core": 27,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 68,
+      "core": 28,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 69,
+      "core": 29,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 70,
+      "core": 30,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 71,
+      "core": 31,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 72,
+      "core": 32,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 73,
+      "core": 33,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 74,
+      "core": 34,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 75,
+      "core": 35,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 76,
+      "core": 36,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 77,
+      "core": 37,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 78,
+      "core": 38,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 79,
+      "core": 39,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 80,
+      "core": 0,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 81,
+      "core": 1,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 82,
+      "core": 2,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 83,
+      "core": 3,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 84,
+      "core": 4,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 85,
+      "core": 5,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 86,
+      "core": 6,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 87,
+      "core": 7,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 88,
+      "core": 8,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 89,
+      "core": 9,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 90,
+      "core": 10,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 91,
+      "core": 11,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 92,
+      "core": 12,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 93,
+      "core": 13,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 94,
+      "core": 14,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 95,
+      "core": 15,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 96,
+      "core": 16,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 97,
+      "core": 17,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 98,
+      "core": 18,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 99,
+      "core": 19,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 100,
+      "core": 20,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 101,
+      "core": 21,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 102,
+      "core": 22,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 103,
+      "core": 23,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 104,
+      "core": 24,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 105,
+      "core": 25,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 106,
+      "core": 26,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 107,
+      "core": 27,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 108,
+      "core": 28,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 109,
+      "core": 29,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 110,
+      "core": 30,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 111,
+      "core": 31,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 112,
+      "core": 32,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 113,
+      "core": 33,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 114,
+      "core": 34,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 115,
+      "core": 35,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 116,
+      "core": 36,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 117,
+      "core": 37,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 118,
+      "core": 38,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 119,
+      "core": 39,
+      "socket": 0,
+      "numa": 0
+    },
+    {
+      "id": 120,
+      "core": 0,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 121,
+      "core": 1,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 122,
+      "core": 2,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 123,
+      "core": 3,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 124,
+      "core": 4,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 125,
+      "core": 5,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 126,
+      "core": 6,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 127,
+      "core": 7,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 128,
+      "core": 8,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 129,
+      "core": 9,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 130,
+      "core": 10,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 131,
+      "core": 11,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 132,
+      "core": 12,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 133,
+      "core": 13,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 134,
+      "core": 14,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 135,
+      "core": 15,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 136,
+      "core": 16,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 137,
+      "core": 17,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 138,
+      "core": 18,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 139,
+      "core": 19,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 140,
+      "core": 20,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 141,
+      "core": 21,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 142,
+      "core": 22,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 143,
+      "core": 23,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 144,
+      "core": 24,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 145,
+      "core": 25,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 146,
+      "core": 26,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 147,
+      "core": 27,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 148,
+      "core": 28,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 149,
+      "core": 29,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 150,
+      "core": 30,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 151,
+      "core": 31,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 152,
+      "core": 32,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 153,
+      "core": 33,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 154,
+      "core": 34,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 155,
+      "core": 35,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 156,
+      "core": 36,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 157,
+      "core": 37,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 158,
+      "core": 38,
+      "socket": 1,
+      "numa": 1
+    },
+    {
+      "id": 159,
+      "core": 39,
+      "socket": 1,
+      "numa": 1
+    }
+  ],
+  "numa": [
+    {
+      "id": 0,
+      "cpulist": "0-39,80-119",
+      "memory_mib": 515000
+    },
+    {
+      "id": 1,
+      "cpulist": "40-79,120-159",
+      "memory_mib": 515000
+    }
+  ],
+  "gpus": [
+    {
+      "index": 0,
+      "uuid": "GPU-00000000-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:17:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 0
+    },
+    {
+      "index": 1,
+      "uuid": "GPU-00000001-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:27:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 0
+    },
+    {
+      "index": 2,
+      "uuid": "GPU-00000002-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:37:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 0
+    },
+    {
+      "index": 3,
+      "uuid": "GPU-00000003-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:47:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 0
+    },
+    {
+      "index": 4,
+      "uuid": "GPU-00000004-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:57:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 1
+    },
+    {
+      "index": 5,
+      "uuid": "GPU-00000005-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:67:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 1
+    },
+    {
+      "index": 6,
+      "uuid": "GPU-00000006-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:77:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 1
+    },
+    {
+      "index": 7,
+      "uuid": "GPU-00000007-e5f6-7890-abcd-ef1234567890",
+      "pci_bus_id": "00000000:87:00.0",
+      "memory_mib": 81920,
+      "name": "NVIDIA H100 80GB HBM3",
+      "numa": 1
+    }
+  ],
+  "topo_matrix": "\tGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\tNIC0\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\nGPU0\t X \tNV18\tNV18\tNV18\tSYS\tSYS\tSYS\tSYS\tPIX\t0-39,80-119\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tSYS\tSYS\tSYS\tSYS\tPIX\t0-39,80-119\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tSYS\tSYS\tPIX\t0-39,80-119\t0\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tSYS\tSYS\tPIX\t0-39,80-119\t0\t\tN/A\nGPU4\tSYS\tSYS\tSYS\tSYS\t X \tNV18\tNV18\tNV18\tSYS\t40-79,120-159\t1\t\tN/A\nGPU5\tSYS\tSYS\tSYS\tSYS\tNV18\t X \tNV18\tNV18\tSYS\t40-79,120-159\t1\t\tN/A\nGPU6\tSYS\tSYS\tSYS\tSYS\tNV18\tNV18\t X \tNV18\tSYS\t40-79,120-159\t1\t\tN/A\nGPU7\tSYS\tSYS\tSYS\tSYS\tNV18\tNV18\tNV18\t X \tSYS\t40-79,120-159\t1\t\tN/A\nNIC0\tPIX\tPIX\tPIX\tPIX\tSYS\tSYS\tSYS\tSYS\t X \n\nLegend:\n\n  X    = Self\n  SYS  = Path traversing PCIe and the SMP interconnect\n  NV#  = Connection traversing a bonded set of # NVLinks",
+  "launcher": {
+    "type": "openmpi",
+    "version": "4.1.6"
+  }
+}
