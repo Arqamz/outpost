@@ -1,0 +1,15 @@
+{
+  "probe_version": "1",
+  "hostname": "opaque-node",
+  "scope": "host",
+  "allowed_cpus": null,
+  "online_cpus": null,
+  "cpus": [],
+  "numa": [],
+  "gpus": [],
+  "topo_matrix": null,
+  "launcher": {
+    "type": null,
+    "version": null
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": "launch-intent/v1",
+  "approval": "manual",
+  "process": {
+    "ranks_per_node": null,
+    "threads_per_rank": 1
+  },
+  "cpu": {
+    "cores_per_rank": 8,
+    "strategy": "closest_to_gpu",
+    "binding_unit": "core",
+    "smt": "physical_only",
+    "allow_overlap": false,
+    "explicit_cpu_ids": null
+  },
+  "memory": {
+    "strategy": "local"
+  },
+  "gpu": {
+    "gpus_per_rank": 1,
+    "strategy": "one_per_rank",
+    "ordering": "pci_bus",
+    "allow_sharing": false,
+    "explicit_gpu_uuids": null
+  },
+  "validation": {
+    "mode": "strict",
+    "require_preflight": true
+  }
+}

@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from . import launch_models
 from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
                       LocalHostAdapter, StaticSshAdapter, KubernetesAdapter,
                       REPO_ROOT, LOGS_DIR, append_job_log)
@@ -199,6 +200,14 @@ class Reconciler:
         # claim mixed pools with no launch path that can span them.
         if spec.hybrid and (spec.launcher != "mpi" or spec.node_count < 2):
             raise ValueError("hybrid: true requires launcher: mpi and node_count >= 2")
+        # Refuse a placement request we cannot resolve BEFORE claiming anything —
+        # same reasoning as the hybrid check above: a job shape this backend can't
+        # execute should never hold capacity while it fails. Deliberately ahead of
+        # the backend split below, because no backend can resolve a plan yet: k8s
+        # least of all, where the kubelet owns in-pod CPU and GPU assignment.
+        unsupported = launch_models.unsupported_reason(spec.launch)
+        if unsupported:
+            raise ValueError(unsupported)
         # Claim BEFORE transitioning state: if the pool can't cover this job
         # (NoCapacity), the job must stay untouched in SUBMITTED so tick()'s
         # wait-and-retry path has something to retry — not a half-provisioned
