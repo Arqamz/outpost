@@ -86,6 +86,10 @@ k8s-up:      ; infra/k8s/setup.sh
 submit-k8s:  ; bin/cluster submit --spec job.k8s.small.example.yaml
 demo-k8s-scheduling: ; demo/run-k8s-scheduling-demo.sh
 
+# --- local end-to-end smoke: dry-run scheduling (all shapes) + real host-GPU +
+#     real k8s gangs + ops commands. Resets job history each run. ---
+e2e:         ; demo/run-local-e2e.sh
+
 # --- ssh gateway (`ssh tashkil ...`): install the forced-command job portal ---
 # Needs root + a client public key: make gateway-install KEY=~/keys/laptop.pub
 # See docs/10-ssh-gateway.md. Re-run to authorize more keys (idempotent).
