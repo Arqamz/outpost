@@ -1,0 +1,21 @@
+# A minimal KAI queue for the sharing demo. Pods attach via the label
+#   kai.scheduler/queue: default-queue
+#
+# ⚠ VERIFY apiVersion against your installed KAI before applying:
+#     kubectl get crd | grep -iE 'queue'
+#   The group name has moved between KAI versions (scheduling.run.ai vs
+#   kai.scheduler). KAI may also ship a default queue already — check with
+#     kubectl get queues -A
+#   and skip this file if 'default-queue' already exists.
+apiVersion: scheduling.run.ai/v2   # <-- CONFIRM: may be kai.scheduler/v1 on newer builds
+kind: Queue
+metadata:
+  name: default-queue
+spec:
+  # A leaf queue with effectively unbounded quota — enough for a local proof.
+  # Real quota/fairness (the point of KAI) is a later concern, not this spike.
+  resources:
+    gpu:
+      quota: -1        # -1 = unlimited
+      limit: -1
+      overQuotaWeight: 1

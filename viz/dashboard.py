@@ -186,6 +186,63 @@ def collect() -> dict:
     return {"ts": now, "nodes": [_host_node(now)] + _vm_nodes(now) + _static_nodes(now)}
 
 
+_K8S_CTX = os.environ.get("CLUSTER_K8S_CONTEXT", "")
+_k8s_cache: dict = {"ts": 0.0, "data": None}
+K8S_TTL = float(os.environ.get("CLUSTER_DASH_K8S_TTL", "3"))
+
+
+def _kubectl(args: list[str]) -> subprocess.CompletedProcess:
+    base = ["kubectl"] + (["--context", _K8S_CTX] if _K8S_CTX else [])
+    return subprocess.run(base + args, capture_output=True, text=True, timeout=6)
+
+
+def _k8s_gangs() -> dict:
+    """Live KAI + HAMi gangs for the k8s backend — the dashboard counterpart of
+    `kubectl get podgroups,pods -A -l outpost-job`. Per outpost-<job> namespace:
+    the gang's PodGroup minMember + each rank pod's phase and HAMi VRAM cap. Only
+    meaningful when the k8s backend is in use; degrades to {enabled:false} when
+    kubectl can't reach a cluster, so it never blocks or errors the rest of the
+    dashboard. Cached briefly (kubectl is ~0.3s vs the 2s poll)."""
+    now = time.time()
+    if _k8s_cache["data"] is not None and now - _k8s_cache["ts"] < K8S_TTL:
+        return _k8s_cache["data"]
+    result: dict = {"enabled": False, "gangs": []}
+    try:
+        r = _kubectl(["get", "pods", "-A", "-l", "outpost-job", "-o",
+                      'jsonpath={range .items[*]}{.metadata.namespace},'
+                      '{.metadata.labels.outpost-job},{.metadata.name},'
+                      '{.status.phase},{.metadata.annotations.gpu-memory}{"\\n"}{end}'])
+        if r.returncode != 0:
+            _k8s_cache.update(ts=now, data=result)
+            return result
+        result["enabled"] = True
+        gangs: dict[str, dict] = {}
+        for line in r.stdout.splitlines():
+            parts = line.split(",")
+            if len(parts) < 5:
+                continue
+            ns, job, pod, phase, mem = parts[:5]
+            g = gangs.setdefault(ns, {"namespace": ns, "job": job, "pods": []})
+            g["pods"].append({"name": pod, "phase": phase or "Pending", "gpu_memory_mb": mem})
+        pg = _kubectl(["get", "podgroups", "-A", "-o",
+                       'jsonpath={range .items[*]}{.metadata.namespace},'
+                       '{.metadata.name},{.spec.minMember}{"\\n"}{end}'])
+        if pg.returncode == 0:
+            for line in pg.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) < 3 or parts[0] not in gangs:
+                    continue
+                gangs[parts[0]]["podgroup"] = parts[1]
+                gangs[parts[0]]["min_member"] = parts[2]
+        for g in gangs.values():
+            g["pods"].sort(key=lambda p: p["name"])
+        result["gangs"] = sorted(gangs.values(), key=lambda x: x["namespace"])
+    except Exception:
+        pass  # kubectl absent / cluster down / timeout -> enabled:false, silently
+    _k8s_cache.update(ts=now, data=result)
+    return result
+
+
 def _jobs() -> list[dict]:
     """The job queue, straight from the same store `cluster list/status`
     reads — the dashboard has no state of its own, so it can never drift from
@@ -248,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(collect())
         elif path.startswith("/api/jobs"):
             self._json(_jobs())
+        elif path.startswith("/api/k8s"):
+            self._json(_k8s_gangs())
         elif path.startswith("/api/logs"):
             job_id = (parse_qs(urlparse(self.path).query).get("job") or [""])[0]
             # job_id lands in a filesystem path (job_log_path) and this server

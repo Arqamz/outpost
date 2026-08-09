@@ -1,0 +1,45 @@
+# THE PROOF: 4 pods each requesting a 2 GiB slice of the SAME single physical
+# GPU, scheduled by KAI with HAMi-core memory isolation. This is "multi-GPU on
+# one GPU" — 4 independent GPU workloads co-resident on the one RTX 5060 Ti.
+#
+# How the sharing works (verified 2026-07-29 on NixOS+KinD):
+#   - schedulerName: kai-scheduler  -> KAI places the pod (not default-scheduler)
+#   - annotation gpu-memory: "2048" -> KAI fractional-GPU request in MiB; KAI's
+#       binder sets NVIDIA_VISIBLE_DEVICES so the nvidia runtime (CDI mode)
+#       injects the physical GPU, and the kai-resource-isolator webhook injects
+#       CUDA_DEVICE_MEMORY_LIMIT + HAMi-core (libvgpu.so) to HARD-cap VRAM.
+#   - label kai.scheduler/queue: default-queue -> the queue KAI ships by default
+#       (no Queue CR needed; default-queue/default-parent-queue already exist).
+#   - pods do NOT request `nvidia.com/gpu` in resources — that would consume the
+#       whole card. The annotation is how you ask for a fraction.
+#
+#   kubectl apply -f gpu-share-gang.yaml
+#   kubectl get pods -l app=gpu-share -o wide   # all 4 Running on the one node/GPU
+#   kubectl logs gpu-share-0                      # nvidia-smi + the injected cap
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-share
+spec:
+  replicas: 4
+  selector:
+    matchLabels: {app: gpu-share}
+  template:
+    metadata:
+      labels:
+        app: gpu-share
+        kai.scheduler/queue: default-queue
+      annotations:
+        gpu-memory: "2048"            # MiB per replica, hard-capped by HAMi-core
+    spec:
+      schedulerName: kai-scheduler
+      containers:
+        - name: probe
+          image: ubuntu:24.04          # nvidia-smi is injected by the runtime
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "-c"]
+          args:
+            - |
+              echo "rank=$HOSTNAME  CUDA_DEVICE_MEMORY_LIMIT=$CUDA_DEVICE_MEMORY_LIMIT"
+              nvidia-smi -L
+              sleep 600

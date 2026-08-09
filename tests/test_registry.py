@@ -83,10 +83,14 @@ class TestCompetingMultiNodeClaims:
         barrier = threading.Barrier(2, timeout=5)
         acquire = store.claim_node
 
-        def claim_then_wait(job_id, require_gpu=False):
+        def claim_then_wait(job_id, **kw):
+            # **kw, not a fixed signature: the registry passes backend/context
+            # selectors through to the store, and a stub that pinned them would
+            # start raising TypeError the moment one is added — leaving this
+            # xfail passing because both threads died, not because they starved.
             # Hold at the barrier after the FIRST node so both jobs are holding one
             # before either asks for its second — the interleaving that starves.
-            node = acquire(job_id, require_gpu=require_gpu)
+            node = acquire(job_id, **kw)
             if node is not None and not getattr(threading.current_thread(), "paused", False):
                 threading.current_thread().paused = True
                 barrier.wait()

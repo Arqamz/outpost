@@ -1,0 +1,23 @@
+# A small (2-rank) k8s-backend job — the quickest end-to-end check that the
+# KubernetesAdapter reaches `promoted` with real per-rank logs in the drop-zone,
+# and the unit the concurrency demo submits several of at once.
+#
+# node_count here is the GANG SIZE: 2 pods co-scheduled by KAI onto the ONE
+# physical GPU, each HAMi-capped to gpu_memory_mb. The ubuntu image carries no
+# CUDA — nvidia-smi is injected by the nvidia runtime, and the HAMi cap shows up
+# as CUDA_DEVICE_MEMORY_LIMIT in each rank's log.
+#
+# Prereqs: `make k8s-up` (cluster + KAI + HAMi) and CLUSTER_K8S_BACKEND=1 seed.
+# Submit with: bin/cluster submit --spec job.k8s.small.example.yaml
+
+name: k8s-gpu-share-small
+backend: k8s
+image: "ubuntu:24.04"
+command: ["bash", "-c", "echo rank=$RANK/$WORLD_SIZE cap=$CUDA_DEVICE_MEMORY_LIMIT; nvidia-smi -L"]
+node_count: 2
+gpu: true
+output_dir: "/out"
+
+params:
+  gpu_memory_mb: 2048     # HAMi hard VRAM cap per rank (pod annotation gpu-memory)
+  queue: default-queue    # KAI queue

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# tashkil — CLIENT-side wrapper around `ssh tashkil ...`.
+#
+# Runs on YOUR machine (laptop/PC), not the cluster. It's pure sugar over the
+# ssh gateway: it wires stdin for `submit` and untars `fetch` for you, so the
+# open interface (JobSpec in, artifacts out) feels local. Everything it does you
+# can also do with raw ssh — see the fallthrough at the bottom.
+#
+# Setup: put this on your PATH and add a `Host tashkil` block to ~/.ssh/config
+# (see infra/gateway/README.md). Override the alias with TASHKIL_HOST=other-host.
+#
+# Usage:
+#   tashkil submit job.yaml     # ssh tashkil submit < job.yaml   -> prints job-id
+#   tashkil submit < job.yaml   # (spec on stdin works too)
+#   tashkil status  <job-id>
+#   tashkil result  <job-id>
+#   tashkil fetch   <job-id> [dir]   # untars artifacts into dir (default: .)
+#   tashkil logs    <job-id> [--tail N]
+#   tashkil list | nodes | reconciler-log | help
+#   tashkil run job.yaml [dir]  # submit, wait for terminal state, then fetch
+set -euo pipefail
+
+HOST="${TASHKIL_HOST:-tashkil}"
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  submit)
+    # `tashkil submit job.yaml` pipes the file; `tashkil submit` reads stdin.
+    if [[ $# -ge 1 && -f "$1" ]]; then
+      ssh "$HOST" submit < "$1"
+    else
+      ssh "$HOST" submit
+    fi ;;
+
+  fetch)
+    id="${1:?usage: tashkil fetch <job-id> [dir]}"
+    dir="${2:-.}"
+    mkdir -p "$dir"
+    # Stream the server-side tar straight into `tar x` — artifacts land in
+    # <dir>/<job-id>/.
+    ssh "$HOST" fetch "$id" | tar -x -C "$dir" -v
+    echo "artifacts -> ${dir%/}/${id}/" >&2 ;;
+
+  run)
+    # Convenience: submit, poll status to a terminal state, then fetch.
+    spec="${1:?usage: tashkil run <job.yaml> [dir]}"
+    dir="${2:-.}"
+    id="$(ssh "$HOST" submit < "$spec")"
+    echo "submitted ${id}; waiting for it to finish..." >&2
+    while true; do
+      state="$(ssh "$HOST" status "$id" | awk '/^state/ {print $3; exit}')"
+      echo "  [$id] ${state}" >&2
+      case "$state" in
+        promoted)                  break ;;
+        failed|rejected|cancelled) echo "job ended: ${state}" >&2; exit 1 ;;
+      esac
+      sleep 5
+    done
+    "$0" fetch "$id" "$dir" ;;
+
+  help|-h|--help)
+    ssh "$HOST" help ;;
+
+  *)
+    # Anything else -> pass straight through (status/result/list/nodes/logs/…).
+    ssh "$HOST" "$cmd" "$@" ;;
+esac

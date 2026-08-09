@@ -1,0 +1,23 @@
+name: k8s-osu-pt2pt
+backend: k8s
+image: "nvcr.io/nvidia/hpc-benchmarks:26.02"
+# Single KAI-scheduled, HAMi-capped pod running a 2-rank MPI pt2pt gang
+# INSIDE the pod (mpirun -np 2). Direct k8s analog of the bare-metal intranode
+# OSU of the board §6.2 — same osu_latency/osu_bw, same shared-memory transport,
+# now placed through the scheduler with a hard VRAM cap. node_count=1 so it is
+# one pod; the two ranks are mpirun's, not a cross-pod gang.
+command:
+  - bash
+  - -lc
+  - |
+    OSU=/workspace/microbenchmarks/osu_mpi_tests/mpi/pt2pt
+    echo "=== OSU LATENCY (np2, in-pod) ==="
+    mpirun --allow-run-as-root --oversubscribe -np 2 $OSU/osu_latency
+    echo "=== OSU BW (np2, in-pod) ==="
+    mpirun --allow-run-as-root --oversubscribe -np 2 $OSU/osu_bw
+node_count: 1
+gpu: true
+output_dir: /out
+params:
+  gpu_memory_mb: 4000
+  queue: default-queue

@@ -1,0 +1,30 @@
+# Static SSH GPU-worker manifest — join a pre-provisioned GPU box (e.g. your
+# NixOS PC with the RTX 5060 Ti) as a worker the cluster runs `apptainer --nv`
+# jobs on over ssh:  cluster add-node --spec node.pc-gpu.example.yaml
+#
+# The cluster does NOT provision/destroy this node — it only runs containers on
+# it (StaticSshAdapter). A `gpu: true` job (launcher: single) can land here. For
+# HAMi GPU-slicing on this same box, use the k8s backend instead (register its
+# kube-context in CLUSTER_K8S_CLUSTERS) — this manifest is the BARE apptainer
+# --nv fabric, one container gets the whole GPU.
+#
+# Prereqs on the PC before it passes bootstrap:
+#   - reachable over ssh from THIS control plane (LAN IP or Tailscale address)
+#   - the control plane's ssh key authorized for ssh_user below
+#   - apptainer ON THE ssh USER'S NON-LOGIN PATH. Bootstrap runs
+#     `ssh <pc> command -v apptainer`; on NixOS the dev-shell apptainer is NOT
+#     on that PATH. Fix (pick one): add apptainer to environment.systemPackages
+#     (nixos-rebuild), or to the user's home-manager/profile, so a plain
+#     `ssh <pc> apptainer --version` works.
+
+name: pc-gpu                       # unique node name in the registry
+ip: 100.x.y.z                      # PC's LAN IP or Tailscale address (ssh-reachable from the VM)
+ssh_user: arqam                    # login user on the PC ("" -> cluster default)
+ssh_key: ~/.ssh/outpost-cluster-ssh   # PRIVATE key on the control plane; "" -> cluster default
+gpu: true                          # GPU worker -> claims gpu:true jobs
+runtime: apptainer
+# NixOS keeps the NVIDIA driver libs outside the standard ldconfig path, so
+# `apptainer --nv` needs them bound in — these are the PC's OWN paths (they exist
+# on the PC, not on the control plane). On an Ubuntu GPU worker, DELETE this line
+# (leave it empty): --nv self-detects and a missing bind source is a hard error.
+gpu_binds: "/nix/store,/run/opengl-driver"

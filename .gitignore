@@ -4,9 +4,14 @@
 # Local notes/runbooks
 notes/
 
-# Live static-node manifest — holds a real instance IP that changes per launch.
-# node.ec2.example.yaml is the committed template; node.ec2.yaml is per-machine.
+# Live static-node manifests — hold a real instance IP that changes per launch.
+# The *.example.yaml files are the committed templates; these are per-machine.
 node.ec2.yaml
+node.l20.yaml
+
+# Scratch: one-off debug scripts, personal test job specs, and benchmark
+# output logs — never something another machine/clone should rely on.
+scratchpad/
 
 # Built apptainer images
 demo/*.sif

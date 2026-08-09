@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# tashkil-gw — the `ssh tashkil ...` front door.
+#
+# This is the FORCED COMMAND pinned in the gateway user's authorized_keys
+# (command="…/tashkil-gw"). sshd runs it for every connection on that key and
+# hands us the client's requested command in $SSH_ORIGINAL_COMMAND — the key
+# holder can NEVER get an interactive shell or run anything but the whitelist
+# below. It is a thin, safe transport for Outpost's open interface (JobSpec in
+# over stdin, artifacts out over stdout) onto the existing `cluster` CLI; the
+# reconciler daemon already running on the control plane does the actual work.
+#
+# Exposed surface (job portal — read + submit + fetch, no infra mutation):
+#   submit                 read a JobSpec YAML from stdin, print the job-id
+#   fetch <id>             stream a tar of the job's artifacts to stdout
+#   status <id> | result <id> | logs <id> [--tail N]
+#   list | nodes | reconciler-log [--tail N]
+# Everything else (reconcile, seed-nodes, add-node, remove-node, fail-node,
+# clear-jobs) is DENIED here and stays operator-only on the control plane.
+#
+# Safety: we never eval $SSH_ORIGINAL_COMMAND through a shell. We word-split it
+# once, hard-match the subcommand against the whitelist, validate the few
+# free-form args (job-ids, --tail N) against a strict charset, and invoke
+# `cluster` via execve with a FIXED argv shape per command. A client string
+# like `submit; rm -rf ~` reaches us only as inert words, never as shell.
+set -euo pipefail
+
+# CLUSTER_ROOT = this repo checkout (…/infra/gateway/tashkil-gw -> repo root).
+CLUSTER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Bring the same env the operator uses (PATH incl. bin/cluster, PYTHONPATH,
+# CLUSTER_DROPZONE, store path). env.sh prints a readiness line — force it to
+# stderr so it can NEVER corrupt a `fetch` tar on stdout.
+{ source "${CLUSTER_ROOT}/env.sh"; } >&2
+
+usage() {
+  cat >&2 <<'EOF'
+tashkil — Outpost job portal over ssh. Usage:
+
+  ssh tashkil submit < job.yaml        submit a JobSpec (stdin) -> prints job-id
+  ssh tashkil list                     jobs + states
+  ssh tashkil status <job-id>          one job + its audit trail
+  ssh tashkil result <job-id>          server-side drop path for the artifacts
+  ssh tashkil fetch  <job-id> | tar x  stream the artifacts here and untar
+  ssh tashkil logs   <job-id> [--tail N]   full replay transcript
+  ssh tashkil reconciler-log [--tail N]    cross-job timeline
+  ssh tashkil nodes                    the node pool + capabilities
+
+Submit, wait for `status` to read `promoted`, then `fetch`. Admin commands are
+not available over ssh.
+EOF
+}
+
+# Reject anything outside a safe id/flag charset (no shell metachars, spaces,
+# slashes) — belt-and-braces on top of the fixed-argv execve below.
+valid() { [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]; }
+die()   { echo "tashkil: $*" >&2; exit 2; }
+
+# --- optional trailing `--tail N`, shared by logs / reconciler-log ----------
+# Fills TAIL_ARGS with `--tail N` (validated) or leaves it empty. Runs in the
+# MAIN shell (not a $(…) subshell) so `die` actually exits the gateway on a
+# malformed value instead of being swallowed by the substitution.
+TAIL_ARGS=()
+set_tail() {
+  TAIL_ARGS=()
+  local flag="${1:-}" val="${2:-}"
+  [[ -z "$flag" ]] && return 0
+  [[ "$flag" == "--tail" ]] || die "unexpected argument: $flag"
+  [[ "$val" =~ ^[0-9]+$ ]] || die "--tail wants a number, got: ${val:-<missing>}"
+  TAIL_ARGS=(--tail "$val")
+}
+
+# Word-split the client's request without glob/pathname expansion (safe: no
+# eval, args are inert). Empty command (bare `ssh tashkil`) -> usage.
+set -f
+read -r -a REQ <<< "${SSH_ORIGINAL_COMMAND:-}"
+set +f
+sub="${REQ[0]:-}"
+
+case "$sub" in
+  ""|help|-h|--help)
+    usage ;;
+
+  submit)
+    # Spec arrives on stdin; we hardcode `--spec -` so the client can't point
+    # submit at an arbitrary server-side file.
+    exec cluster submit --spec - ;;
+
+  fetch|status|result)
+    id="${REQ[1]:-}"
+    [[ -n "$id" ]] || die "$sub needs a <job-id>"
+    valid "$id"    || die "bad job-id: $id"
+    exec cluster "$sub" "$id" ;;
+
+  logs)
+    id="${REQ[1]:-}"
+    [[ -n "$id" ]] || die "logs needs a <job-id>"
+    valid "$id"    || die "bad job-id: $id"
+    set_tail "${REQ[2]:-}" "${REQ[3]:-}"
+    exec cluster logs "$id" "${TAIL_ARGS[@]}" ;;
+
+  reconciler-log)
+    set_tail "${REQ[1]:-}" "${REQ[2]:-}"
+    exec cluster reconciler-log "${TAIL_ARGS[@]}" ;;
+
+  list|nodes)
+    exec cluster "$sub" ;;
+
+  *)
+    die "command not allowed over ssh: '$sub' (try: ssh tashkil help)" ;;
+esac

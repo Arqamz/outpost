@@ -1,0 +1,10 @@
+name: k8s-stream-bench
+backend: k8s
+image: "nvcr.io/nvidia/hpc-benchmarks:26.02"
+command: ["/workspace/stream-gpu-test.sh", "--n", "160000000"]
+node_count: 1
+gpu: true
+output_dir: /out
+params:
+  gpu_memory_mb: 14000
+  queue: default-queue

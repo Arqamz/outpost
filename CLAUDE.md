@@ -14,8 +14,11 @@ anything can drive it: a script, a CI job, a bigger scheduler built later, or
 just the `cluster` CLI in this repo (a local test client of that same
 interface, nothing more).
 
-Apptainer on VMs/host is the only execution backend today. KinD, Slinky/Slurm,
-and multi-node distribution are planned for later.
+Apptainer on VMs/host is the primary execution backend. A second, optional
+backend exists: `backend: k8s` routes a job onto a **KAI + HAMi Kubernetes
+cluster** (KinD) — same JobSpec in, same drop-zone out, but the job is scheduled
+by KAI as a gang of N pods sharing the one GPU (HAMi-capped per rank). Off by
+default; see `docs/08-kubernetes-backend.md`. Slinky/Slurm is still planned.
 
 Runs on any Linux host with libvirt/KVM (`/dev/kvm`, nested/hardware
 virtualization enabled) and, optionally, an NVIDIA GPU + driver for GPU jobs
@@ -55,25 +58,32 @@ flake.nix, shell.nix        pinned dev shell (qemu, virsh, ansible, apptainer, p
 Makefile                    convenience targets (see below)
 infra/libvirt/              make VMs: config.env (SoT), lib.sh (incl. wait_ssh), net/vm/cluster scripts
 infra/ansible/              configure nodes: bootstrap role (apptainer|docker|mpi|ssh-fabric…)
+infra/gateway/              `ssh tashkil` front door: tashkil-gw (forced command), install.sh
 reconciler/                 the control plane (Python package)
   states.py                 job/node state machines (transition tables)
   models.py                 JobSpec (incl. launcher), JobRecord, NodeRecord, RunResult
   store.py                  FileStore (default, fcntl shared/exclusive locked) | MongoStore
   registry.py               NodeRegistry: claim/release/quarantine (exclusive locks)
-  adapter.py                ProviderAdapter ABC + Libvirt/LocalHost/StaticSsh/Null;
+  adapter.py                ProviderAdapter ABC + Libvirt/LocalHost/StaticSsh/Kubernetes/Null;
                              container_argv(), mpirun_argv(), run_logged()/append_job_log()
                              (replay logs); per-node ssh identity (node_ssh_id)
   reconciler.py             the driver: submit, concurrent tick, phases, wait/timeout, failure
   cli.py                    cluster commands (incl. logs / reconciler-log)
 demo/                       mpi_demo.c/.def/.sif, run-mpi-demo.sh (bare), run-scheduling-demo.sh
-viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer
-docs/                       01-architecture … 07-ubuntu-setup (native Ubuntu, no nix)
+viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer + k8s gangs panel
+docs/                       01-architecture … 07-ubuntu-setup, 08-kubernetes-backend,
+                            09-multi-machine-cluster (one control plane, many fabrics)
 bin/cluster             CLI launcher (python -m reconciler)
+bin/tashkil                 CLIENT-side wrapper over `ssh tashkil …` (submit/fetch/run sugar)
 job.example.yaml            sample generic JobSpec (dry-run)
 job.mpi.example.yaml        multi-node MPI JobSpec (node_count: 4)
 job.mpi.small.example.yaml  multi-node MPI JobSpec (node_count: 2, for contention demos)
 job.gpu.example.yaml        GPU JobSpec (nvidia-smi via apptainer --nv)
 job.hybrid.example.yaml     hybrid JobSpec (host GPU node + VM in ONE mpirun)
+job.k8s.example.yaml        k8s-backend JobSpec (gang of N pods on one GPU, KAI+HAMi)
+job.k8s.small.example.yaml  k8s-backend JobSpec (node_count: 2, for quick/concurrency tests)
+node.ec2.example.yaml       static-ssh CPU worker manifest (cluster add-node)
+node.pc-gpu.example.yaml    static-ssh GPU worker manifest (remote apptainer --nv + gpu_binds)
 env.sh                      source on a non-nix host (Ubuntu) in place of the dev shell
 ```
 
@@ -87,7 +97,8 @@ make net-up | template | cluster-up | status | bootstrap | cluster-down | net-do
 make fail N=3                    # inject a node failure
 
 # live dashboard (per-VM CPU/RAM + host GPU + job queue + per-job/cross-job
-# replay logs, one page) — open http://localhost:8087
+# replay logs + live k8s gangs/pods when the k8s backend is in use, one page)
+# — open http://localhost:8087
 make dashboard
 
 # control plane (job-driven; dry-run unless --execute)
@@ -97,6 +108,8 @@ cluster submit --spec j.yaml # -> job-id  (job.example.yaml | job.mpi.example.ya
                                   #             job.mpi.small.example.yaml | job.gpu.example.yaml)
 cluster reconcile [--once] [--execute] [--interval N]
 cluster list | status <id> | result <id>
+cluster fetch <id>            # stream a tar of the drop-zone artifacts to stdout (egress
+                                  #   over the wire; `--spec -` on submit reads a JobSpec from stdin)
 cluster logs <id> [--tail N]  # full per-job replay transcript (every command + output)
 cluster reconciler-log        # cross-job chronological narration, all jobs interleaved
 cluster fail-node <name> [--inject] [--reason ...]
@@ -109,6 +122,19 @@ make mpi-sif                     # build demo/mpi_demo.sif (needed once for MPI 
 make submit-mpi                  # submit job.mpi.example.yaml
 make submit-hybrid               # submit job.hybrid.example.yaml (host GPU + VM, one mpirun)
 make demo-scheduling             # submit 4 jobs (2x pool-filling MPI, 1 waiting, 1 GPU), tick live
+
+# k8s (KAI + HAMi) backend — off unless CLUSTER_K8S_BACKEND=1 (docs/08)
+make k8s-up                      # stand up KinD + KAI + HAMi (infra/k8s/setup.sh)
+CLUSTER_K8S_BACKEND=1 make seed-nodes   # also seed k8s-slot-0..N-1
+make submit-k8s                  # submit job.k8s.small.example.yaml (gang of 2 on one GPU)
+make demo-k8s-scheduling         # several concurrent k8s gangs, KAI arbitrating live
+
+# ssh gateway — `ssh tashkil …` job portal (forced command, no shell; docs/10)
+make gateway-install KEY=~/k.pub    # (root) dedicated tashkil user + forced key + shared group
+ssh tashkil submit < job.yaml       # JobSpec in over stdin -> job-id (reconciler daemon runs it)
+ssh tashkil status <id>             # poll until: promoted
+ssh tashkil fetch  <id> | tar x     # artifacts out over a stdout tar -> land locally
+tashkil run job.yaml [dir]          # client wrapper: submit + wait + fetch in one (bin/tashkil)
 ```
 
 ## Job flow (state machine)
@@ -151,6 +177,24 @@ apptainer install + full walkthrough live in `infra/aws/`. Spot reclamation surf
 failure→quarantine path. Keep static nodes `launcher: single` (multi-node
 `mpirun` across a WAN is latency-bound and trips the hybrid fabric pinning).
 
+`k8s` → `KubernetesAdapter` — the whole KAI+HAMi cluster as a backend. Unlike
+the others a k8s registry node is a **slot** (`k8s-slot-N`, provider `k8s`), not
+a machine: `cluster seed-nodes` seeds `CLUSTER_K8S_SLOTS` of them when
+`CLUSTER_K8S_BACKEND=1`. A `backend: k8s` job (routed by `JobSpec.backend`, not
+`node.provider` — the claim picks the slot pool) claims **one** slot and its
+`node_count` becomes the **gang size**: `run()` renders a Namespace + explicit
+PodGroup (`minMember=N`) + a headless Service + N pods (annotation
+`pod-group-name` binds them to the gang, `gpu-memory` is the HAMi per-rank VRAM
+cap, `schedulerName: kai-scheduler`), applies them, polls to completion, and
+`collect()` ships each rank's log. Ranks get distributed-rendezvous env
+(`RANK`/`WORLD_SIZE`/`MASTER_ADDR`=rank-0's DNS name via the headless Service/
+`MASTER_PORT`, + `NCCL_P2P_DISABLE=1` default) so a real torchrun/NCCL/MPI-over-
+TCP job forms a communicator, not N solo pods; a job's own `env` overrides. It
+installs nothing (provision/bootstrap only verify the cluster+KAI+HAMi+queue+
+RuntimeClass exist; `setup.sh` owns the install). Slots are a **concurrency
+bound**, not physical GPUs — KAI queues gangs beyond what fits. See
+`docs/08-kubernetes-backend.md`.
+
 `JobSpec.launcher` selects the run path: `"single"` (default) runs the
 container on one node; `"mpi"` (with `node_count > 1`) builds a per-job
 hostfile from exactly the nodes this job claimed, stages the image to each,
@@ -190,7 +234,10 @@ one job never blocks any other job's progress.
 ## Scheduling
 
 `gpu: true` jobs claim GPU nodes (only `cluster-host`); `gpu: false` jobs claim VMs;
-`hybrid: true` claims 1 GPU node + (node_count-1) VMs (GPU-first, all-or-nothing).
+`hybrid: true` claims 1 GPU node + (node_count-1) VMs (GPU-first, all-or-nothing);
+`backend: k8s` claims **one k8s slot** (by provider, ignoring gpu/node_count —
+node_count is the in-cluster gang size) and the two pools never cross (a normal
+claim explicitly excludes provider `k8s`, `store.claim_node`).
 Claims are atomic (fcntl / `find_one_and_update`) = exclusive locks. A job that
 can't get enough capacity right now **waits and retries every tick** (it is
 NOT failed immediately) until either it succeeds or `CLUSTER_CAPACITY_WAIT_TIMEOUT`
@@ -201,13 +248,20 @@ always time out this way — there is one GPU node.
 ## The open interface (contract with whatever drives it)
 
 - **Intake:** a `JobSpec` doc in `jobs` — `name, image, command, runtime,
-  launcher, node_count, gpu, hybrid, env, output_dir, params`. `image=""` → dry-run.
+  launcher, backend, node_count, gpu, hybrid, env, output_dir, params`.
+  `image=""` → dry-run; `backend: "k8s"` → the KAI+HAMi cluster (node_count =
+  gang size); default `backend: ""` → the VM/host pool.
   `launcher: "mpi"` + `node_count > 1` → real multi-node `mpirun`;
   `hybrid: true` → the mpirun spans the host GPU node + VMs.
 - **Egress:** artifacts land in `${CLUSTER_DROPZONE}/<job_id>/` — `stdout.log`
   (the container's captured stdout+stderr, guaranteed for every adapter/launch
   path) plus whatever the job wrote to `output_dir`; `jobs.drop_path`/`run`
   record where + exit code.
+- **Wire transport (same contract over ssh):** `ssh tashkil` is a forced-command
+  front door that carries this exact interface — `submit` reads the JobSpec from
+  stdin (`cluster submit --spec -`), `fetch` streams the drop-zone dir back as a
+  tar on stdout (`cluster fetch <id>`). No new interface, just intake/egress over
+  a pipe. Job-portal only (no admin commands). See `docs/10-ssh-gateway.md`.
 - **Status:** `jobs` (state), `audit` (every transition), `nodes`
   (pool). Everything else is private implementation. See
   `docs/06-interface-contract.md`.
@@ -223,7 +277,10 @@ always time out this way — there is one GPU node.
   (wait-and-retry + timeout), exclusive locks, concurrent tick, failure→
   quarantine, `run` (single-node AND multi-node MPI, host GPU or VMs), `collect`
   (drop-zone, `stdout.log` guaranteed on every path), audit, replay logging,
-  live dashboard (node stats + job queue + log viewer).
+  live dashboard (node stats + job queue + log viewer). k8s backend
+  (`KubernetesAdapter`): real Namespace + explicit PodGroup gang + N pods via
+  KAI, HAMi per-rank VRAM cap, per-rank logs to the drop-zone — live-verified on
+  the NixOS+KinD `outpost` cluster (concurrent gangs on one GPU).
 - Stub: `validate` gates + the sampler (`nvidia-smi` bracketing) — promote is
   currently unconditional. Wire in when parsers/gates arrive (deliberately left
   as-is for now).

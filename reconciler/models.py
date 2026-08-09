@@ -36,6 +36,11 @@ class JobSpec:
     command: list[str] = field(default_factory=list)   # argv inside the container
     runtime: str = "apptainer"         # apptainer | docker (how to launch `image`)
     launcher: str = "single"           # single | mpi (mpi -> mpirun, one rank per claimed node)
+    # which execution backend runs this job. "" (default) = the VM/host/static
+    # pool routed by gpu/hybrid below; "k8s" = the KubernetesAdapter (KAI + HAMi),
+    # where the job claims ONE k8s slot and node_count is reinterpreted as the
+    # gang size (N pods on the shared GPU). See docs/08-kubernetes-backend.md.
+    backend: str = ""
     # scheduling constraints
     node_count: int = 1
     gpu: bool = False                  # true -> must land on a GPU-capable node (the host)
@@ -73,6 +78,7 @@ class JobSpec:
             command=list(cmd),
             runtime=d.get("runtime", "apptainer"),
             launcher=d.get("launcher", "single") or "single",
+            backend=d.get("backend", "") or "",
             node_count=int(d.get("node_count", 1)),
             gpu=bool(d.get("gpu", False)),
             hybrid=bool(d.get("hybrid", False)),
@@ -144,6 +150,18 @@ class NodeRecord:
     # "" -> fall back to the cluster-wide CLUSTER_SSH_USER / CLUSTER_SSH_PRIVKEY.
     ssh_user: str = ""
     ssh_key: str = ""
+    # per-node GPU driver binds for `apptainer --nv` (comma-sep --bind paths),
+    # overriding the control plane's global CLUSTER_GPU_BINDS. The point is a
+    # REMOTE gpu worker whose driver libs live somewhere non-standard: a NixOS
+    # box reached over ssh needs "/nix/store,/run/opengl-driver" (its own paths,
+    # which exist on that node), while an Ubuntu worker wants "" (--nv self-
+    # detects). Only consulted for gpu runs; empty = plain --nv.
+    gpu_binds: str = ""
+    # for a k8s-backend slot: which kube-context (i.e. which cluster) it targets,
+    # so several k8s clusters (e.g. the VM's L20 + the PC's 5060 Ti) can live
+    # under ONE control plane. "" -> the adapter's global CLUSTER_K8S_CONTEXT
+    # (current kube-context). Ignored by every non-k8s node.
+    kube_context: str = ""
     updated_at: str | None = None
 
     @property
@@ -159,7 +177,7 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "updated_at"}
+                "gpu_binds", "kube_context", "updated_at"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 

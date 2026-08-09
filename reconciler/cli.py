@@ -2,11 +2,14 @@
 
 Talks to the store (file by default, Mongo via CLUSTER_MONGO_URI); it does NOT run on
 the nodes. Commands:
-    submit --spec job.yaml     write a JobSpec into jobs
+    submit --spec job.yaml     write a JobSpec into jobs (--spec - reads YAML from stdin,
+                               so `ssh tashkil submit < job.yaml` works)
     reconcile [--once] [--execute]   drive the state machine
     list                       jobs + states
     status <job_id>            one job + its audit trail
     result <job_id>            print where the job's artifacts landed (egress)
+    fetch <job_id>             stream a tar of the job's drop-zone artifacts to stdout
+                               (egress over the wire: `ssh tashkil fetch <id> | tar x`)
     logs <job_id> [--tail N]   full replay transcript for one job (every command + output)
     nodes                      the NodeRegistry (with gpu/local capabilities)
     seed-nodes                 populate nodes from config (VMs + host GPU node)
@@ -67,12 +70,84 @@ def _host_node() -> NodeRecord | None:
                       state=NodeState.AVAILABLE.value, gpu=True, local=True, runtime=runtime)
 
 
+def _k8s_slots() -> list[NodeRecord]:
+    """The k8s backend's slot pool, read from config.env (empty unless
+    CLUSTER_K8S_BACKEND=1). Each slot is an interchangeable registry node
+    (provider 'k8s', gpu, no ip/ssh — the KubernetesAdapter talks to the cluster,
+    not a machine); a `backend: k8s` job claims one and renders its own gang of
+    pods. Slot count just bounds how many gangs Outpost hands KAI concurrently.
+
+    Multi-cluster: CLUSTER_K8S_CLUSTERS lets several k8s clusters live under one
+    control plane (e.g. the VM's L20 + the PC's 5060 Ti). Format is a
+    comma-separated list of `name:kube_context:slots`, e.g.
+    `vm:kind-vm:8,pc:kind-pc:4` -> slots `k8s-vm-0..7` (context kind-vm) +
+    `k8s-pc-0..3` (context kind-pc). A `backend: k8s` job targets one via
+    params.k8s_context (matching kube_context), else lands on any free slot.
+    Unset -> a single cluster: CLUSTER_K8S_SLOTS slots named `<prefix>-<i>` with
+    kube_context = CLUSTER_K8S_CONTEXT (the current context when also empty)."""
+    # Echo each var on its own line so CLUSTER_K8S_CLUSTERS (which may embed ':'
+    # and ',') isn't whitespace-split like the space-joined form was.
+    out = subprocess.run(
+        ["bash", "-c", 'source "$0"/infra/libvirt/lib.sh; '
+         'echo "${CLUSTER_K8S_BACKEND:-0}"; echo "${CLUSTER_K8S_SLOTS:-4}"; '
+         'echo "${CLUSTER_K8S_SLOT_PREFIX:-k8s-slot}"; echo "${CLUSTER_K8S_CLUSTERS:-}"; '
+         'echo "${CLUSTER_K8S_CONTEXT:-}"', REPO_ROOT],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    backend, slots, prefix, clusters, context = (out + [""] * 5)[:5]
+    if backend.strip() != "1":
+        return []
+
+    def mk(name: str, n: int, ctx: str) -> list[NodeRecord]:
+        return [NodeRecord(node_id=f"{name}-{i}", name=f"{name}-{i}", index=-1, ip="",
+                           state=NodeState.AVAILABLE.value, gpu=True, local=False,
+                           runtime="k8s", provider="k8s", kube_context=ctx)
+                for i in range(n)]
+
+    if clusters.strip():
+        nodes: list[NodeRecord] = []
+        for entry in clusters.split(","):
+            parts = [p.strip() for p in entry.split(":")]
+            if len(parts) != 3 or not parts[0]:
+                sys.exit(f"bad CLUSTER_K8S_CLUSTERS entry {entry!r} "
+                         "(expected name:kube_context:slots)")
+            name, ctx, n = parts
+            nodes += mk(f"{prefix}-{name}", int(n), ctx)
+        return nodes
+    return mk(prefix, int(slots), context.strip())
+
+
 def cmd_submit(args):
     import yaml
-    with open(args.spec) as f:
-        spec = JobSpec.from_dict(yaml.safe_load(f))
+    # --spec - reads the JobSpec from stdin so the same intake works over a pipe
+    # (the ssh gateway: `ssh tashkil submit < job.yaml`) as from a local file.
+    if args.spec == "-":
+        spec = JobSpec.from_dict(yaml.safe_load(sys.stdin))
+    else:
+        with open(args.spec) as f:
+            spec = JobSpec.from_dict(yaml.safe_load(f))
     r = Reconciler(_store())
     print(r.submit(spec))
+
+
+def cmd_fetch(args):
+    """Egress over the wire: stream a tar of the job's drop-zone dir to stdout.
+    The remote counterpart to `result` — where `result` prints the server-side
+    path, `fetch` ships the bytes, so `ssh tashkil fetch <id> | tar x` lands
+    every artifact (stdout.log + whatever the job wrote) locally. Reads the same
+    ${CLUSTER_DROPZONE}/<id>/ that `collect` populated."""
+    from .reconciler import DROPZONE
+    job = _store().get_job(args.job_id)
+    if not job:
+        sys.exit(f"no such job: {args.job_id}")
+    src = os.path.join(DROPZONE, args.job_id)
+    if not os.path.isdir(src):
+        sys.exit(f"no artifacts for {args.job_id} yet (state {job.state}; expected {src})")
+    # Stream the tar straight to the inherited stdout fd (zero-copy over ssh),
+    # with job_id as the top-level member so `tar x` yields <job_id>/... . Fixed
+    # argv, no shell — nothing here is interpolated from an untrusted string.
+    sys.stdout.flush()
+    os.execvp("tar", ["tar", "-C", DROPZONE, "-cf", "-", args.job_id])
 
 
 def cmd_reconcile(args):
@@ -144,8 +219,13 @@ def cmd_reconciler_log(args):
 def cmd_nodes(args):
     for n in _store().list_nodes():
         caps = ("gpu" if n.gpu else "cpu") + ("/local" if n.local else "")
-        print(f"{n.name:<14} idx={n.index} {n.ip:<15} {n.state:<12} "
-              f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}")
+        extra = ""
+        if n.kube_context:
+            extra += f" ctx={n.kube_context}"
+        if n.gpu_binds:
+            extra += f" binds={n.gpu_binds}"
+        print(f"{n.name:<16} idx={n.index} {n.ip:<15} {n.state:<12} "
+              f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}{extra}")
 
 
 def cmd_add_node(args):
@@ -171,11 +251,15 @@ def cmd_add_node(args):
         runtime=d.get("runtime", "apptainer"), provider="static-ssh",
         ssh_user=d.get("ssh_user", "") or "",
         ssh_key=os.path.expanduser(key) if key else "",
+        # gpu_binds: this node's OWN `apptainer --nv` driver binds (a NixOS GPU
+        # worker needs /nix/store,/run/opengl-driver; Ubuntu leaves it empty).
+        gpu_binds=d.get("gpu_binds", "") or "",
     )
     store.put_node(node)
     print(f"added static-ssh node {node.name} at {node.ip} "
           f"({'gpu' if node.gpu else 'cpu'}, ssh {node.ssh_user or '<cluster-default>'}"
-          f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}). "
+          f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}"
+          f"{f', gpu_binds={node.gpu_binds}' if node.gpu_binds else ''}). "
           f"Bake apptainer into the image before running real jobs.")
 
 
@@ -189,6 +273,8 @@ def cmd_seed_nodes(args):
     host = _host_node()
     if host:
         nodes.append(host)
+    k8s_slots = _k8s_slots()
+    nodes.extend(k8s_slots)
     for n in nodes:
         old = existing.get(n.node_id)
         if old is None:
@@ -204,7 +290,9 @@ def cmd_seed_nodes(args):
             updated += 1
     print(f"seeded {added} node(s) into the registry ({len(existing)} already present"
           + (f", {updated} refreshed" if updated else "") + ")"
-          + (f"; host GPU node = {host.name}" if host else "; no host GPU node (CLUSTER_GPU_HOST != 1)"))
+          + (f"; host GPU node = {host.name}" if host else "; no host GPU node (CLUSTER_GPU_HOST != 1)")
+          + (f"; {len(k8s_slots)} k8s slot(s) = {k8s_slots[0].name}..{k8s_slots[-1].name}"
+             if k8s_slots else "; no k8s backend (CLUSTER_K8S_BACKEND != 1)"))
 
 
 def cmd_remove_node(args):
@@ -261,6 +349,8 @@ def main(argv=None):
     sub.add_parser("list").set_defaults(fn=cmd_list)
     s = sub.add_parser("status"); s.add_argument("job_id"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("result"); s.add_argument("job_id"); s.set_defaults(fn=cmd_result)
+    s = sub.add_parser("fetch", help="stream a tar of a job's drop-zone artifacts to stdout")
+    s.add_argument("job_id"); s.set_defaults(fn=cmd_fetch)
     s = sub.add_parser("logs"); s.add_argument("job_id")
     s.add_argument("--tail", type=int, default=0, help="show only the last N lines")
     s.set_defaults(fn=cmd_logs)

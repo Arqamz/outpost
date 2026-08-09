@@ -72,6 +72,21 @@
   .btn{background:#1c2531;border:1px solid var(--line);color:var(--txt);border-radius:6px;
        padding:4px 10px;font-size:11px;cursor:pointer}
   .btn:hover{background:#26313f}
+
+  /* k8s gangs (KAI + HAMi) */
+  .gang{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .gang.gpu-edge{border-color:#3a2f5a80;background:linear-gradient(180deg,#1a1530,var(--panel))}
+  .gang h3{font-size:13px;margin:0 0 2px;display:flex;align-items:center;gap:8px}
+  .gang .gmeta{color:var(--dim);font-size:11.5px;margin-bottom:10px}
+  .pods{display:flex;flex-wrap:wrap;gap:6px}
+  .pod{font-size:11px;padding:3px 8px;border-radius:999px;background:#0e141c;border:1px solid #1f2937;
+       display:flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
+  .pod .pdot{width:7px;height:7px;border-radius:50%}
+  .pod .cap{color:var(--dim)}
+  .ph-Running .pdot{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .ph-Succeeded .pdot{background:var(--ok)}
+  .ph-Pending .pdot{background:var(--warn)}
+  .ph-Failed .pdot{background:var(--hot)}
 </style>
 </head>
 <body>
@@ -82,6 +97,13 @@
   </header>
   <div class="summary" id="summary"></div>
   <div class="grid" id="grid"></div>
+
+  <div class="section" id="k8ssection" style="display:none">
+    <h2>Kubernetes · KAI + HAMi <span class="badge" id="gangcount">0</span>
+      <span class="sub" style="margin-left:8px">gangs sharing the one GPU (HAMi VRAM-capped per rank)</span>
+    </h2>
+    <div class="grid" id="gangs"></div>
+  </div>
 
   <div class="section">
     <h2>Jobs <span class="badge" id="jobcount">0</span>
@@ -159,6 +181,36 @@ async function tick(){
     document.getElementById("dot").classList.add("off");
     document.getElementById("status").textContent = "cluster unreachable";
   }
+}
+
+// ── k8s gangs (KAI + HAMi) ─────────────────────────────────────────────────
+function gangCard(g){
+  const done = g.pods.filter(p => p.phase==='Succeeded').length;
+  const running = g.pods.filter(p => p.phase==='Running').length;
+  const mm = g.min_member || g.pods.length;
+  const pods = g.pods.map(p => {
+    const cap = p.gpu_memory_mb ? `<span class="cap">${p.gpu_memory_mb}Mi</span>` : "";
+    return `<span class="pod ph-${p.phase}"><span class="pdot"></span>${esc(p.name)} ${cap}</span>`;
+  }).join("");
+  return `<div class="gang gpu-edge">
+    <h3>${esc(g.job||g.namespace)} <span class="badge gpu">gang ${mm}</span></h3>
+    <div class="gmeta">${g.pods.length} pod(s) · ${running} running · ${done} done`+
+    (g.podgroup?` · <span class="mono">${esc(g.podgroup)}</span>`:``)+`</div>
+    <div class="pods">${pods}</div>
+  </div>`;
+}
+
+async function renderK8s(){
+  try{
+    const r = await fetch("/api/k8s.json",{cache:"no-store"});
+    const d = await r.json();
+    const sec = document.getElementById("k8ssection");
+    if(!d.enabled){ sec.style.display = "none"; return; }
+    sec.style.display = "block";
+    document.getElementById("gangcount").textContent = d.gangs.length;
+    document.getElementById("gangs").innerHTML = d.gangs.length ? d.gangs.map(gangCard).join("") :
+      `<div class="gang" style="color:var(--dim)">no active gangs — submit a backend:k8s job</div>`;
+  }catch(e){ /* leave last render; k8s panel is best-effort */ }
 }
 
 // ── job queue + log viewer ─────────────────────────────────────────────────
@@ -254,9 +306,10 @@ document.getElementById("clearJobs").onclick = async () => {
   renderJobs();
 };
 
-tick(); renderJobs();
+tick(); renderJobs(); renderK8s();
 setInterval(tick, 2000);
 setInterval(renderJobs, 2000);
+setInterval(renderK8s, 2000);
 setInterval(() => { if(selectedJob === "__reconciler__") loadLog("__reconciler__", document.getElementById("logtitle").textContent); }, 2000);
 </script>
 </body>

@@ -1,0 +1,10 @@
+name: k8s-hpl-bench
+backend: k8s
+image: "nvcr.io/nvidia/hpc-benchmarks:26.02"
+command: ["mpirun","--allow-run-as-root","-np","1","--bind-to","none","/workspace/hpl-mxp.sh","--gpu-affinity","0","--nprow","1","--npcol","1","--nporder","row","--n","40960","--nb","1024","--test-loop","3","--use-mpi-panel-broadcast","1"]
+node_count: 1
+gpu: true
+output_dir: /out
+params:
+  gpu_memory_mb: 12000
+  queue: default-queue
