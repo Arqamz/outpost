@@ -1397,7 +1397,10 @@ class KubernetesAdapter(ProviderAdapter):
                 raise RuntimeError(f"{what} not found — run infra/k8s/setup.sh")
 
     # ── workload lifecycle ────────────────────────────────────────────────
-    def run(self, nodes, job_id, spec):
+    def run(self, nodes, job_id, spec, plan=None):
+        # `plan` never applies here: backend: k8s jobs are already refused
+        # earlier (reconciler.py _phase_provision) if they carry a launch
+        # block — the kubelet, not this cluster, owns in-pod CPU/GPU.
         slot = nodes[0]
         ctx = self._context_of(slot)
         workdir = os.path.join(RUNS_DIR, job_id)
@@ -1410,15 +1413,32 @@ class KubernetesAdapter(ProviderAdapter):
         manifest_path = os.path.join(workdir, "manifests.yaml")
         with open(manifest_path, "w") as f:
             f.write(manifest)
-        gpu_mem = spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB)
+        declared_gpu_mem = spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB)
         self.log(f"[k8s] applying gang: ns={ns} minMember={n} image={self._image_ref(spec.image)} "
-                 f"gpu-memory={gpu_mem}MiB/rank queue={spec.params.get('queue', K8S_QUEUE)}"
+                 f"gpu-memory={declared_gpu_mem}MiB/rank queue={spec.params.get('queue', K8S_QUEUE)}"
                  f"{f' context={ctx}' if ctx else ''}")
         self._kubectl(["apply", "-f", manifest_path], job_id, context=ctx)
         rc = self._await_gang(ns, n, job_id, ctx)
         stdout_path = self._capture_logs(ns, n, job_id, workdir, ctx)
+        if spec.params.get("verify_gpu_memory"):
+            self._build_gpu_memory_receipt(workdir, n, spec)
         return RunResult(job_id, slot.name, rc, workdir, stdout_path,
                          note=f"k8s gang np={n} (ns {ns}) exit={rc}")
+
+    @staticmethod
+    def _gpu_mem_for_rank(spec: JobSpec, i: int, n: int) -> str:
+        """gpu_memory_mb may be one scalar (today's default — every pod gets
+        the same value) or a list of exactly N values, one per rank. A
+        mismatched list length fails the job before anything is applied,
+        rather than silently reusing or truncating the declared policy."""
+        declared = spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB)
+        if isinstance(declared, list):
+            if len(declared) != n:
+                raise ValueError(
+                    f"gpu_memory_mb is a list of {len(declared)} value(s) but this "
+                    f"gang has {n} rank(s) — one entry per rank, or a single shared value")
+            return str(declared[i])
+        return str(declared)
 
     def _render_manifests(self, job_id: str, spec: JobSpec, n: int) -> str:
         """Render the Namespace + headless Service + PodGroup + N Pod docs for one
@@ -1430,15 +1450,28 @@ class KubernetesAdapter(ProviderAdapter):
         Service (`hostname`/`subdomain`) and the standard distributed-rendezvous
         env (RANK, WORLD_SIZE, MASTER_ADDR=rank-0's FQDN, MASTER_PORT), so a real
         multi-rank workload (torchrun / c10d / NCCL-over-TCP / MPI-over-TCP) can
-        form a communicator across the gang — not just N independent pods."""
+        form a communicator across the gang — not just N independent pods.
+
+        `spec.params.verify_gpu_memory` (opt-in, default unset): prepends
+        gpu-memory-probe.sh to each pod's command so the VRAM cap HAMi's
+        isolator actually enforced is observable from inside the container.
+        The pod spec (post-mutation) DOES reference it (`envFrom` a generated
+        ConfigMap), but the resolved value — and whether libvgpu.so actually
+        intercepted THIS process's CUDA calls with it — is only knowable from
+        inside the running container (see the probe's own docstring).
+        Requires `spec.command` to be set: there is nothing to prepend a
+        probe onto an image's own entrypoint without overriding it."""
         import yaml
         ns = self._namespace(job_id)
         image = self._image_ref(spec.image)
         pg_name = f"pg-{job_id}"
-        gpu_mem = str(spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB))
         queue = str(spec.params.get("queue", K8S_QUEUE))
         master_port = str(spec.params.get("master_port", K8S_MASTER_PORT))
         master_addr = f"rank-0.{K8S_RDZV_SERVICE}.{ns}.svc.cluster.local"
+        verify_gpu_memory = bool(spec.params.get("verify_gpu_memory"))
+        if verify_gpu_memory and not spec.command:
+            raise ValueError("verify_gpu_memory needs spec.command set — there is no "
+                             "entrypoint to prepend the probe onto otherwise")
         docs: list[dict] = [
             {"apiVersion": "v1", "kind": "Namespace",
              "metadata": {"name": ns, "labels": {"outpost-job": job_id}}},
@@ -1465,14 +1498,20 @@ class KubernetesAdapter(ProviderAdapter):
             container: dict = {"name": "rank", "image": image,
                                "imagePullPolicy": "IfNotPresent", "env": env}
             if spec.command:                            # else use the image entrypoint
-                container["command"] = list(spec.command)
+                command = list(spec.command)
+                if verify_gpu_memory:
+                    probe = GPU_MEMORY_PROBE_PATH.read_text()
+                    inner = " ".join(shlex.quote(a) for a in command)
+                    command = ["sh", "-c", f"({probe}) 2>&1; exec {inner}"]
+                container["command"] = command
             docs.append({
                 "apiVersion": "v1", "kind": "Pod",
                 "metadata": {
                     "name": f"rank-{i}", "namespace": ns,
                     "labels": {"kai.scheduler/queue": queue,
                                "outpost-job": job_id, "outpost-rank": str(i)},
-                    "annotations": {"pod-group-name": pg_name, "gpu-memory": gpu_mem},
+                    "annotations": {"pod-group-name": pg_name,
+                                   "gpu-memory": self._gpu_mem_for_rank(spec, i, n)},
                 },
                 "spec": {"schedulerName": K8S_SCHEDULER, "restartPolicy": "Never",
                          "hostname": f"rank-{i}", "subdomain": K8S_RDZV_SERVICE,
@@ -1530,6 +1569,38 @@ class KubernetesAdapter(ProviderAdapter):
                 agg.write(f"=== {pod} ===\n{out}\n")
                 append_job_log(job_id, f"{now_iso()} [k8s] {ns}/{pod} logs:\n{out}")
         return combined
+
+    def _build_gpu_memory_receipt(self, workdir: str, n: int, spec: JobSpec) -> None:
+        """Compare the declared per-rank gpu-memory policy against what
+        gpu-memory-probe.sh actually observed inside each pod (already local —
+        _capture_logs wrote rank-<i>.log before this runs; no extra kubectl
+        round trip needed). Writes gpu-memory-receipt.yaml into workdir, which
+        collect() already ships wholesale. A rank with no parseable probe line
+        is recorded as unmatched, never silently skipped — same rule as
+        receipt.py's build_receipt for the CPU/rankfile path."""
+        import yaml
+        ranks = []
+        for i in range(n):
+            declared_mb = int(self._gpu_mem_for_rank(spec, i, n))
+            observed = None
+            log_path = os.path.join(workdir, f"rank-{i}.log")
+            if os.path.isfile(log_path):
+                for line in open(log_path):
+                    if line.startswith(_GPU_MEMORY_MARKER):
+                        try:
+                            observed = json.loads(line[len(_GPU_MEMORY_MARKER):].strip())
+                        except json.JSONDecodeError:
+                            observed = None
+                        break
+            observed_mb = observed.get("cuda_device_memory_limit_mb") if observed else None
+            ranks.append({
+                "rank": i, "declared_mb": declared_mb,
+                "observed_mb": observed_mb,
+                "observed_gpu_uuid": observed.get("gpu_uuid") if observed else None,
+                "matched": observed_mb == declared_mb,
+            })
+        with open(os.path.join(workdir, "gpu-memory-receipt.yaml"), "w") as f:
+            yaml.safe_dump({"ranks": ranks}, f, sort_keys=False)
 
     def collect(self, nodes, job_id, spec, dest):
         # The run already pulled every rank's logs into .var/runs/<job_id>; just
