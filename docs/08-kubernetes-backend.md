@@ -138,6 +138,83 @@ params:
   queue: default-queue     # KAI queue
 ```
 
+## Declaring and verifying per-rank GPU-memory affinity
+
+**What "GPU affinity" means on this backend, and what it doesn't.** This is a
+single-physical-GPU host (`infra/k8s/setup.sh` hard-codes
+`nvidia.com/gpu.count=1`) — there is no second device to pin a rank to, so
+there is no device-selection knob here, unlike the `launcher: mpi` VM path's
+per-rank `CUDA_VISIBLE_DEVICES` (see [`06-interface-contract.md`](06-interface-contract.md)
+and `reconciler/launcher.py`). The one real, declarable knob on this backend
+is HAMi's per-rank **VRAM-fraction cap** — how much of the one card each rank
+is isolated to.
+
+**Declare it per rank**, not just uniformly across the whole gang:
+
+```yaml
+params:
+  gpu_memory_mb: [1024, 2048, 1024, 1024]   # one entry per rank (node_count == 4)
+  # gpu_memory_mb: 4096                     # or a single scalar — every rank the same (unchanged default)
+```
+
+A list whose length doesn't match `node_count` fails the job before anything
+is applied — the same "refuse rather than silently narrow the request" rule
+the VM path's placement resolver follows. Omitting `gpu_memory_mb` entirely
+keeps today's behavior exactly: every rank gets `K8S_GPU_MEMORY_MB` (default
+2048 MiB).
+
+**Verify what HAMi actually enforced**, not just what the pod annotation
+asked for — opt in with `params.verify_gpu_memory: true`:
+
+```yaml
+params:
+  gpu_memory_mb: [1024, 2048]
+  verify_gpu_memory: true   # requires `command` to be set (needs an entrypoint to wrap)
+node_count: 2
+command: ["python3", "train.py"]
+```
+
+Why this needs its own probe rather than reading the pod spec: the
+kai-resource-isolator webhook mutates the pod to add `CUDA_DEVICE_MEMORY_LIMIT`
+via `envFrom` a generated ConfigMap — visible in `kubectl get pod -o yaml`
+**as a reference**, but the resolved value (and whether `libvgpu.so`'s
+`ld.so.preload` hook actually intercepted THIS process's CUDA calls with it)
+is only knowable from inside the running container. Verified live: the value
+carries a trailing unit letter (`"1141m"`, not a bare integer) and is KAI's
+own *quantized* GPU portion, not necessarily the exact declared MiB figure —
+`gpu-memory: "1024"` on a 16311 MiB card resolved to a `GPU_PORTION` of
+`0.07` → `CUDA_DEVICE_MEMORY_LIMIT=1141m`. `reconciler/probes/
+gpu-memory-probe.sh` runs once per rank, **inside** the container, before the
+real command (same inline-splice technique the VM path's preflight probe
+uses), strips that suffix, and reports the enforced cap plus the GPU UUID
+`nvidia-smi` sees. `KubernetesAdapter._build_gpu_memory_receipt` reconciles
+declared vs observed per rank into `gpu-memory-receipt.yaml` in the
+drop-zone — a rank with no parseable observation is recorded as an explicit
+mismatch, never silently dropped.
+
+```yaml
+# gpu-memory-receipt.yaml
+ranks:
+  - rank: 0
+    declared_mb: 1024
+    observed_mb: 1141      # KAI's quantized portion, not always == declared_mb exactly
+    observed_gpu_uuid: GPU-...
+    matched: false          # exact-equality on purpose — see below
+```
+
+**`matched` is exact equality on purpose, and will legitimately read `false`
+under KAI's own quantization** (observed live: requesting 1024 MiB resolved
+to a 1141 MiB enforced cap). This is not a bug in the receipt: rounding the
+comparison to "close enough" would be inventing a tolerance nobody has
+verified is the right one, the same reasoning `receipt.py` uses for the
+CPU/rankfile path. Read `observed_mb` yourself to judge whether the
+quantization is acceptable for what you're measuring; don't treat
+`matched: false` here as an integration failure by itself.
+
+This declares/verifies capacity-isolation only — it says nothing about
+*throughput* (see "the honest limit" above): a matched receipt confirms the
+VRAM cap held, not that the ranks ran at full, uncontended speed.
+
 ## Substrate — decided: NixOS + KinD
 
 The adapter is a few hundred lines of `kubectl` templating. **The risk is
