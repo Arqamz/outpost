@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -25,6 +26,13 @@ from pathlib import Path
 
 from .models import NodeRecord, JobSpec, RunResult
 from .store import now_iso
+from .topology import PROBE_PATH
+
+# Runs ONCE PER RANK inside a k8s pod (KubernetesAdapter, opt-in via
+# spec.params.verify_gpu_memory) — see the script for why it must run inside
+# the container rather than being read off the pod spec.
+GPU_MEMORY_PROBE_PATH = Path(__file__).resolve().parent / "probes" / "gpu-memory-probe.sh"
+_GPU_MEMORY_MARKER = "===GPU_MEMORY_PROBE==="
 
 
 def _log_stderr(msg: str) -> None:
@@ -33,12 +41,15 @@ def _log_stderr(msg: str) -> None:
 
 def _is_staging_artifact(name: str) -> bool:
     """Staging files that MUST NOT be collected into the drop-zone: the per-node
-    container image (a ~5 GB SIF staged into the workdir) and the MPI hostfile.
-    collect() ships the whole workdir, so pulling the image back duplicated it
-    once per job and filled /home to 100% (2026-07-21) — corrupting the state
-    file mid-write. The image is content-addressed + cached (.var/sif-cache) and
-    fully regenerable; only stdout.log + the output_dir files are real results."""
-    return name.endswith(".sif") or name == "hostfile"
+    container image (a ~5 GB SIF staged into the workdir), the MPI hostfile, and
+    (for a planned launch: mpi run) the compiled launcher appfile/rankfile/
+    per-rank scripts. collect() ships the whole workdir, so pulling the image
+    back duplicated it once per job and filled /home to 100% (2026-07-21) —
+    corrupting the state file mid-write. The image is content-addressed +
+    cached (.var/sif-cache) and fully regenerable; only stdout.log, the
+    output_dir files, and the three launch-*.yaml artifacts are real results."""
+    return (name.endswith(".sif") or name == "hostfile" or
+           name.startswith("launcher-"))
 
 
 REPO_ROOT = os.environ.get("CLUSTER_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -154,6 +165,29 @@ def scp_to(ip: str, src: str, dst: str, job_id: str,
     argv = ["scp", "-i", key or SSH_KEY, "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null", src, f"{user or SSH_USER}@{ip}:{dst}"]
     run_logged(argv, job_id)
+
+
+def _with_preflight_probe(files: dict[str, str], probe_script: str,
+                          remote_workdir: str) -> dict[str, str]:
+    """Prepend the placement-probe.sh TEXT (inlined, same way GTL's own
+    probe.wrap_command splices its probe before a benchmark) to every rank
+    script's `exec` line, so each rank writes its own observation before
+    becoming the workload — the probe runs under the exact rankfile/appfile/
+    env the workload will, which is the whole point of a PREFLIGHT check.
+
+    `set -- "{remote_workdir}"` gives the probe its $1 explicitly: the script
+    itself defaults $1 to `/out`, which is right INSIDE the container (where
+    output_dir is bind-mounted) but this runs BEFORE `exec` swaps the rank
+    into the container — found live against real VMs, where the unset default
+    silently wrote (or failed to write) under a bare, unrelated `/out` on the
+    VM's own filesystem instead of the workdir collect() actually ships."""
+    out = {}
+    for name, content in files.items():
+        if name.startswith("launcher-rank-") and "\nexec " in content:
+            preamble = f'(set -- {shlex.quote(remote_workdir)}; {probe_script}) >/dev/null 2>&1\n'
+            content = content.replace("\nexec ", "\n" + preamble + "exec ", 1)
+        out[name] = content
+    return out
 
 
 def _sif_cache_name(ref: str) -> str:
@@ -350,11 +384,23 @@ class ProviderAdapter(ABC):
     @abstractmethod
     def bootstrap(self, nodes: list[NodeRecord], job_id: str) -> None: ...
 
-    # workload lifecycle (head node = nodes[0])
+    # workload lifecycle (head node = nodes[0]). `plan`: the resolved LaunchPlan
+    # dict from reconciler.py's _phase_plan, or None for a job with no
+    # placement request (the pre-existing case) — only LibvirtAdapter's
+    # launcher: mpi path acts on it; every other adapter ignores it.
     @abstractmethod
-    def run(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec) -> RunResult: ...
+    def run(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
+           plan: dict | None = None) -> RunResult: ...
     @abstractmethod
     def collect(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec, dest: str) -> str: ...
+
+    # placement (reconciler.py's _phase_plan; only a launcher: mpi job carrying
+    # a launch block ever calls this). NOT abstract: an adapter that never sees
+    # one (k8s, and most callers today) inherits this default rather than every
+    # adapter needing a stub. The default raises rather than fabricating a
+    # topology — a wrong affinity silently binds a rank to the far socket.
+    def probe_topology(self, node: NodeRecord, job_id: str) -> dict:
+        raise NotImplementedError(f"{self.name} adapter cannot probe topology")
 
 
 class NullAdapter(ProviderAdapter):
@@ -368,7 +414,7 @@ class NullAdapter(ProviderAdapter):
     def deprovision(self, node, job_id):  self.log(f"[null] deprovision {node.name} (no-op)")
     def bootstrap(self, nodes, job_id):   self.log(f"[null] bootstrap {[n.name for n in nodes]} (no-op)")
 
-    def run(self, nodes, job_id, spec):
+    def run(self, nodes, job_id, spec, plan=None):
         self.log(f"[null] would run '{spec.image or '(no image)'}' on {nodes[0].name}")
         return RunResult(job_id, nodes[0].name, None, note="dry-run (null adapter)")
 
@@ -376,6 +422,24 @@ class NullAdapter(ProviderAdapter):
         self.log(f"[null] would collect -> {dest}")
         os.makedirs(dest, exist_ok=True)
         return dest
+
+    def probe_topology(self, node, job_id):
+        # A synthetic single-GPU node, deterministic per node name (not
+        # random) — lets a launch block resolve and preview end-to-end in
+        # dry-run without real hardware, but it's a MADE-UP machine: never
+        # runs a real workload, so nothing downstream depends on it being
+        # accurate the way a real probe's output must be.
+        self.log(f"[null] would probe topology on {node.name} (synthetic 4-core/1-GPU)")
+        return {
+            "probe_version": "1", "hostname": node.name, "scope": "host",
+            "allowed_cpus": "0-3", "online_cpus": "0-3",
+            "cpus": [{"id": i, "core": i, "socket": 0, "numa": 0} for i in range(4)],
+            "numa": [{"id": 0, "cpulist": "0-3", "memory_mib": 65536}],
+            "gpus": [{"index": 0, "uuid": f"GPU-null-{node.name}", "pci_bus_id": "0000:00:00.0",
+                     "memory_mib": 16384, "name": "null-adapter synthetic GPU", "numa": 0}],
+            "topo_matrix": "\tGPU0\tCPU Affinity\tNUMA Affinity\nGPU0\t X \t0-3\t0\n",
+            "launcher": {"type": "openmpi", "version": "0.0.0-null"},
+        }
 
 
 class LocalHostAdapter(ProviderAdapter):
@@ -409,7 +473,10 @@ class LocalHostAdapter(ProviderAdapter):
             self.log("[localhost] WARNING: mpirun not found on host — hybrid MPI jobs "
                      "will fail (on Ubuntu: apt install openmpi-bin, matching the VMs' 4.1.x)")
 
-    def run(self, nodes, job_id, spec):
+    def run(self, nodes, job_id, spec, plan=None):
+        # `plan` is ignored here: this adapter's launcher: mpi path is the
+        # HYBRID one (host GPU + VMs, one appfile), a different shape from
+        # the plain multi-VM case LibvirtAdapter's planned path targets.
         node = nodes[0]
         workdir = os.path.join(RUNS_DIR, job_id)
         os.makedirs(workdir, exist_ok=True)
@@ -521,6 +588,13 @@ class LocalHostAdapter(ProviderAdapter):
                     shutil.copy2(src, dst)
         return dest
 
+    def probe_topology(self, node, job_id):
+        proc = subprocess.run(["sh", "-c", PROBE_PATH.read_text()],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"topology probe failed on {node.name}: {proc.stderr.strip()}")
+        return json.loads(proc.stdout)
+
 
 class LibvirtAdapter(ProviderAdapter):
     """VM nodes: virsh define/start for lifecycle, ssh + apptainer for workloads."""
@@ -618,13 +692,13 @@ class LibvirtAdapter(ProviderAdapter):
             hosts.add(line.split()[0])
         return hosts
 
-    def run(self, nodes, job_id, spec):
+    def run(self, nodes, job_id, spec, plan=None):
         head = nodes[0]
         remote_workdir = f"/tmp/cluster/{job_id}"
         if spec.is_dry_run:
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
         if spec.launcher == "mpi" and len(nodes) > 1:
-            return self._run_mpi(nodes, job_id, spec, remote_workdir)
+            return self._run_mpi(nodes, job_id, spec, remote_workdir, plan)
         # A GPU job on a remote node adds the node's OWN driver binds for
         # `apptainer --nv` (node.gpu_binds), whose source paths must exist ON
         # THAT node — a NixOS worker needs /nix/store,/run/opengl-driver; an
@@ -653,32 +727,36 @@ class LibvirtAdapter(ProviderAdapter):
         scp_to(node.ip, src, dst, job_id, *node_ssh_id(node))
 
     def _run_mpi(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
-                 remote_workdir: str) -> RunResult:
-        """Multi-node hybrid launch: mpirun runs on the head VM (installed by
-        the bootstrap role) and execs `apptainer exec <image> ...` per rank
-        on every claimed node over ssh — the container never needs its own MPI
-        launcher, only a matching libmpi. Hostfile + image are per-job (built
-        from the nodes THIS job claimed, not the cluster-wide 8) and staged
-        fresh onto every claimed node under remote_workdir."""
-        head = nodes[0]
-        remote_hostfile = f"{remote_workdir}/hostfile"
-        btl_inc, oob_inc = fabric_if_include(nodes)
+                 remote_workdir: str, plan: dict | None = None) -> RunResult:
+        """Multi-node launch: mpirun runs on the head VM (installed by the
+        bootstrap role) and execs `apptainer exec <image> ...` per rank on
+        every claimed node over ssh — the container never needs its own MPI
+        launcher, only a matching libmpi. Image is per-job (built from the
+        nodes THIS job claimed, not the cluster-wide 8) and staged fresh onto
+        every claimed node under remote_workdir.
 
-        local_scratch = os.path.join(RUNS_DIR, job_id)
-        os.makedirs(local_scratch, exist_ok=True)
-        # A docker://…@digest ref is materialized into a real SIF here before
-        # it can be scp'd onto each rank's node (single-node execs the ref
-        # directly, but staging needs a file).
+        `plan`: a resolved LaunchPlan dict (reconciler.py's _phase_plan) routes
+        to _run_mpi_planned — per-rank rankfile/argv/env compiled by
+        launcher.for_plan(), instead of the one shared command below. None
+        (no placement request) keeps this EXACT path, unchanged."""
+        head = nodes[0]
         local_image = ensure_local_sif(spec.image, job_id)
         remote_image = f"{remote_workdir}/{os.path.basename(local_image)}"
+        for n in nodes:
+            run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
+            self._scp_to(n, local_image, remote_image, job_id)
+
+        if plan is not None:
+            return self._run_mpi_planned(nodes, job_id, spec, remote_workdir, remote_image, plan)
+
+        remote_hostfile = f"{remote_workdir}/hostfile"
+        btl_inc, oob_inc = fabric_if_include(nodes)
+        local_scratch = os.path.join(RUNS_DIR, job_id)
+        os.makedirs(local_scratch, exist_ok=True)
         local_hostfile = os.path.join(local_scratch, "hostfile")
         with open(local_hostfile, "w") as f:
             for n in nodes:
                 f.write(f"{n.ip} slots=1\n")
-
-        for n in nodes:
-            run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
-            self._scp_to(n, local_image, remote_image, job_id)
         self._scp_to(head, local_hostfile, remote_hostfile, job_id)
 
         rank_spec = dataclasses.replace(spec, image=remote_image)
@@ -694,6 +772,115 @@ class LibvirtAdapter(ProviderAdapter):
         rc = run_logged(self._ssh_base(head) + [remote], job_id, check=False)
         return RunResult(job_id, head.name, rc, remote_workdir, stdout_log,
                          note=f"mpirun np={len(nodes)} exit={rc}")
+
+    def _run_mpi_planned(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
+                         remote_workdir: str, remote_image: str, plan: dict) -> RunResult:
+        """The launcher.for_plan() path: per-rank rankfile/appfile/env compiled
+        from the resolved plan, `--report-bindings` captured for the receipt,
+        and (when the intent asks for it) a per-rank preflight probe run
+        before the workload so the receipt has a real OS-level observation,
+        not just the launcher's own claim."""
+        from . import launcher as launcher_mod
+        from .placement import LaunchPlan
+        from .receipt import PLACEMENT_PROBE_PATH, build_receipt
+
+        head = nodes[0]
+        launch_plan = LaunchPlan.from_dict(plan)
+        node_ips = {n.name: n.ip for n in nodes}
+        launcher_adapter = launcher_mod.for_plan(launch_plan)
+        # Checked BEFORE compiling: a capability gap should read as itself
+        # ("this launcher cannot bind ranks to CPUs"), not as whatever a
+        # half-rendered command does next.
+        unmet = launcher_adapter.unsupported(launch_plan, spec.launch or {})
+        if unmet:
+            raise launcher_mod.LauncherUnsupported("; ".join(unmet))
+        rendering = launcher_adapter.compile(launch_plan, spec, node_ips=node_ips,
+                                             workdir=remote_workdir, image=remote_image)
+
+        require_preflight = bool(((spec.launch or {}).get("validation") or {})
+                                 .get("require_preflight"))
+        files = rendering.files
+        if require_preflight:
+            files = _with_preflight_probe(files, PLACEMENT_PROBE_PATH.read_text(), remote_workdir)
+
+        # mpirun (on the head) reads the appfile/rankfile itself, so those two
+        # only need to exist THERE. A per-rank script is `/bin/sh`'d via ssh
+        # onto the rank's OWN node (the appfile's `--host`) — staging it only
+        # on head left every non-head rank unable to find its own script,
+        # found live against 2 real VMs: rank 1 on cluster-node-02 failed
+        # with "cannot open .../launcher-rank-1.sh: No such file".
+        rank_node = {r.global_rank: r.node for r in launch_plan.ranks}
+        node_by_name = {n.name: n for n in nodes}
+        local_scratch = os.path.join(RUNS_DIR, job_id)
+        os.makedirs(local_scratch, exist_ok=True)
+        for name, content in files.items():
+            local_path = os.path.join(local_scratch, name)
+            with open(local_path, "w") as f:
+                f.write(content)
+            m = re.match(r"launcher-rank-(\d+)\.sh$", name)
+            target = node_by_name[rank_node[int(m.group(1))]] if m else head
+            self._scp_to(target, local_path, f"{remote_workdir}/{name}", job_id)
+
+        inner = " ".join(shlex.quote(a) for a in rendering.argv)
+        stdout_log = f"{remote_workdir}/stdout.log"
+        remote = f"({inner}) 2>&1 | tee {stdout_log}; exit ${{PIPESTATUS[0]}}"
+        self.log(f"[libvirt] ssh {head.name} (mpirun head, planned, {len(launch_plan.ranks)} "
+                f"rank(s)): {inner}")
+        rc = run_logged(self._ssh_base(head) + [remote], job_id, check=False)
+
+        # --report-bindings' output is interleaved into the same stream that
+        # went to stdout_log; read it back rather than threading a second
+        # capture path through run_logged (which only returns an exit code).
+        combined = subprocess.run(self._ssh_base(head) + [f"cat {stdout_log}"],
+                                  capture_output=True, text=True).stdout
+        observations = (self._fetch_preflight_observations(nodes, remote_workdir)
+                        if require_preflight else [])
+        receipt = build_receipt(launch_plan, observations, binding_report=combined,
+                                preflight_ran=require_preflight)
+        self._stage_launch_artifacts(head, job_id, remote_workdir, spec.launch, plan, receipt)
+
+        return RunResult(job_id, head.name, rc, remote_workdir, stdout_log,
+                         note=f"mpirun np={len(launch_plan.ranks)} (planned) exit={rc}")
+
+    def _fetch_preflight_observations(self, nodes: list[NodeRecord],
+                                      remote_workdir: str) -> list[dict]:
+        """Every rank writes its own preflight/rank-<N>.json on WHICHEVER node
+        it actually landed on, not necessarily the head — collected here (not
+        by collect(), which only pulls from head) since receipt.build_receipt
+        needs them immediately, before teardown. A node with no such rank, or
+        no preflight directory at all, contributes nothing (not an error)."""
+        observations: list[dict] = []
+        for n in nodes:
+            proc = subprocess.run(
+                self._ssh_base(n) +
+                [f"for f in {remote_workdir}/preflight/*.json; do "
+                 f"[ -f \"$f\" ] && echo ===RANK=== && cat \"$f\"; done 2>/dev/null"],
+                capture_output=True, text=True)
+            for chunk in proc.stdout.split("===RANK==="):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                try:
+                    observations.append(json.loads(chunk))
+                except json.JSONDecodeError:
+                    continue
+        return observations
+
+    def _stage_launch_artifacts(self, head: NodeRecord, job_id: str, remote_workdir: str,
+                                intent: dict | None, plan: dict, receipt) -> None:
+        """Write launch-{intent,plan,receipt}.yaml into the SAME remote workdir
+        collect() already scp's wholesale — the exact three filenames the
+        child-cluster interface contract (and GTL's childcluster.py reader)
+        expect beside stdout.log, with no change needed to collect() itself."""
+        import yaml
+        local_scratch = os.path.join(RUNS_DIR, job_id)
+        artifacts = {"launch-intent.yaml": intent, "launch-plan.yaml": plan,
+                    "launch-receipt.yaml": receipt.to_dict()}
+        for name, doc in artifacts.items():
+            local_path = os.path.join(local_scratch, name)
+            with open(local_path, "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+            self._scp_to(head, local_path, f"{remote_workdir}/{name}", job_id)
 
     def collect(self, nodes, job_id, spec, dest):
         head = nodes[0]
@@ -712,6 +899,18 @@ class LibvirtAdapter(ProviderAdapter):
                    "-o", "UserKnownHostsFile=/dev/null", "-r",
                    f"{user}@{head.ip}:{remote_workdir}/.", dest], job_id, check=False)
         return dest
+
+    def probe_topology(self, node, job_id):
+        # Same ssh reachability provision()/bootstrap() already proved for
+        # this node — no new credential or connectivity path. Piped via stdin
+        # (`sh -s`) rather than staged as a file: read-only, and the script is
+        # small enough that a round trip to write+chmod+run+clean up a remote
+        # file would be pure overhead. StaticSshAdapter inherits this as-is.
+        proc = subprocess.run(self._ssh_base(node) + ["sh", "-s"],
+                              input=PROBE_PATH.read_text(), capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"topology probe failed on {node.name}: {proc.stderr.strip()}")
+        return json.loads(proc.stdout)
 
 
 class StaticSshAdapter(LibvirtAdapter):
