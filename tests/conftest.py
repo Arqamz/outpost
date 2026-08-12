@@ -89,7 +89,7 @@ class FakeAdapter(ProviderAdapter):
     def bootstrap(self, nodes, job_id):
         self._phase("bootstrap", job_id, [n.name for n in nodes])
 
-    def run(self, nodes, job_id, spec):
+    def run(self, nodes, job_id, spec, plan=None):
         self._phase("run", job_id, [n.name for n in nodes])
         return RunResult(job_id, nodes[0].name, self.exit_code, note="fake run")
 
@@ -97,6 +97,23 @@ class FakeAdapter(ProviderAdapter):
         self._phase("collect", job_id, [n.name for n in nodes])
         os.makedirs(dest, exist_ok=True)
         return dest
+
+    def probe_topology(self, node, job_id):
+        self._phase("probe_topology", job_id, [node.name])
+        # A synthetic single-GPU/8-core node, deterministic per node name —
+        # enough for placement.resolve() to produce a real plan against a
+        # multi-node allocation (incl. the shipped one-rank-per-gpu.json
+        # example, cores_per_rank=8) without any real ssh/hardware.
+        return {
+            "probe_version": "1", "hostname": node.name, "scope": "host",
+            "allowed_cpus": "0-7", "online_cpus": "0-7",
+            "cpus": [{"id": i, "core": i, "socket": 0, "numa": 0} for i in range(8)],
+            "numa": [{"id": 0, "cpulist": "0-7", "memory_mib": 65536}],
+            "gpus": [{"index": 0, "uuid": f"GPU-fake-{node.name}", "pci_bus_id": "0000:00:00.0",
+                     "memory_mib": 16384, "name": "fake-adapter synthetic GPU", "numa": 0}],
+            "topo_matrix": "\tGPU0\tCPU Affinity\tNUMA Affinity\nGPU0\t X \t0-7\t0\n",
+            "launcher": {"type": "openmpi", "version": "0.0.0-fake"},
+        }
 
 
 @pytest.fixture()

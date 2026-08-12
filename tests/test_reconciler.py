@@ -6,15 +6,25 @@ libvirt, ssh, ansible or apptainer.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
-from conftest import FakeAdapter, assert_pool_returned, drive, states
+from conftest import FakeAdapter, REPO_DIR, assert_pool_returned, drive, states
 
 from reconciler.reconciler import clear_jobs
 from reconciler.states import IllegalTransition, JobState, NodeState
 
 PROMOTED = JobState.PROMOTED.value
 FAILED = JobState.FAILED.value
+PLAN_READY = JobState.PLAN_READY.value
 AVAILABLE = NodeState.AVAILABLE.value
+
+_LAUNCH_EXAMPLES = Path(REPO_DIR) / "contract" / "launch-intent" / "v1" / "examples"
+
+
+def launch_intent(name: str = "one-rank-per-gpu.json") -> dict:
+    return json.loads((_LAUNCH_EXAMPLES / name).read_text())
 
 
 class TestHappyPath:
@@ -116,25 +126,21 @@ class TestFailurePaths:
         assert job.assigned_nodes == [], "a rejected shape must not hold capacity"
         assert_pool_returned(store)
 
-    def test_unsupported_launch_intent_is_refused_before_claiming(
+    def test_launch_intent_on_an_unsupported_launcher_is_refused_before_claiming(
             self, store, seed, make_reconciler, spec):
-        # Planning is not implemented yet, so a valid intent must still stop the
-        # job — running it would apply a placement the caller never asked for,
-        # and the output would look entirely normal afterwards.
-        import json
-        from pathlib import Path
-
-        from conftest import REPO_DIR
-        intent = json.loads((Path(REPO_DIR) / "contract" / "launch-intent" / "v1" /
-                             "examples" / "one-rank-per-gpu.json").read_text())
+        # Planning only resolves launcher: mpi jobs — a launch block on the
+        # default launcher: single must still stop the job before it claims
+        # anything, or it would run under whatever placement the launcher
+        # defaults to while the caller believes their request was applied.
+        intent = launch_intent()
         seed(cpu=2)
         rec, fake = make_reconciler()
-        job_id = rec.submit(spec(launch=intent))
+        job_id = rec.submit(spec(launch=intent))        # launcher defaults to "single"
         drive(rec)
 
         job = store.get_job(job_id)
         assert job.state == FAILED
-        assert "cannot resolve a launch plan yet" in job.error
+        assert "only resolves launch plans for launcher: mpi" in job.error
         assert job.assigned_nodes == [], "a job we cannot run must not hold capacity"
         assert fake.phases_for(job_id) == [], "nothing should have been provisioned"
         assert_pool_returned(store)
@@ -273,3 +279,101 @@ class TestClearJobs:
         seed(cpu=3, gpu=True)
         clear_jobs(store)
         assert len(store.list_nodes()) == 4
+
+
+class TestPlanning:
+    """launcher: mpi + a launch block: the opt-in path through PLANNING/PLAN_READY."""
+
+    def test_no_launch_block_skips_planning_entirely(self, store, seed, make_reconciler, spec):
+        # No behaviour change without opting in: a launcher: mpi job with no
+        # placement request must show EXACTLY the audit chain it did before
+        # PLANNING/PLAN_READY existed.
+        seed(cpu=2)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec(launcher="mpi", node_count=2))
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == PROMOTED
+        assert job.plan is None and job.plan_status == "none"
+        assert "probe_topology" not in fake.phases_for(job_id)
+        assert [(e["from"], e["to"]) for e in store.list_audit(job_id)] == [
+            ("-", "submitted"),
+            ("submitted", "provisioning"),
+            ("provisioning", "bootstrapping"),
+            ("bootstrapping", "running"),
+            ("running", "collecting"),
+            ("collecting", "teardown"),
+            ("teardown", "validating"),
+            ("validating", "promoted"),
+        ]
+
+    def test_auto_approval_resolves_and_runs_without_a_human(self, store, seed, make_reconciler, spec):
+        # one-rank-per-gpu.json is `approval: manual` by default; only that
+        # field is overridden — everything else (gpu.strategy: one_per_rank,
+        # ranks_per_node: null -> derived from the discovered GPU count) is the
+        # shipped contract example, unmodified.
+        intent = launch_intent()
+        intent["approval"] = "auto"
+        seed(cpu=2)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec(launcher="mpi", node_count=2, launch=intent))
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == PROMOTED
+        assert job.plan_status == "approved"
+        assert job.plan and len(job.plan["ranks"]) == 2   # 1 GPU/node (one_per_rank) x 2 nodes
+        assert fake.phases_for(job_id).count("probe_topology") == 2  # one per node
+
+    def test_manual_approval_holds_the_job_in_plan_ready_until_approved(
+            self, store, seed, make_reconciler, spec):
+        seed(cpu=2)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec(launcher="mpi", node_count=2,
+                                 launch=launch_intent()))   # approval: manual (unmodified)
+
+        for _ in range(6):    # submitted -> provisioning -> bootstrapping -> planning -> plan_ready
+            rec.tick()
+        job = store.get_job(job_id)
+        assert job.state == PLAN_READY
+        assert job.plan_status == "ready"
+        assert "run" not in fake.phases_for(job_id), "must not run before approval"
+
+        # `gtl approve`'s real effect: flip plan_status under the store's lock —
+        # nothing else about the record changes.
+        job.plan_status = "approved"
+        store.put_job(job)
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == PROMOTED
+        assert fake.phases_for(job_id).count("probe_topology") == 2  # resolved ONCE, not re-probed
+
+    def test_unapproved_plan_times_out_instead_of_holding_capacity_forever(
+            self, store, seed, make_reconciler, spec):
+        seed(cpu=2)
+        rec, fake = make_reconciler(approval_wait_timeout=0.0)
+        job_id = rec.submit(spec(launcher="mpi", node_count=2, launch=launch_intent()))
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == FAILED
+        assert "waiting for plan approval" in job.error
+        assert_pool_returned(store)
+
+    def test_impossible_placement_fails_the_job_with_the_reason(
+            self, store, seed, make_reconciler, spec):
+        # The fake node only has 8 cores; asking for 999/rank is unsatisfiable —
+        # placement.resolve must refuse rather than silently narrow the request.
+        intent = launch_intent()
+        intent["cpu"]["cores_per_rank"] = 999
+        seed(cpu=2)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec(launcher="mpi", node_count=2, launch=intent))
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == FAILED
+        assert "PlacementError" in job.error
+        assert_pool_returned(store)
