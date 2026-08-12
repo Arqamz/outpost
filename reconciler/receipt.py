@@ -21,8 +21,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from .placement import LaunchPlan
+
+# Runs ONCE PER RANK, under the same launcher rendering as the benchmark, and
+# writes <output_dir>/preflight/rank-<N>.json — the observations this module
+# reconciles against the plan. Path only (like topology.PROBE_PATH); the
+# adapter decides whether/how to inline it into a rank's launch.
+PLACEMENT_PROBE_PATH = Path(__file__).resolve().parent / "probes" / "placement-probe.sh"
 from .topology import expand_cpulist
 
 # `[host:04469] MCW rank 0 bound to socket 0[core 0[hwt 0]]: [B/././.]`
