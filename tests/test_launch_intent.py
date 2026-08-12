@@ -125,18 +125,21 @@ class TestMalformed:
         assert "validation" in message
 
 
-class TestNotYetSupported:
-    def test_a_valid_intent_is_still_refused_while_planning_is_unimplemented(self):
+class TestPlanningSupportGate:
+    def test_a_valid_intent_is_refused_while_planning_is_unimplemented(self, monkeypatch):
+        # Proves the gate is the flag and nothing else — a backend with no
+        # resolver at all (or one that has since regressed) refuses cleanly.
+        monkeypatch.setattr(launch_models, "PLANNING_SUPPORTED", False)
         reason = launch_models.unsupported_reason(intent())
         assert reason and "cannot resolve a launch plan yet" in reason
 
     def test_no_intent_is_always_supported(self):
         assert launch_models.unsupported_reason(None) is None
 
-    def test_the_refusal_disappears_when_planning_lands(self, monkeypatch):
-        # Proves the gate is the flag and nothing else, so flipping it in the
-        # resolver phase is all that is needed here.
-        monkeypatch.setattr(launch_models, "PLANNING_SUPPORTED", True)
+    def test_a_valid_intent_is_accepted_now_that_planning_has_landed(self):
+        # PLANNING_SUPPORTED is True by default — reconciler.py's _phase_plan
+        # is the real resolver, not a monkeypatched stand-in.
+        assert launch_models.PLANNING_SUPPORTED is True
         assert launch_models.unsupported_reason(intent()) is None
 
 

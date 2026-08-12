@@ -34,13 +34,13 @@ SCHEMA_VERSION = "launch-intent/v1"
 SCHEMA_PATH = (Path(__file__).resolve().parent.parent
                / "contract" / "launch-intent" / "v1" / "launch-intent.schema.json")
 
-# Set when the planning phases land (topology discovery -> placement resolver ->
-# launcher compilation -> preflight). Until then a launch block is parsed and
-# validated but the job is still REFUSED, because executing it would run the
-# benchmark under whatever placement the launcher defaults to while the caller
-# believes their request was applied — the exact failure the contract exists to
-# prevent, and one nothing downstream can detect from the output.
-PLANNING_SUPPORTED = False
+# The planning phases (topology discovery -> placement resolver -> launcher
+# compilation -> receipt) now exist in reconciler.py's _phase_plan, for
+# launcher: mpi jobs. This flag is the single, tested gate for "can this
+# backend resolve a launch plan at all" — the launcher-specific restriction
+# (mpi only, for now) is a separate check in _phase_provision, because it is
+# about WHICH jobs, not whether the capability exists.
+PLANNING_SUPPORTED = True
 
 _PY_TYPES = {
     "object": dict, "array": list, "string": str, "boolean": bool,

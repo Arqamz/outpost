@@ -26,6 +26,7 @@ is intentionally generic — the cluster runs *any* container:
 | `env` | map | env vars set inside the container |
 | `output_dir` | str | in-container path the job writes results to (bound to the host) |
 | `params` | map | opaque passthrough (ignored by the cluster) |
+| `launch` | map, optional | a semantic placement request (`launch-intent/v1`, see [`contract/README.md`](../contract/README.md)) — resolved against real topology for `launcher: mpi` jobs only; see "Placement" below. Absent = today's behavior, unchanged. |
 
 **The cluster promises:** given a JobSpec, it schedules the right resource
 (waiting for capacity to free up if needed, not failing immediately — see
@@ -49,6 +50,42 @@ Two ways to write the spec today:
 - our local CLI: `cluster submit --spec job.yaml` (a client of this same store);
 - directly: insert the JobSpec document into `jobs` — what any other caller
   would do, via `CLUSTER_MONGO_URI`.
+
+## Placement — declaring and verifying where ranks actually ran
+
+A `launcher: mpi` `JobSpec` may carry an optional `launch` block (`contract/
+launch-intent/v1/launch-intent.schema.json`) — a semantic statement of the
+placement a benchmark needs (ranks per node, cores per rank, GPU binding),
+with no CPU ids, device indices, or launcher flags (those depend on the
+allocation, which the caller cannot know at submit time). Any other launcher
+shape (`launcher: single`, `backend: k8s`) refuses a job carrying one rather
+than running it under a placement nobody chose.
+
+When present, the job passes through two additional states between
+`bootstrapping` and `running`:
+
+- **`planning`** — the cluster probes the allocated nodes' real topology and
+  resolves the intent into an exact per-rank plan (`jobs.plan`), or fails the
+  job with the reason if the allocation cannot satisfy it.
+- **`plan_ready`** — the plan is resolved. `jobs.plan_status` is one of
+  `none | ready | approved | failed` — `ready` means a human must run
+  `gtl approve` (or the equivalent direct store write) before the job may
+  proceed; `approved` (including auto-approval, the schema default) means it
+  already has. A job with no `launch` block skips both states entirely — its
+  audit trail is unaffected.
+
+Once the job runs, three additional files land in the drop-zone alongside
+`stdout.log`: `launch-intent.yaml` (what was asked for), `launch-plan.yaml`
+(the exact resolved per-rank mapping), and `launch-receipt.yaml` (the
+resolved plan reconciled against the launcher's own `--report-bindings`
+claim and, when `validation.require_preflight` is set, a real in-process
+observation from inside each rank) — `receipt.status` is `verified`,
+`mismatched`, or `unverified`.
+
+The k8s backend has a separate, narrower placement concept — see
+["Declaring and verifying per-rank GPU-memory affinity"](08-kubernetes-backend.md#declaring-and-verifying-per-rank-gpu-memory-affinity)
+— since it has no cores/rankfile to resolve against (the kubelet owns in-pod
+CPU/GPU) and exactly one physical GPU (no device to pin to).
 
 ## Egress — how output comes back
 
@@ -85,7 +122,8 @@ the drop-zone + `jobs`/`audit`/`nodes` remain the only programmatic contract.
 ## Status / audit — read side
 
 - `jobs` — every job with its current `state`, `assigned_nodes`, `run`,
-  `drop_path`, `error`.
+  `drop_path`, `error`, and (only when `launch` was set) `plan`/`plan_status` —
+  see "Placement" above.
 - `audit` — append-only, ordered list of every state transition (job + node)
   with timestamps and reasons. This is the source of truth for "what happened."
 - `nodes` — the resource pool with capabilities and lock ownership.

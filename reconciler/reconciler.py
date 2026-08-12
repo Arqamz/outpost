@@ -21,7 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from . import launch_models
+from . import launch_models, placement
 from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
                       LocalHostAdapter, StaticSshAdapter, KubernetesAdapter,
                       REPO_ROOT, LOGS_DIR, append_job_log)
@@ -30,6 +30,7 @@ from .models import JobRecord, JobSpec, NodeRecord
 from .registry import NodeRegistry, NoCapacity  # NoCapacity: a submitted job waits, it doesn't fail
 from .states import JobState, NodeState, JOB_TERMINAL, assert_job
 from .store import Store, now_iso
+from .topology import normalize as normalize_topology
 
 # Egress half of the open interface: collected artifacts land under here per job.
 DROPZONE = os.environ.get("CLUSTER_DROPZONE") or os.path.join(REPO_ROOT, ".var", "dropzone")
@@ -37,6 +38,17 @@ DROPZONE = os.environ.get("CLUSTER_DROPZONE") or os.path.join(REPO_ROOT, ".var",
 # How long a job may sit retrying NoCapacity before it's failed cleanly instead
 # of waiting forever (e.g. node_count bigger than the whole pool will ever have).
 CAPACITY_WAIT_TIMEOUT_S = float(os.environ.get("CLUSTER_CAPACITY_WAIT_TIMEOUT", "600"))
+
+# How long a resolved-but-unapproved plan (plan_status "ready") may sit in
+# PLAN_READY before it's failed cleanly instead of holding its nodes forever —
+# a human approval gate, unlike capacity, has no guarantee anyone is watching.
+APPROVAL_WAIT_TIMEOUT_S = float(os.environ.get("CLUSTER_APPROVAL_WAIT_TIMEOUT", "3600"))
+
+
+class ApprovalPending(Exception):
+    """A resolved plan is waiting on `gtl approve` (plan_status == "ready").
+    Not a job defect — the job stays in PLAN_READY, holding its nodes, and
+    tick() retries next time, exactly like NoCapacity."""
 
 # Cap on how many jobs' phases run concurrently in one tick. Threads, not
 # processes — each phase is I/O-bound (ssh/scp/subprocess), so this is cheap;
@@ -67,6 +79,7 @@ class Reconciler:
     def __init__(self, store: Store, execute: bool = False, log=log_stderr,
                  adapters: dict[str, ProviderAdapter] | None = None,
                  capacity_wait_timeout: float = CAPACITY_WAIT_TIMEOUT_S,
+                 approval_wait_timeout: float = APPROVAL_WAIT_TIMEOUT_S,
                  max_workers: int = RECONCILE_WORKERS):
         self.store = store
         self.audit = Audit(store)
@@ -74,6 +87,7 @@ class Reconciler:
         self.execute = execute
         self.log = log
         self.capacity_wait_timeout = capacity_wait_timeout
+        self.approval_wait_timeout = approval_wait_timeout
         self.max_workers = max_workers
         if adapters is None:
             if execute:
@@ -109,6 +123,15 @@ class Reconciler:
         if not job.created_at:
             return 0.0
         return (datetime.now(timezone.utc) - datetime.fromisoformat(job.created_at)).total_seconds()
+
+    def _approval_wait_seconds(self, job: JobRecord) -> float:
+        """How long a plan has sat 'ready' awaiting `gtl approve`. updated_at is
+        stamped on every store write, and _phase_plan's write of plan_status is
+        the last one before the job starts waiting — the wait loop itself never
+        writes while it has nothing new to say, so this timestamp holds still."""
+        if not job.updated_at:
+            return 0.0
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(job.updated_at)).total_seconds()
 
     # ── job state helper ──────────────────────────────────────────────────
     def _set_job(self, job: JobRecord, to: JobState, reason: str = "") -> None:
@@ -165,6 +188,18 @@ class Reconciler:
             self.log(f"[job {job.job_id}] waiting for capacity "
                      f"({waited:.0f}s/{self.capacity_wait_timeout:.0f}s): {e}")
             return False
+        except ApprovalPending as e:
+            # A human hasn't run `gtl approve` yet — not a job defect, and
+            # unlike NoCapacity the job already holds its nodes, so waiting
+            # costs the pool, not just this job. Time out rather than hold
+            # capacity forever for an approval nobody is going to give.
+            waited = self._approval_wait_seconds(job)
+            if waited > self.approval_wait_timeout:
+                self._fail(job, f"timed out after {waited:.0f}s waiting for plan approval: {e}")
+                return True
+            self.log(f"[job {job.job_id}] waiting for plan approval "
+                     f"({waited:.0f}s/{self.approval_wait_timeout:.0f}s): {e}")
+            return False
         except Exception as e:  # noqa: BLE001 — any other phase error is a clean job failure
             self._fail(job, f"{type(e).__name__}: {e}")
             return True
@@ -180,7 +215,8 @@ class Reconciler:
         handler = {
             JobState.SUBMITTED:     self._phase_provision,
             JobState.PROVISIONING:  self._phase_bootstrap,
-            JobState.BOOTSTRAPPING: self._phase_run,
+            JobState.BOOTSTRAPPING: self._phase_plan,
+            JobState.PLAN_READY:    self._phase_await_approval,
             JobState.RUNNING:       self._phase_collect,
             JobState.COLLECTING:    self._phase_teardown,
             JobState.TEARDOWN:      self._phase_validate,
@@ -206,6 +242,19 @@ class Reconciler:
         unsupported = launch_models.unsupported_reason(spec.launch)
         if unsupported:
             raise ValueError(unsupported)
+        # _phase_plan (placement.resolve + launcher.for_plan, wired below) only
+        # targets the one-rank-per-node/per-container shape launcher: mpi gives
+        # it. launcher: single packs every rank into ONE container's own
+        # internal mpirun (see hpl.py) — nothing here compiles a plan for that.
+        # backend: k8s is further out still: the kubelet, not this cluster,
+        # owns in-pod CPU/GPU assignment. Both still refuse loudly rather than
+        # run the requested placement silently ignored.
+        if spec.launch is not None and spec.launcher != "mpi":
+            raise ValueError(
+                f"spec.launch was supplied with launcher={spec.launcher!r}, but this "
+                "backend only resolves launch plans for launcher: mpi today. Refusing "
+                "rather than running the benchmark with the requested placement "
+                "silently ignored.")
         # Claim BEFORE transitioning state: if the pool can't cover this job
         # (NoCapacity), the job must stay untouched in SUBMITTED so tick()'s
         # wait-and-retry path has something to retry — not a half-provisioned
@@ -252,13 +301,61 @@ class Reconciler:
         for nid in job.assigned_nodes:
             self.registry.advance(nid, NodeState.READY, "bootstrapped")
 
+    def _probe_topology(self, node: NodeRecord, job_id: str):
+        """Get one allocated node's topology and normalize it.
+
+        Delegates the actual probing to the node's OWN adapter
+        (adapter.probe_topology) — same reason run()/collect() do: there is no
+        separate executor abstraction here, reaching a node is always the
+        adapter's job, never reconciler.py reaching for ssh/subprocess itself.
+        This is what makes it fake-able in tests the same way run() already is.
+        """
+        raw = self._adapter_for(node).probe_topology(node, job_id)
+        return normalize_topology(raw, node.name)
+
+    def _phase_plan(self, job: JobRecord) -> None:
+        """Resolve spec.launch against the topology actually allocated.
+
+        OPT-IN ONLY: a job with no placement request, or on a launcher this
+        cluster does not resolve plans for yet (enforced earlier, in
+        _phase_provision), skips PLANNING/PLAN_READY entirely and runs exactly
+        the path it always did — _phase_run, unchanged. Only a launcher: mpi
+        job carrying a launch block takes the new states.
+        """
+        spec = JobSpec.from_dict(job.spec)
+        if spec.launch is None or spec.launcher != "mpi":
+            self._phase_run(job)
+            return
+        self._set_job(job, JobState.PLANNING, "resolving placement against allocated topology")
+        nodes = [self.store.get_node(nid) for nid in job.assigned_nodes]
+        topologies = [self._probe_topology(n, job.job_id) for n in nodes]
+        plan = placement.resolve(spec.launch, topologies)
+        job.plan = plan.to_dict()
+        # auto (the schema default) needs no human — the caller already
+        # reviewed the INTENT (invariant 3 in the contract); manual parks the
+        # RESOLVED PLAN for a human to look at before it runs (gtl plan-show).
+        approval = spec.launch.get("approval", "auto")
+        job.plan_status = "approved" if approval == "auto" else "ready"
+        self.store.put_job(job)
+        self._set_job(job, JobState.PLAN_READY,
+                      f"plan resolved ({len(plan.ranks)} rank(s)), plan_status={job.plan_status}")
+
+    def _phase_await_approval(self, job: JobRecord) -> None:
+        """PLAN_READY is a parking state, not a phase with its own work: the
+        resolve already happened in _phase_plan. This just re-checks
+        plan_status every tick without re-probing or re-resolving anything."""
+        if job.plan_status == "ready":
+            raise ApprovalPending(
+                f"job {job.job_id} plan is ready and awaiting `gtl approve`")
+        self._phase_run(job)
+
     def _phase_run(self, job: JobRecord) -> None:
         spec = JobSpec.from_dict(job.spec)
         self._set_job(job, JobState.RUNNING, f"running '{spec.image or 'dry-run'}'")
         nodes = [self.store.get_node(nid) for nid in job.assigned_nodes]
         for nid in job.assigned_nodes:
             self.registry.advance(nid, NodeState.BUSY, "job running")
-        result = self._adapter_for(nodes[0]).run(nodes, job.job_id, spec)
+        result = self._adapter_for(nodes[0]).run(nodes, job.job_id, spec, plan=job.plan)
         job.run = result.to_dict()
         self.store.put_job(job)
         # A non-zero container exit is a clean job failure (tick() catches it).
