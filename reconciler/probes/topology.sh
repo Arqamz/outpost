@@ -23,13 +23,24 @@ esc() { printf '%s' "${1:-}" | tr -d '\\"' | tr '\n' ' '; }
 jstr() { if [ -n "${1:-}" ]; then printf '"%s"' "$(esc "$1")"; else printf 'null'; fi; }
 jnum() { case "${1:-}" in ''|*[!0-9-]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
 
+# `nvidia-smi topo -m` wraps its header row in ANSI SGR codes (ESC [ 4 m ...
+# ESC [ 0 m) UNCONDITIONALLY, even when piped to a non-tty — verified on real
+# hardware. Left in, the raw ESC byte is invalid inside a JSON string (jblob's
+# own escaping below only covers \, ", tab, CR), and even escaped it would
+# leave "[4mGPU0" as the header cell text, which topology.py's column parser
+# does not recognise as a GPU/NIC row — so the CPU-affinity table would
+# silently parse as empty. Strip the whole escape sequence, not just the ESC
+# byte, before any of that.
+_esc_char="$(printf '\033')"
+
 # A multi-line blob as ONE JSON string: newlines escaped rather than flattened,
 # because the meaning of a topology matrix is in its rows.
 jblob() {
   if [ -z "${1:-}" ]; then printf 'null'; return; fi
   printf '"'
   printf '%s' "$1" \
-    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/    /g' -e 's/\r//g' \
+    | sed -e "s/${_esc_char}\\[[0-9;]*m//g" \
+          -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/    /g' -e 's/\r//g' \
     | awk 'NR>1{printf "\\n"} {printf "%s", $0}'
   printf '"'
 }

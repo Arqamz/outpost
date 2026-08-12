@@ -102,6 +102,17 @@ class TestTopoMatrix:
         assert parsed["GPU0"]["cpu_affinity"] == () and parsed["GPU0"]["numa"] is None
         assert parsed["GPU0"]["links"]["GPU1"] == "NV12"
 
+    def test_ansi_wrapped_header_still_parses(self):
+        # `nvidia-smi topo -m` wraps its header row in ANSI SGR codes
+        # unconditionally, even piped to a non-tty (verified on real hardware:
+        # `\x1b[4mGPU0\t...\x1b[0m`) — left in, the header cell reads
+        # "\x1b[4mGPU0" and the GPU/NIC check below fails to match it, so the
+        # whole table would silently parse as empty.
+        text = ("\t\x1b[4mGPU0\tCPU Affinity\tNUMA Affinity\x1b[0m\n"
+                "GPU0\t X \t0-3\t1\n")
+        assert parse_topo_matrix(text)["GPU0"] == {
+            "cpu_affinity": (0, 1, 2, 3), "numa": 1, "links": {"GPU0": "X"}}
+
     def test_legend_is_not_parsed_as_data(self):
         parsed = parse_topo_matrix(raw("2socket_8gpu")["topo_matrix"])
         assert not any(k.startswith("Legend") or k == "X" for k in parsed)

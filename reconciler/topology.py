@@ -28,6 +28,13 @@ _COLUMNS = re.compile(r"\s{2,}")
 # Link classes worth distinguishing: NV# is NVLink (count = bandwidth), PIX/PXB
 # stay on one PCIe host bridge, NODE/SYS cross one or more CPU sockets.
 _LINK = re.compile(r"^(NV\d+|PIX|PXB|NODE|SYS|X)$")
+# `nvidia-smi topo -m` wraps its header row in ANSI SGR codes unconditionally,
+# even piped to a non-tty (verified on real hardware). The probe already
+# strips these before they reach here, but a left-in "\x1b[4mGPU0" would not
+# match the GPU/NIC header check below and silently parse as an empty table —
+# hardening this function directly means it is correct on its own, not just
+# because of what currently calls it.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass(frozen=True)
@@ -144,6 +151,7 @@ def parse_topo_matrix(text: str | None) -> dict[str, dict]:
     """
     if not text:
         return {}
+    text = _ANSI.sub("", text)
     header: list[str] | None = None
     rows: dict[str, dict] = {}
     for raw_line in text.replace("\t", "    ").splitlines():
