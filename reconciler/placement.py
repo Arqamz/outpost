@@ -62,6 +62,31 @@ class LaunchPlan:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @staticmethod
+    def from_dict(d: dict) -> "LaunchPlan":
+        """The inverse of to_dict(), after a JSON round-trip (JobRecord.plan):
+        JSON has no tuple type, so every tuple field comes back as a list —
+        reconstruct RankPlacement/LaunchPlan's actual field types rather than
+        handing a launcher adapter tuples-shaped-like-lists and lists-shaped-
+        like-tuples, which would fail on the FIRST tuple-only operation
+        (hashing, `in` against a tuple literal) rather than obviously."""
+        ranks = tuple(
+            RankPlacement(
+                global_rank=r["global_rank"], local_rank=r["local_rank"], node=r["node"],
+                cpu_ids=tuple(r["cpu_ids"]),
+                cpu_slots=tuple(tuple(slot) for slot in r["cpu_slots"]),
+                numa_nodes=tuple(r["numa_nodes"]),
+                gpu_uuid=r["gpu_uuid"], gpu_pci_bus_id=r["gpu_pci_bus_id"],
+                visible_gpu_index=r["visible_gpu_index"],
+            )
+            for r in d["ranks"]
+        )
+        validation = dict(d["validation"])
+        if "warnings" in validation:
+            validation["warnings"] = tuple(validation["warnings"])
+        return LaunchPlan(plan_id=d["plan_id"], launcher=d["launcher"], ranks=ranks,
+                          validation=validation, digests=d["digests"])
+
 
 def _sorted_gpus(gpus: tuple[Gpu, ...], ordering: str) -> list[Gpu]:
     """Deterministic device order, so a rank's visible device is reproducible

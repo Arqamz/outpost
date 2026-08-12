@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from conftest import REPO_DIR
 
-from reconciler.placement import RESOLVER_VERSION, PlacementError, resolve
+from reconciler.placement import RESOLVER_VERSION, LaunchPlan, PlacementError, resolve
 from reconciler.topology import normalize
 
 FIXTURES = Path(REPO_DIR) / "tests" / "fixtures"
@@ -348,3 +348,23 @@ class TestGlobalConsistency:
         clone_a, clone_b = normalize(doc, "a"), normalize(doc, "b")
         with pytest.raises(PlacementError, match="assigned to both rank"):
             resolve(intent(cpu={"cores_per_rank": 2}), [clone_a, clone_b])
+
+
+class TestSerialization:
+    def test_from_dict_survives_a_json_round_trip(self):
+        # job.plan is stored as JSON (FileStore/Mongo): every tuple field comes
+        # back as a list. from_dict must reconstruct the ACTUAL field types
+        # (RankPlacement.cpu_ids etc. as tuples), not hand a launcher adapter
+        # list-shaped-like-tuples — the exact bug this guards.
+        plan = resolve(intent(), [topo("2socket_8gpu")])
+
+        # json.dumps/loads is the FileStore's exact round trip (store.py).
+        roundtripped = json.loads(json.dumps(plan.to_dict()))
+        rebuilt = LaunchPlan.from_dict(roundtripped)
+
+        assert rebuilt == plan
+        for rank in rebuilt.ranks:
+            assert isinstance(rank.cpu_ids, tuple)
+            assert isinstance(rank.cpu_slots, tuple)
+            assert all(isinstance(slot, tuple) for slot in rank.cpu_slots)
+            assert isinstance(rank.numa_nodes, tuple)
