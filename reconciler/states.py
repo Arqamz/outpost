@@ -11,6 +11,13 @@ class JobState(str, Enum):
     SUBMITTED = "submitted"
     PROVISIONING = "provisioning"
     BOOTSTRAPPING = "bootstrapping"
+    # Resolve spec.launch against the topology actually allocated. OPT-IN ONLY:
+    # a job with no placement request, or on a launcher this cluster does not
+    # resolve plans for, skips both states entirely (BOOTSTRAPPING -> RUNNING
+    # directly, see JOB_TRANSITIONS) — its audit trail and phase calls stay
+    # byte-for-byte what they were before these states existed.
+    PLANNING = "planning"
+    PLAN_READY = "plan_ready"
     RUNNING = "running"
     COLLECTING = "collecting"
     TEARDOWN = "teardown"
@@ -41,7 +48,16 @@ JOB_TRANSITIONS: dict[JobState, set[JobState]] = {
     # claiming a node, so it can fail straight out of SUBMITTED.
     JobState.SUBMITTED:     {JobState.PROVISIONING, JobState.FAILED, JobState.CANCELLED},
     JobState.PROVISIONING:  {JobState.BOOTSTRAPPING, JobState.FAILED, JobState.CANCELLED},
-    JobState.BOOTSTRAPPING: {JobState.RUNNING, JobState.FAILED, JobState.CANCELLED},
+    # RUNNING is a direct, legal edge here too: a job with no spec.launch (or
+    # on a launcher planning does not cover) skips PLANNING/PLAN_READY
+    # entirely — see reconciler.py:_phase_plan. PLANNING is the edge a job
+    # with a real placement request takes instead.
+    JobState.BOOTSTRAPPING: {JobState.PLANNING, JobState.RUNNING,
+                             JobState.FAILED, JobState.CANCELLED},
+    JobState.PLANNING:      {JobState.PLAN_READY, JobState.FAILED, JobState.CANCELLED},
+    # A resolved-but-unapproved plan waits here (gtl approve / manual gate);
+    # FAILED covers both a placement error and an approval-wait timeout.
+    JobState.PLAN_READY:    {JobState.RUNNING, JobState.FAILED, JobState.CANCELLED},
     JobState.RUNNING:       {JobState.COLLECTING, JobState.FAILED, JobState.CANCELLED},
     JobState.COLLECTING:    {JobState.TEARDOWN, JobState.FAILED, JobState.CANCELLED},
     JobState.TEARDOWN:      {JobState.VALIDATING, JobState.FAILED},
@@ -56,7 +72,9 @@ JOB_TRANSITIONS: dict[JobState, set[JobState]] = {
 JOB_NEXT: dict[JobState, JobState] = {
     JobState.SUBMITTED:     JobState.PROVISIONING,
     JobState.PROVISIONING:  JobState.BOOTSTRAPPING,
-    JobState.BOOTSTRAPPING: JobState.RUNNING,
+    JobState.BOOTSTRAPPING: JobState.PLANNING,
+    JobState.PLANNING:      JobState.PLAN_READY,
+    JobState.PLAN_READY:    JobState.RUNNING,
     JobState.RUNNING:       JobState.COLLECTING,
     JobState.COLLECTING:    JobState.TEARDOWN,
     JobState.TEARDOWN:      JobState.VALIDATING,
