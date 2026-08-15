@@ -105,17 +105,30 @@ def ssh_keepalive_opts() -> list[str]:
             "-o", f"ServerAliveCountMax={SSH_ALIVE_COUNT}",
             "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}"]
 
-# ── Kubernetes (KAI + HAMi) backend params ──────────────────────────────────
-# The whole cluster + KAI + HAMi are stood up out of band by infra/k8s/setup.sh;
-# the adapter only templates kubectl against it. All env-overridable so a
-# differently-installed cluster (other queue, other CRD version) needs no code
-# change. Defaults verified live against the `outpost` kind cluster 2026-07-30.
+# ── Kubernetes backend params ────────────────────────────────────────────────
+# Two GPU modes, selected by CLUSTER_K8S_GPU_MODE (or a job's own
+# spec.params["gpu_mode"], which wins per-job):
+#   "shared" (default — today's exact behaviour, byte-for-byte unchanged): one
+#     physical GPU sliced across N ranks. KAI schedules the gang (explicit
+#     PodGroup) and HAMi-core hard-caps each rank's VRAM via the `gpu-memory`
+#     annotation. Stood up out of band by infra/k8s/setup.sh (KinD dev box).
+#   "dedicated": a real multi-node cluster where every rank gets its own whole
+#     GPU via a plain `nvidia.com/gpu` resource request — no VRAM slicing, no
+#     gang scheduler, no KAI/HAMi at all. Stood up out of band by
+#     infra/k8s/setup-kubeadm.sh (real kubeadm cluster, nvidia-device-plugin).
+# All env-overridable so a differently-installed cluster (other queue, other
+# CRD version) needs no code change. "shared" defaults verified live against
+# the `outpost` kind cluster 2026-07-30.
+K8S_GPU_MODE = os.environ.get("CLUSTER_K8S_GPU_MODE", "shared")           # shared | dedicated
 K8S_NAMESPACE_PREFIX = os.environ.get("CLUSTER_K8S_NS_PREFIX", "outpost-")
 K8S_PODGROUP_APIVERSION = os.environ.get("CLUSTER_K8S_PODGROUP_APIVERSION",
                                          "scheduling.run.ai/v2alpha2")
-K8S_QUEUE = os.environ.get("CLUSTER_K8S_QUEUE", "default-queue")          # KAI queue
-K8S_GPU_MEMORY_MB = int(os.environ.get("CLUSTER_K8S_GPU_MEMORY_MB", "2048"))  # HAMi cap/rank
-K8S_SCHEDULER = os.environ.get("CLUSTER_K8S_SCHEDULER", "kai-scheduler")
+K8S_QUEUE = os.environ.get("CLUSTER_K8S_QUEUE", "default-queue")          # KAI queue ("shared" mode)
+K8S_GPU_MEMORY_MB = int(os.environ.get("CLUSTER_K8S_GPU_MEMORY_MB", "2048"))  # HAMi cap/rank ("shared" mode)
+K8S_SCHEDULER = os.environ.get("CLUSTER_K8S_SCHEDULER", "kai-scheduler")  # ("shared" mode)
+K8S_GPU_COUNT = int(os.environ.get("CLUSTER_K8S_GPU_COUNT", "1"))         # nvidia.com/gpu per rank ("dedicated" mode)
+K8S_DEVICE_PLUGIN_NAMESPACE = os.environ.get("CLUSTER_K8S_DEVICE_PLUGIN_NS",
+                                             "nvidia-device-plugin")      # ("dedicated" mode)
 K8S_CONTEXT = os.environ.get("CLUSTER_K8S_CONTEXT", "")                   # kubectl --context
 K8S_RUN_TIMEOUT_S = float(os.environ.get("CLUSTER_K8S_RUN_TIMEOUT", "1800"))
 K8S_POLL_INTERVAL_S = float(os.environ.get("CLUSTER_K8S_POLL_INTERVAL", "5"))
@@ -1286,32 +1299,54 @@ class StaticSshAdapter(LibvirtAdapter):
 
 
 class KubernetesAdapter(ProviderAdapter):
-    """A whole Kubernetes cluster (KAI scheduler + HAMi-core isolation) as a
-    backend. Unlike every other adapter, a k8s registry "node" is a SLOT, not a
-    machine: the cluster schedules its own pods, so the registry models the
-    cluster as a small pool of interchangeable slots and each job claims one.
-    The N-way parallelism a job asks for (spec.node_count) is realized INSIDE
-    run() as a GANG of N pods sharing the one physical GPU — KAI co-schedules
-    them (an explicit PodGroup, minMember=N) and HAMi-core hard-caps each rank's
-    VRAM via the `gpu-memory` annotation. This is the "multi-GPU on one GPU"
-    simulator; faithful for topology/scheduling/init, not for throughput (the
-    ranks time-slice one SM array). See docs/08-kubernetes-backend.md.
+    """A whole Kubernetes cluster as a backend, in one of two GPU modes
+    (K8S_GPU_MODE / CLUSTER_K8S_GPU_MODE, "shared" default). Unlike every other
+    adapter, a k8s registry "node" is a SLOT, not a machine: the cluster
+    schedules its own pods, so the registry models the cluster as a small pool
+    of interchangeable slots and each job claims one. The N-way parallelism a
+    job asks for (spec.node_count) is realized INSIDE run() as a GANG of N pods.
 
-    Nothing here installs anything (golden rule): the cluster + KAI + HAMi are
-    stood up out of band by infra/k8s/setup.sh. provision/bootstrap only VERIFY
-    the pieces exist and fail closed with a pointer if not. run() renders a
-    Namespace + PodGroup + N Pods and applies them; collect() ships each rank's
-    logs to the drop-zone; deprovision() deletes the job's namespace (leaving
-    the cluster standing, exactly like LocalHost/StaticSsh leave their machine).
+    **"shared" mode** (today's original design, unchanged): N ranks share ONE
+    physical GPU — KAI co-schedules them (an explicit PodGroup, minMember=N)
+    and HAMi-core hard-caps each rank's VRAM via the `gpu-memory` annotation.
+    This is the "multi-GPU on one GPU" simulator; faithful for
+    topology/scheduling/init, not for throughput (the ranks time-slice one SM
+    array). Stood up out of band by infra/k8s/setup.sh (KinD dev box).
 
-    The manifest shape was verified live before this landed: a pre-created
-    PodGroup + pods carrying the `pod-group-name` annotation bind to that gang
-    (KAI's auto-grouper does NOT create per-pod groups instead), and HAMi injects
-    CUDA_DEVICE_MEMORY_LIMIT per rank."""
+    **"dedicated" mode**: a real multi-node cluster where every rank lands on
+    its own real GPU via a plain `nvidia.com/gpu` resource request — no VRAM
+    slicing, no gang scheduler, no KAI/HAMi at all. Stood up out of band by
+    infra/k8s/setup-kubeadm.sh (real kubeadm cluster + nvidia-device-plugin).
+
+    See docs/08-kubernetes-backend.md for both. Nothing here installs anything
+    (golden rule) in either mode: the cluster (+ KAI/HAMi, or + the device
+    plugin) is stood up out of band. provision/bootstrap only VERIFY the
+    pieces exist and fail closed with a pointer if not. run() renders a
+    Namespace + (PodGroup, "shared" only) + N Pods and applies them;
+    collect() ships each rank's logs to the drop-zone; deprovision() deletes
+    the job's namespace (leaving the cluster standing, exactly like
+    LocalHost/StaticSsh leave their machine).
+
+    The "shared"-mode manifest shape was verified live before it landed: a
+    pre-created PodGroup + pods carrying the `pod-group-name` annotation bind
+    to that gang (KAI's auto-grouper does NOT create per-pod groups instead),
+    and HAMi injects CUDA_DEVICE_MEMORY_LIMIT per rank."""
     name = "k8s"
 
     def __init__(self, log=_log_stderr):
         self.log = log
+
+    @staticmethod
+    def _gpu_mode(spec: JobSpec | None = None) -> str:
+        """"shared" or "dedicated". A job may override the cluster-wide
+        CLUSTER_K8S_GPU_MODE via spec.params["gpu_mode"] — but only where a
+        JobSpec is actually in hand (run()/_render_manifests()); provision()/
+        bootstrap() run before a spec is claimed against a specific node and
+        always check against the cluster-wide default, matching whatever the
+        operator stood up out of band."""
+        if spec is not None:
+            return str(spec.params.get("gpu_mode", K8S_GPU_MODE))
+        return K8S_GPU_MODE
 
     # ── kubectl plumbing ─────────────────────────────────────────────────
     @staticmethod
@@ -1355,26 +1390,38 @@ class KubernetesAdapter(ProviderAdapter):
     # ── node lifecycle (verify only; the cluster is managed out of band) ──
     def provision(self, node, job_id):
         ctx = self._context_of(node)
-        self.log(f"[k8s] verifying cluster reachable + KAI up (slot {node.name}"
-                 f"{f', context {ctx}' if ctx else ''})")
+        mode = self._gpu_mode()
+        self.log(f"[k8s] verifying cluster reachable + {mode}-mode prerequisites up "
+                 f"(slot {node.name}{f', context {ctx}' if ctx else ''})")
         if self._kubectl(["get", "nodes"], job_id, context=ctx, check=False) != 0:
+            setup = "infra/k8s/setup.sh" if mode == "shared" else "infra/k8s/setup-kubeadm.sh"
             raise RuntimeError(
                 f"k8s cluster unreachable (`kubectl {f'--context {ctx} ' if ctx else ''}get nodes` "
-                "failed). Stand it up first with infra/k8s/setup.sh, and set the slot's "
+                f"failed). Stand it up first with {setup}, and set the slot's "
                 "kube_context / CLUSTER_K8S_CONTEXT / KUBECONFIG if it isn't your current "
                 "kube-context.")
-        rc, out = self._kubectl_out(["get", "pods", "-n", "kai-scheduler",
-                                     "--field-selector=status.phase=Running", "-o", "name"],
-                                    context=ctx)
-        if rc != 0 or not out.strip():
-            raise RuntimeError(
-                "KAI scheduler is not Running in namespace 'kai-scheduler' — run "
-                "infra/k8s/setup.sh (installs KAI + the HAMi-core isolator).")
+        if mode == "shared":
+            rc, out = self._kubectl_out(["get", "pods", "-n", "kai-scheduler",
+                                         "--field-selector=status.phase=Running", "-o", "name"],
+                                        context=ctx)
+            if rc != 0 or not out.strip():
+                raise RuntimeError(
+                    "KAI scheduler is not Running in namespace 'kai-scheduler' — run "
+                    "infra/k8s/setup.sh (installs KAI + the HAMi-core isolator).")
+        else:
+            rc, out = self._kubectl_out(["get", "nodes", "-o",
+                "jsonpath={range .items[*]}{.status.allocatable.nvidia\\.com/gpu};{end}"],
+                context=ctx)
+            if rc != 0 or not any(v.strip() not in ("", "0") for v in out.split(";")):
+                raise RuntimeError(
+                    "no node advertises an allocatable 'nvidia.com/gpu' — run "
+                    "infra/k8s/setup-kubeadm.sh (installs the nvidia-device-plugin) and confirm "
+                    "the driver + container toolkit are present on the GPU workers.")
 
     def deprovision(self, node, job_id):
         ctx = self._context_of(node)
         ns = self._namespace(job_id)
-        self.log(f"[k8s] deleting namespace {ns} (cascades pods + PodGroup); cluster left standing")
+        self.log(f"[k8s] deleting namespace {ns} (cascades its pods/PodGroup); cluster left standing")
         # --wait=false: teardown shouldn't block the tick on namespace GC; a
         # lingering terminating namespace doesn't affect a later job (each job
         # gets its own uniquely-named namespace).
@@ -1383,9 +1430,21 @@ class KubernetesAdapter(ProviderAdapter):
 
     def bootstrap(self, nodes, job_id):
         # Verify the scheduling prerequisites exist. Installs NOTHING (golden
-        # rule) — setup.sh owns the install; a missing piece is a clear failure
-        # here, not a mysterious pod-never-schedules later.
+        # rule) — setup.sh/setup-kubeadm.sh owns the install; a missing piece
+        # is a clear failure here, not a mysterious pod-never-schedules later.
         ctx = self._context_of(nodes[0])
+        mode = self._gpu_mode()
+        if mode != "shared":
+            self.log(f"[k8s] verifying dedicated-GPU scheduling prerequisites"
+                     f"{f' (context {ctx})' if ctx else ''}")
+            rc, out = self._kubectl_out(["get", "pods", "-n", K8S_DEVICE_PLUGIN_NAMESPACE,
+                                         "--field-selector=status.phase=Running", "-o", "name"],
+                                        context=ctx)
+            if rc != 0 or not out.strip():
+                raise RuntimeError(
+                    f"nvidia-device-plugin is not Running in namespace "
+                    f"{K8S_DEVICE_PLUGIN_NAMESPACE!r} — run infra/k8s/setup-kubeadm.sh.")
+            return
         self.log(f"[k8s] verifying scheduling prerequisites (queue={K8S_QUEUE}"
                  f"{f', context {ctx}' if ctx else ''})")
         for args, what in (
@@ -1409,18 +1468,25 @@ class KubernetesAdapter(ProviderAdapter):
             return RunResult(job_id, slot.name, None, workdir, note="no image -> dry-run")
         n = max(1, spec.node_count)                    # node_count == gang size here
         ns = self._namespace(job_id)
+        mode = self._gpu_mode(spec)
         manifest = self._render_manifests(job_id, spec, n)
         manifest_path = os.path.join(workdir, "manifests.yaml")
         with open(manifest_path, "w") as f:
             f.write(manifest)
-        declared_gpu_mem = spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB)
-        self.log(f"[k8s] applying gang: ns={ns} minMember={n} image={self._image_ref(spec.image)} "
-                 f"gpu-memory={declared_gpu_mem}MiB/rank queue={spec.params.get('queue', K8S_QUEUE)}"
-                 f"{f' context={ctx}' if ctx else ''}")
+        if mode == "shared":
+            declared_gpu_mem = spec.params.get("gpu_memory_mb", K8S_GPU_MEMORY_MB)
+            self.log(f"[k8s] applying gang: ns={ns} minMember={n} image={self._image_ref(spec.image)} "
+                     f"gpu-memory={declared_gpu_mem}MiB/rank queue={spec.params.get('queue', K8S_QUEUE)}"
+                     f"{f' context={ctx}' if ctx else ''}")
+        else:
+            gpu_count = spec.params.get("gpu_count", K8S_GPU_COUNT)
+            self.log(f"[k8s] applying dedicated-GPU gang: ns={ns} pods={n} "
+                     f"image={self._image_ref(spec.image)} nvidia.com/gpu={gpu_count}/pod"
+                     f"{f' context={ctx}' if ctx else ''}")
         self._kubectl(["apply", "-f", manifest_path], job_id, context=ctx)
         rc = self._await_gang(ns, n, job_id, ctx)
         stdout_path = self._capture_logs(ns, n, job_id, workdir, ctx)
-        if spec.params.get("verify_gpu_memory"):
+        if mode == "shared" and spec.params.get("verify_gpu_memory"):
             self._build_gpu_memory_receipt(workdir, n, spec)
         return RunResult(job_id, slot.name, rc, workdir, stdout_path,
                          note=f"k8s gang np={n} (ns {ns}) exit={rc}")
@@ -1441,37 +1507,39 @@ class KubernetesAdapter(ProviderAdapter):
         return str(declared)
 
     def _render_manifests(self, job_id: str, spec: JobSpec, n: int) -> str:
-        """Render the Namespace + headless Service + PodGroup + N Pod docs for one
-        gang. Pure (no cluster calls) so it's unit-testable. Pods ask for a GPU
-        *fraction* via the `gpu-memory` annotation (NOT an `nvidia.com/gpu`
-        resource request, which would consume the whole card), attach to the
-        explicit PodGroup via `pod-group-name`, and are placed by KAI
-        (`schedulerName`). Each pod gets a stable DNS name via the headless
-        Service (`hostname`/`subdomain`) and the standard distributed-rendezvous
-        env (RANK, WORLD_SIZE, MASTER_ADDR=rank-0's FQDN, MASTER_PORT), so a real
-        multi-rank workload (torchrun / c10d / NCCL-over-TCP / MPI-over-TCP) can
-        form a communicator across the gang — not just N independent pods.
+        """Render the Namespace + headless Service + (PodGroup, "shared" mode
+        only) + N Pod docs for one gang. Pure (no cluster calls) so it's
+        unit-testable. Both modes share the Namespace, headless Service, and
+        distributed-rendezvous env (RANK, WORLD_SIZE, MASTER_ADDR=rank-0's
+        FQDN, MASTER_PORT), so a real multi-rank workload (torchrun / c10d /
+        NCCL-over-TCP / MPI-over-TCP) can form a communicator across the gang
+        in either mode — not just N independent pods.
 
-        `spec.params.verify_gpu_memory` (opt-in, default unset): prepends
-        gpu-memory-probe.sh to each pod's command so the VRAM cap HAMi's
-        isolator actually enforced is observable from inside the container.
-        The pod spec (post-mutation) DOES reference it (`envFrom` a generated
-        ConfigMap), but the resolved value — and whether libvgpu.so actually
-        intercepted THIS process's CUDA calls with it — is only knowable from
-        inside the running container (see the probe's own docstring).
-        Requires `spec.command` to be set: there is nothing to prepend a
-        probe onto an image's own entrypoint without overriding it."""
+        **"shared" mode** (spec.params["gpu_mode"], default): pods ask for a
+        GPU *fraction* via the `gpu-memory` annotation (NOT an `nvidia.com/gpu`
+        resource request, which would consume the whole card), attach to an
+        explicit PodGroup via `pod-group-name`, and are placed by KAI
+        (`schedulerName`). `spec.params.verify_gpu_memory` (opt-in, default
+        unset): prepends gpu-memory-probe.sh to each pod's command so the VRAM
+        cap HAMi's isolator actually enforced is observable from inside the
+        container. The pod spec (post-mutation) DOES reference it (`envFrom`
+        a generated ConfigMap), but the resolved value — and whether
+        libvgpu.so actually intercepted THIS process's CUDA calls with it — is
+        only knowable from inside the running container (see the probe's own
+        docstring). Requires `spec.command` to be set: there is nothing to
+        prepend a probe onto an image's own entrypoint without overriding it.
+
+        **"dedicated" mode**: no PodGroup, no KAI/HAMi annotations/label/
+        schedulerName — each pod requests a whole real GPU via a plain
+        `resources.requests/limits["nvidia.com/gpu"]` count
+        (`spec.params["gpu_count"]`, default K8S_GPU_COUNT), scheduled by the
+        cluster's default scheduler + the nvidia-device-plugin."""
         import yaml
         ns = self._namespace(job_id)
         image = self._image_ref(spec.image)
-        pg_name = f"pg-{job_id}"
-        queue = str(spec.params.get("queue", K8S_QUEUE))
+        mode = self._gpu_mode(spec)
         master_port = str(spec.params.get("master_port", K8S_MASTER_PORT))
         master_addr = f"rank-0.{K8S_RDZV_SERVICE}.{ns}.svc.cluster.local"
-        verify_gpu_memory = bool(spec.params.get("verify_gpu_memory"))
-        if verify_gpu_memory and not spec.command:
-            raise ValueError("verify_gpu_memory needs spec.command set — there is no "
-                             "entrypoint to prepend the probe onto otherwise")
         docs: list[dict] = [
             {"apiVersion": "v1", "kind": "Namespace",
              "metadata": {"name": ns, "labels": {"outpost-job": job_id}}},
@@ -1483,40 +1551,56 @@ class KubernetesAdapter(ProviderAdapter):
              "spec": {"clusterIP": "None", "publishNotReadyAddresses": True,
                       "selector": {"outpost-job": job_id},
                       "ports": [{"name": "rdzv", "port": int(master_port)}]}},
-            {"apiVersion": K8S_PODGROUP_APIVERSION, "kind": "PodGroup",
-             "metadata": {"name": pg_name, "namespace": ns},
-             "spec": {"minMember": n, "queue": queue}},
         ]
+
+        if mode == "shared":
+            pg_name = f"pg-{job_id}"
+            queue = str(spec.params.get("queue", K8S_QUEUE))
+            verify_gpu_memory = bool(spec.params.get("verify_gpu_memory"))
+            if verify_gpu_memory and not spec.command:
+                raise ValueError("verify_gpu_memory needs spec.command set — there is no "
+                                 "entrypoint to prepend the probe onto otherwise")
+            docs.append({"apiVersion": K8S_PODGROUP_APIVERSION, "kind": "PodGroup",
+                        "metadata": {"name": pg_name, "namespace": ns},
+                        "spec": {"minMember": n, "queue": queue}})
+        else:
+            gpu_count = str(spec.params.get("gpu_count", K8S_GPU_COUNT))
+
         for i in range(n):
             # order: sane defaults, then rendezvous, then the job's own env last
             # so a spec can override any of them.
-            merged = {**K8S_DEFAULT_ENV,
+            default_env = K8S_DEFAULT_ENV if mode == "shared" else {}
+            merged = {**default_env,
                       "RANK": str(i), "WORLD_SIZE": str(n),
                       "MASTER_ADDR": master_addr, "MASTER_PORT": master_port,
                       **spec.env}
             env = [{"name": k, "value": v} for k, v in merged.items()]
             container: dict = {"name": "rank", "image": image,
                                "imagePullPolicy": "IfNotPresent", "env": env}
+            if mode == "dedicated":
+                container["resources"] = {"requests": {"nvidia.com/gpu": gpu_count},
+                                          "limits": {"nvidia.com/gpu": gpu_count}}
             if spec.command:                            # else use the image entrypoint
                 command = list(spec.command)
-                if verify_gpu_memory:
+                if mode == "shared" and verify_gpu_memory:
                     probe = GPU_MEMORY_PROBE_PATH.read_text()
                     inner = " ".join(shlex.quote(a) for a in command)
                     command = ["sh", "-c", f"({probe}) 2>&1; exec {inner}"]
                 container["command"] = command
-            docs.append({
-                "apiVersion": "v1", "kind": "Pod",
-                "metadata": {
-                    "name": f"rank-{i}", "namespace": ns,
-                    "labels": {"kai.scheduler/queue": queue,
-                               "outpost-job": job_id, "outpost-rank": str(i)},
-                    "annotations": {"pod-group-name": pg_name,
-                                   "gpu-memory": self._gpu_mem_for_rank(spec, i, n)},
-                },
-                "spec": {"schedulerName": K8S_SCHEDULER, "restartPolicy": "Never",
-                         "hostname": f"rank-{i}", "subdomain": K8S_RDZV_SERVICE,
-                         "containers": [container]},
-            })
+            metadata = {
+                "name": f"rank-{i}", "namespace": ns,
+                "labels": {"outpost-job": job_id, "outpost-rank": str(i)},
+            }
+            pod_spec: dict = {"restartPolicy": "Never",
+                              "hostname": f"rank-{i}", "subdomain": K8S_RDZV_SERVICE,
+                              "containers": [container]}
+            if mode == "shared":
+                metadata["labels"]["kai.scheduler/queue"] = queue
+                metadata["annotations"] = {"pod-group-name": pg_name,
+                                          "gpu-memory": self._gpu_mem_for_rank(spec, i, n)}
+                pod_spec["schedulerName"] = K8S_SCHEDULER
+            docs.append({"apiVersion": "v1", "kind": "Pod",
+                        "metadata": metadata, "spec": pod_spec})
         return yaml.safe_dump_all(docs, default_flow_style=False, sort_keys=False)
 
     def _await_gang(self, ns: str, n: int, job_id: str, context: str = "") -> int:
