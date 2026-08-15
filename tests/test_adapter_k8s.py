@@ -154,3 +154,69 @@ class TestGpuMemoryProbeScript:
     def test_absent_is_null_not_a_guess(self):
         doc = self._run({"RANK": "0"})
         assert doc["cuda_device_memory_limit_mb"] is None
+
+
+class TestRenderManifestsDedicatedGpuMode:
+    """gpu_mode="dedicated": real per-node GPUs via a plain nvidia.com/gpu
+    resource request, no KAI/HAMi at all. The "shared" default (every existing
+    test above) must keep working byte-for-byte — this class only covers the
+    new opt-in branch."""
+
+    def test_no_podgroup_doc_is_rendered(self, adapter):
+        s = spec(params={"gpu_mode": "dedicated"})
+        docs = list(yaml.safe_load_all(adapter._render_manifests("job-x", s, 2)))
+        assert not any(d and d.get("kind") == "PodGroup" for d in docs)
+
+    def test_no_kai_hami_fields_on_the_pod(self, adapter):
+        s = spec(params={"gpu_mode": "dedicated"})
+        pods = pods_from(adapter._render_manifests("job-x", s, 1))
+        pod = pods[0]
+        assert "annotations" not in pod["metadata"]
+        assert "kai.scheduler/queue" not in pod["metadata"]["labels"]
+        assert "schedulerName" not in pod["spec"]
+
+    def test_default_gpu_count_is_one(self, adapter):
+        from reconciler.adapter import K8S_GPU_COUNT
+        s = spec(params={"gpu_mode": "dedicated"})
+        pods = pods_from(adapter._render_manifests("job-x", s, 1))
+        resources = pods[0]["spec"]["containers"][0]["resources"]
+        assert resources["requests"]["nvidia.com/gpu"] == str(K8S_GPU_COUNT)
+        assert resources["limits"]["nvidia.com/gpu"] == str(K8S_GPU_COUNT)
+
+    def test_gpu_count_override_applies_to_every_rank(self, adapter):
+        s = spec(params={"gpu_mode": "dedicated", "gpu_count": 4})
+        pods = pods_from(adapter._render_manifests("job-x", s, 2))
+        for pod in pods:
+            resources = pod["spec"]["containers"][0]["resources"]
+            assert resources["requests"]["nvidia.com/gpu"] == "4"
+            assert resources["limits"]["nvidia.com/gpu"] == "4"
+
+    def test_no_nccl_p2p_disable_default(self, adapter):
+        # "shared" mode disables NCCL P2P by default (ranks time-slice one
+        # physical GPU) - meaningless with real distinct per-node GPUs, so
+        # dedicated mode must not carry that default forward.
+        s = spec(params={"gpu_mode": "dedicated"})
+        pods = pods_from(adapter._render_manifests("job-x", s, 1))
+        env_names = {e["name"] for e in pods[0]["spec"]["containers"][0]["env"]}
+        assert "NCCL_P2P_DISABLE" not in env_names
+
+    def test_rendezvous_env_still_present(self, adapter):
+        # The genuinely backend-agnostic mechanism (headless Service +
+        # RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT) must survive in this mode too.
+        s = spec(params={"gpu_mode": "dedicated"})
+        docs = list(yaml.safe_load_all(adapter._render_manifests("job-x", s, 2)))
+        assert any(d and d.get("kind") == "Service" for d in docs)
+        pods = pods_from(adapter._render_manifests("job-x", s, 2))
+        env0 = {e["name"]: e["value"] for e in pods[0]["spec"]["containers"][0]["env"]}
+        assert env0["RANK"] == "0"
+        assert env0["WORLD_SIZE"] == "2"
+        assert env0["MASTER_ADDR"].startswith("rank-0.")
+
+    def test_shared_mode_is_unaffected_by_the_new_branch(self, adapter):
+        # Regression guard: gpu_mode unset (or explicitly "shared") must still
+        # render the exact original shape.
+        s = spec(params={"gpu_memory_mb": [1024, 2048]})
+        pods = pods_from(adapter._render_manifests("job-x", s, 2))
+        assert pods[0]["metadata"]["annotations"]["gpu-memory"] == "1024"
+        assert pods[0]["spec"]["schedulerName"] == "kai-scheduler"
+        assert "resources" not in pods[0]["spec"]["containers"][0]
