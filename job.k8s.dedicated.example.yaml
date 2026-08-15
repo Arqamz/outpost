@@ -1,0 +1,24 @@
+# A k8s-backend job using gpu_mode: dedicated — a real multi-node cluster
+# where every rank gets its own WHOLE GPU via a plain nvidia.com/gpu resource
+# request, scheduled by the cluster's default scheduler + nvidia-device-plugin.
+# No KAI, no HAMi, no VRAM slicing, no PodGroup.
+#
+# node_count here is the number of pods (ranks); each lands on its own real
+# GPU node. Contrast with job.k8s.small.example.yaml (gpu_mode: shared,
+# the default), where node_count ranks time-slice ONE physical GPU.
+#
+# Prereqs: infra/k8s/setup-kubeadm.sh against a real kubeadm cluster (control
+# plane + GPU workers already joined), then CLUSTER_K8S_BACKEND=1 seed.
+# Submit with: bin/cluster submit --spec job.k8s.dedicated.example.yaml
+
+name: k8s-gpu-dedicated-small
+backend: k8s
+image: "ubuntu:24.04"
+command: ["bash", "-c", "echo rank=$RANK/$WORLD_SIZE; nvidia-smi -L"]
+node_count: 2
+gpu: true
+output_dir: "/out"
+
+params:
+  gpu_mode: dedicated     # opt in to the plain nvidia.com/gpu path
+  gpu_count: 1            # whole GPUs requested per rank (resources.requests/limits)
