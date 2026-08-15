@@ -15,9 +15,12 @@ just the `cluster` CLI in this repo (a local test client of that same
 interface, nothing more).
 
 Apptainer on VMs/host is the primary execution backend. A second, optional
-backend exists: `backend: k8s` routes a job onto a **KAI + HAMi Kubernetes
-cluster** (KinD) — same JobSpec in, same drop-zone out, but the job is scheduled
-by KAI as a gang of N pods sharing the one GPU (HAMi-capped per rank). Off by
+backend exists: `backend: k8s` routes a job onto a Kubernetes cluster — same
+JobSpec in, same drop-zone out — in one of two GPU modes
+(`CLUSTER_K8S_GPU_MODE`, default `shared`): **shared** (KinD dev box) schedules
+a gang of N pods sharing the one GPU via **KAI + HAMi** (HAMi-capped VRAM per
+rank); **dedicated** (a real multi-node cluster) gives every rank its own
+whole GPU via a plain `nvidia.com/gpu` request, no KAI/HAMi involved. Off by
 default; see `docs/08-kubernetes-backend.md`. Slinky/Slurm is still planned.
 
 Runs on any Linux host with libvirt/KVM (`/dev/kvm`, nested/hardware
