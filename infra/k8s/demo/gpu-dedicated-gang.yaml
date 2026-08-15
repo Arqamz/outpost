@@ -1,0 +1,41 @@
+# Real hardware, real GPUs: N pods, each requesting one WHOLE physical GPU via
+# resources.requests/limits["nvidia.com/gpu"] on a real multi-node kubeadm
+# cluster. Contrast with gpu-share-gang.yaml, which fractional-shares ONE GPU
+# across replicas via KAI+HAMi annotations on a KinD dev box.
+#
+# How this differs from the shared-mode demo:
+#   - no schedulerName override -> the cluster's default scheduler places pods
+#   - no gpu-memory / kai.scheduler/queue annotation-label -> no VRAM slicing
+#   - resources.requests/limits["nvidia.com/gpu"]: "1" -> the standard k8s
+#       device-plugin resource request; the scheduler only places a pod on a
+#       node with an unclaimed GPU, and each pod gets exclusive access to it
+#
+#   kubectl apply -f gpu-dedicated-gang.yaml
+#   kubectl get pods -l app=gpu-dedicated -o wide   # spread across distinct GPU nodes
+#   kubectl logs gpu-dedicated-0                    # nvidia-smi shows ITS OWN card
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-dedicated
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: gpu-dedicated}
+  template:
+    metadata:
+      labels:
+        app: gpu-dedicated
+    spec:
+      containers:
+        - name: probe
+          image: ubuntu:24.04          # nvidia-smi is injected by the runtime
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "-c"]
+          args:
+            - |
+              echo "rank=$HOSTNAME"
+              nvidia-smi -L
+              sleep 600
+          resources:
+            requests: {"nvidia.com/gpu": "1"}
+            limits: {"nvidia.com/gpu": "1"}
