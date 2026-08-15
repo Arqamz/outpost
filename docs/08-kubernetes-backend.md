@@ -1,11 +1,16 @@
-# 8 · Kubernetes backend — HAMi + KAI (simulate multi-GPU on one GPU)
+# 8 · Kubernetes backend — two GPU modes
 
-> **Status: IMPLEMENTED + live-verified.** `backend: k8s` routes a job to the
-> `KubernetesAdapter`, which renders a Namespace + PodGroup + N pods and drives
-> them through the same reconciler/state-machine/drop-zone as every other
-> backend. The cluster + KAI + HAMi are stood up out of band by
-> [`infra/k8s/setup.sh`](../infra/k8s/setup.sh); the hand-run proof this grew
-> out of is in [`infra/k8s/`](../infra/k8s/). Quick start at the end of this doc.
+> **Status: IMPLEMENTED + live-verified (shared mode).** `backend: k8s` routes
+> a job to the `KubernetesAdapter`, which renders a Namespace + N pods (+
+> PodGroup in shared mode) and drives them through the same
+> reconciler/state-machine/drop-zone as every other backend. Two GPU modes,
+> selected by `CLUSTER_K8S_GPU_MODE` / a job's own `params.gpu_mode` (default
+> **`shared`**, everything below through "Quick start" describes it
+> unchanged): one physical GPU sliced across ranks via **HAMi + KAI**, stood up
+> out of band by [`infra/k8s/setup.sh`](../infra/k8s/setup.sh) (KinD dev box).
+> The second mode, **`dedicated`** — a real multi-node cluster where every
+> rank gets its own whole GPU, no VRAM slicing, no KAI/HAMi — is documented in
+> its own section near the end of this doc, [Dedicated-GPU mode](#dedicated-gpu-mode--real-multi-node-clusters).
 
 ## Why this backend at all
 
@@ -289,6 +294,56 @@ GPU UUID — N ranks co-resident on one physical card. Tunables (queue, per-rank
 VRAM cap, PodGroup CRD apiVersion, run timeout, kube-context) are all env-
 overridable — see the `K8S_*` constants in `reconciler/adapter.py` and the
 `CLUSTER_K8S_*` block in `infra/libvirt/config.env`.
+
+## Dedicated-GPU mode — real multi-node clusters
+
+> **Status: implemented, not yet live-verified** (needs a real multi-node
+> kubeadm cluster with GPU workers — the "shared" mode above is what's been
+> run on hardware so far).
+
+Everything above simulates multiple GPUs on one physical card. On a real
+multi-node cluster — every worker node with its own dedicated GPU(s) — that
+simulation is unnecessary: there's no VRAM to slice, so no KAI gang scheduler
+and no HAMi isolator are involved at all. Set `CLUSTER_K8S_GPU_MODE=dedicated`
+(or a job's own `params: {gpu_mode: dedicated}`, which wins per-job for the
+`run()`/manifest-rendering path — see `KubernetesAdapter._gpu_mode`'s
+docstring for the one place per-job override can't apply: `provision()`/
+`bootstrap()` run before a spec is claimed, so they always check the
+cluster-wide default) and each rank's pod requests a **whole real GPU** via
+the standard `nvidia.com/gpu` resource request instead:
+
+```yaml
+resources:
+  requests: {"nvidia.com/gpu": "1"}   # from params.gpu_count, default 1
+  limits:   {"nvidia.com/gpu": "1"}
+```
+
+Placed by the cluster's **default scheduler** (no `schedulerName` override,
+no `pod-group-name`/`gpu-memory` annotations, no `kai.scheduler/queue` label).
+The headless-Service + `RANK`/`WORLD_SIZE`/`MASTER_ADDR`/`MASTER_PORT`
+rendezvous env is unchanged from shared mode — that mechanism was always
+backend-agnostic. The `NCCL_P2P_DISABLE=1` default from shared mode is
+dropped (it existed only because ranks shared one card).
+
+**Prerequisites** (stood up out of band by
+[`infra/k8s/setup-kubeadm.sh`](../infra/k8s/setup-kubeadm.sh), analogous to
+`setup.sh` for the shared/KinD mode): a real kubeadm cluster with the GPU
+workers already joined (each node's containerd configured with the nvidia
+runtime as `default_runtime_name` — a node-image concern, this script doesn't
+touch nodes directly), a CNI applied (Flannel, matching the `10.244.0.0/16`
+pod CIDR the golden-image kubeadm templates already use), and the
+`nvidia-device-plugin` DaemonSet installed so nodes advertise `nvidia.com/gpu`.
+`provision()` verifies at least one node advertises it; `bootstrap()` verifies
+the device-plugin DaemonSet is Running — same fail-closed convention as the
+shared-mode checks, just against different objects. No RuntimeClass object is
+needed in this mode (unlike shared mode's `runtimeclass nvidia`): setting
+containerd's default runtime at the node level means every container already
+gets GPU-runtime semantics.
+
+Try it: `job.k8s.dedicated.example.yaml` (`gpu_mode: dedicated`, 2 ranks, one
+whole GPU each) and `infra/k8s/demo/gpu-dedicated-gang.yaml` (the Deployment
+equivalent of `demo/gpu-share-gang.yaml`, for a quick non-Outpost smoke of the
+cluster's GPU scheduling on its own).
 
 ## History: how this was de-risked before the adapter
 
