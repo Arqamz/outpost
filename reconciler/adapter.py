@@ -710,7 +710,14 @@ class LibvirtAdapter(ProviderAdapter):
         remote_workdir = f"/tmp/cluster/{job_id}"
         if spec.is_dry_run:
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
-        if spec.launcher == "mpi" and len(nodes) > 1:
+        # A resolved plan always takes the planned path, even on a single
+        # claimed node: intra-node multi-rank placement (e.g. one_per_rank
+        # across every GPU on one 8-GPU box) has exactly one node but many
+        # ranks, and a plan present means launcher: mpi already (_phase_provision
+        # refuses launch+non-mpi combinations before this is ever reached) — so
+        # dropping to the plain single-container path here would silently
+        # discard the resolved rankfile/appfile placement.
+        if spec.launcher == "mpi" and (len(nodes) > 1 or plan is not None):
             return self._run_mpi(nodes, job_id, spec, remote_workdir, plan)
         # A GPU job on a remote node adds the node's OWN driver binds for
         # `apptainer --nv` (node.gpu_binds), whose source paths must exist ON
