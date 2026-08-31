@@ -173,7 +173,12 @@ def _with_preflight_probe(files: dict[str, str], probe_script: str,
     probe.wrap_command splices its probe before a benchmark) to every rank
     script's `exec` line, so each rank writes its own observation before
     becoming the workload — the probe runs under the exact rankfile/appfile/
-    env the workload will, which is the whole point of a PREFLIGHT check.
+    env the workload will, which is the whole point of a PREFLIGHT check. This
+    only holds for env because launcher.py's compile() `export`s every
+    per-rank var into the script BEFORE this preamble is spliced in — the
+    probe itself never starts a container, so a var only reaching the
+    container via `--env` (never the host shell) would otherwise read back
+    unset here, and falsely report a mismatch for a correctly-applied binding.
 
     `set -- "{remote_workdir}"` gives the probe its $1 explicitly: the script
     itself defaults $1 to `/out`, which is right INSIDE the container (where
@@ -484,6 +489,8 @@ class LocalHostAdapter(ProviderAdapter):
             return RunResult(job_id, node.name, None, workdir, note="no image -> dry-run")
         if spec.launcher == "mpi" and len(nodes) > 1:
             return self._run_mpi(nodes, job_id, spec)
+        if plan is not None:
+            return self._run_local_planned(node, job_id, spec, workdir, plan)
         # GPU jobs get the driver bind/env the nix shell exported declaratively.
         extra_binds, extra_env = gpu_launch_extras() if spec.gpu else ([], {})
         argv = container_argv(spec, workdir, spec.output_dir, extra_binds, extra_env)
@@ -499,6 +506,71 @@ class LocalHostAdapter(ProviderAdapter):
             append_job_log(job_id, f.read())
         return RunResult(job_id, node.name, rc, workdir, stdout_path, f"apptainer exit={rc}")
 
+    def _run_local_planned(self, node: NodeRecord, job_id: str, spec: JobSpec,
+                           workdir: str, plan: dict) -> RunResult:
+        """The launcher.for_plan() path, executed in-process on this host — the
+        single-node counterpart of LibvirtAdapter._run_planned. A launcher:
+        single intent always resolves to exactly one rank
+        (LocalProcessLauncherAdapter refuses more), so there is no
+        rankfile/appfile/multi-node staging to do: rendering.files land
+        directly under workdir and rendering.argv runs as a direct child
+        process — no ssh/scp, this adapter already runs everything locally."""
+        from . import launcher as launcher_mod
+        from .placement import LaunchPlan
+        from .receipt import PLACEMENT_PROBE_PATH, build_receipt
+        import yaml
+
+        launch_plan = LaunchPlan.from_dict(plan)
+        launcher_adapter = launcher_mod.for_plan(launch_plan, spec.launcher)
+        unmet = launcher_adapter.unsupported(launch_plan, spec.launch or {})
+        if unmet:
+            raise launcher_mod.LauncherUnsupported("; ".join(unmet))
+        rendering = launcher_adapter.compile(launch_plan, spec, node_ips={node.name: node.ip},
+                                             workdir=workdir, image=spec.image)
+
+        require_preflight = bool(((spec.launch or {}).get("validation") or {})
+                                 .get("require_preflight"))
+        files = rendering.files
+        if require_preflight:
+            files = _with_preflight_probe(files, PLACEMENT_PROBE_PATH.read_text(), workdir)
+        for name, content in files.items():
+            with open(os.path.join(workdir, name), "w") as f:
+                f.write(content)
+
+        inner = " ".join(shlex.quote(a) for a in rendering.argv)
+        stdout_path = os.path.join(workdir, "stdout.log")
+        header = f"$ {inner}"
+        self.log(f"[localhost] (planned, {len(launch_plan.ranks)} rank(s)) {header}")
+        append_job_log(job_id, f"{now_iso()} {header}")
+        with open(stdout_path, "w") as out:
+            rc = subprocess.run(rendering.argv, stdout=out, stderr=subprocess.STDOUT).returncode
+        with open(stdout_path) as f:
+            append_job_log(job_id, f.read())
+
+        observations: list[dict] = []
+        preflight_dir = os.path.join(workdir, "preflight")
+        if require_preflight and os.path.isdir(preflight_dir):
+            for name in os.listdir(preflight_dir):
+                try:
+                    with open(os.path.join(preflight_dir, name)) as f:
+                        observations.append(json.load(f))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        # This adapter has no --report-bindings equivalent of its own
+        # (LocalProcessLauncherAdapter's own CAPABILITIES already say so) —
+        # binding_report stays None, exactly like the mpi-planned path does
+        # for a launcher that made no binding claim.
+        receipt = build_receipt(launch_plan, observations, binding_report=None,
+                                preflight_ran=require_preflight)
+        artifacts = {"launch-intent.yaml": spec.launch, "launch-plan.yaml": plan,
+                    "launch-receipt.yaml": receipt.to_dict()}
+        for name, doc in artifacts.items():
+            with open(os.path.join(workdir, name), "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+
+        return RunResult(job_id, node.name, rc, workdir, stdout_path,
+                         note=f"local planned exit={rc}")
+
     def _run_mpi(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec) -> RunResult:
         """Hybrid multi-node launch: mpirun runs ON THE HOST (nodes[0], the GPU
         node) and spans it plus the job's VM nodes in one launch. The host's
@@ -512,7 +584,7 @@ class LocalHostAdapter(ProviderAdapter):
         appfile `--host` value for `localhost` — the btl/oob if_include MCA
         params, not the host string, decide which endpoints rank 0 advertises.)
 
-        Unlike the VM-headed path (LibvirtAdapter._run_mpi, one shared per-rank
+        Unlike the VM-headed path (LibvirtAdapter._run_launch, one shared per-rank
         command), this uses a per-rank APPFILE so the ranks can differ: rank 0
         (the GPU host) gets `--nv` + the NixOS driver binds the dev shell
         exported, while the VM ranks get a plain launch. A shared command can't
@@ -697,15 +769,17 @@ class LibvirtAdapter(ProviderAdapter):
         remote_workdir = f"/tmp/cluster/{job_id}"
         if spec.is_dry_run:
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
-        # A resolved plan always takes the planned path, even on a single
-        # claimed node: intra-node multi-rank placement (e.g. one_per_rank
-        # across every GPU on one 8-GPU box) has exactly one node but many
-        # ranks, and a plan present means launcher: mpi already (_phase_provision
-        # refuses launch+non-mpi combinations before this is ever reached) — so
-        # dropping to the plain single-container path here would silently
-        # discard the resolved rankfile/appfile placement.
-        if spec.launcher == "mpi" and (len(nodes) > 1 or plan is not None):
-            return self._run_mpi(nodes, job_id, spec, remote_workdir, plan)
+        # A resolved plan always takes the planned path, regardless of node
+        # count or launcher: intra-node multi-rank placement (e.g. one_per_rank
+        # across every GPU on one 8-GPU box, launcher: mpi) has exactly one
+        # node but many ranks, and a single-container launcher: single plan
+        # (one node, one rank — HPL's own internal mpirun) is the same shape
+        # from here. By the time run() is called, _phase_provision/_phase_plan
+        # have already guaranteed a non-None plan only exists for a shape this
+        # backend accepts — dropping to the plain unplanned path here would
+        # silently discard the resolved placement either way.
+        if plan is not None or (spec.launcher == "mpi" and len(nodes) > 1):
+            return self._run_launch(nodes, job_id, spec, remote_workdir, plan)
         # A GPU job on a remote node adds the node's OWN driver binds for
         # `apptainer --nv` (node.gpu_binds), whose source paths must exist ON
         # THAT node — a NixOS worker needs /nix/store,/run/opengl-driver; an
@@ -733,8 +807,33 @@ class LibvirtAdapter(ProviderAdapter):
     def _scp_to(self, node: NodeRecord, src: str, dst: str, job_id: str) -> None:
         scp_to(node.ip, src, dst, job_id, *node_ssh_id(node))
 
-    def _run_mpi(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
-                 remote_workdir: str, plan: dict | None = None) -> RunResult:
+    def _node_iface(self, node: NodeRecord) -> str:
+        """The network interface actually carrying `node.ip` on `node` — needed
+        to pin UCX's own device selection for cross-node MPI. `fabric_if_include`
+        (below) already pins the classic TCP BTL/OOB planes by IP/subnet, which
+        OpenMPI's `*_if_include` options accept directly; UCX has no such
+        subnet-matching mode — `UCX_NET_DEVICES` wants an actual device name.
+        Confirmed LIVE this matters, not just in theory: on a shared box that
+        also runs a kubelet/CNI workload (see the summary doc's "Operational
+        findings"), UCX auto-selected a pod-network veth and advertised an
+        address the peer rank could never reach — `ucp_ep_create(...) failed:
+        Destination is unreachable`, segfaulting `MPI_Init` on both ranks
+        (`job-1e25ee9612ff`). This never touches the node's own kubelet/CNI
+        config — it only tells THIS job's MPI runtime which device to use,
+        the same way CUDA_VISIBLE_DEVICES tells it which GPU to use."""
+        proc = subprocess.run(
+            self._ssh_base(node) +
+            [f"ip -o -4 addr show | grep -F {shlex.quote(node.ip + '/')} | awk '{{print $2}}' | head -1"],
+            capture_output=True, text=True)
+        iface = proc.stdout.strip()
+        if not iface:
+            raise RuntimeError(
+                f"could not determine {node.name}'s network interface for {node.ip} — needed to "
+                "pin UCX away from any other interface (e.g. a CNI veth) on the box")
+        return iface
+
+    def _run_launch(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
+                    remote_workdir: str, plan: dict | None = None) -> RunResult:
         """Multi-node launch: mpirun runs on the head VM (installed by the
         bootstrap role) and execs `apptainer exec <image> ...` per rank on
         every claimed node over ssh — the container never needs its own MPI
@@ -743,9 +842,25 @@ class LibvirtAdapter(ProviderAdapter):
         every claimed node under remote_workdir.
 
         `plan`: a resolved LaunchPlan dict (reconciler.py's _phase_plan) routes
-        to _run_mpi_planned — per-rank rankfile/argv/env compiled by
+        to _run_planned — per-rank rankfile/argv/env (or, for a single-rank
+        launcher: single plan, a plain taskset'd script) compiled by
         launcher.for_plan(), instead of the one shared command below. None
-        (no placement request) keeps this EXACT path, unchanged."""
+        (no placement request) keeps this EXACT path, unchanged.
+
+        Tried and reverted: letting a single remote node pull `spec.image`
+        itself (skipping ensure_local_sif + scp) to dodge the SSM-tunnelled
+        scp's throughput cap. Confirmed LIVE that this backfires on a large
+        multi-layer image: apptainer's own `docker://` -> SIF build needs
+        roughly 2-3x the final image size on the TARGET's disk at once
+        (compressed OCI layers in its blob cache + the unpacked rootfs during
+        conversion + the final SIF), not just the final size — it failed with
+        "no space left on device" mid-unpack on a node that had comfortably
+        enough free space for the final SIF alone. A pre-built local SIF
+        scp'd byte-for-byte only ever needs the final size on the target, so
+        it is the disk-SAFER of the two despite being network-slower. Revisit
+        remote pull only alongside a real remote disk-headroom check, not as
+        an unconditional single-node default. (A follow-up PR does exactly
+        that — see the SIF-cache/SSM-speed fix, tracked separately.)"""
         head = nodes[0]
         local_image = ensure_local_sif(spec.image, job_id)
         remote_image = f"{remote_workdir}/{os.path.basename(local_image)}"
@@ -754,7 +869,7 @@ class LibvirtAdapter(ProviderAdapter):
             self._scp_to(n, local_image, remote_image, job_id)
 
         if plan is not None:
-            return self._run_mpi_planned(nodes, job_id, spec, remote_workdir, remote_image, plan)
+            return self._run_planned(nodes, job_id, spec, remote_workdir, remote_image, plan)
 
         remote_hostfile = f"{remote_workdir}/hostfile"
         btl_inc, oob_inc = fabric_if_include(nodes)
@@ -780,13 +895,14 @@ class LibvirtAdapter(ProviderAdapter):
         return RunResult(job_id, head.name, rc, remote_workdir, stdout_log,
                          note=f"mpirun np={len(nodes)} exit={rc}")
 
-    def _run_mpi_planned(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
-                         remote_workdir: str, remote_image: str, plan: dict) -> RunResult:
-        """The launcher.for_plan() path: per-rank rankfile/appfile/env compiled
-        from the resolved plan, `--report-bindings` captured for the receipt,
-        and (when the intent asks for it) a per-rank preflight probe run
-        before the workload so the receipt has a real OS-level observation,
-        not just the launcher's own claim."""
+    def _run_planned(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
+                     remote_workdir: str, remote_image: str, plan: dict) -> RunResult:
+        """The launcher.for_plan() path: per-rank rankfile/appfile/env (mpi) or
+        a single taskset'd script (single-rank launcher: single) compiled from
+        the resolved plan, `--report-bindings` captured for the receipt when
+        the launcher has one, and (when the intent asks for it) a per-rank
+        preflight probe run before the workload so the receipt has a real
+        OS-level observation, not just the launcher's own claim."""
         from . import launcher as launcher_mod
         from .placement import LaunchPlan
         from .receipt import PLACEMENT_PROBE_PATH, build_receipt
@@ -794,15 +910,49 @@ class LibvirtAdapter(ProviderAdapter):
         head = nodes[0]
         launch_plan = LaunchPlan.from_dict(plan)
         node_ips = {n.name: n.ip for n in nodes}
-        launcher_adapter = launcher_mod.for_plan(launch_plan)
+        launcher_adapter = launcher_mod.for_plan(launch_plan, spec.launcher)
         # Checked BEFORE compiling: a capability gap should read as itself
         # ("this launcher cannot bind ranks to CPUs"), not as whatever a
         # half-rendered command does next.
         unmet = launcher_adapter.unsupported(launch_plan, spec.launch or {})
         if unmet:
             raise launcher_mod.LauncherUnsupported("; ".join(unmet))
+        compile_kwargs: dict = {}
+        if head.provider == "static-ssh":
+            # mpirun runs ON the head (a static-ssh box, not our libvirt
+            # fabric), so it needs its OWN credential to reach the other
+            # claimed nodes directly over their (private) node.ip — unlike
+            # libvirt VMs, static-ssh nodes never get the ansible fabric key
+            # that makes plain default `ssh` just work between them. Confirmed
+            # live: default rsh -> "Host key verification failed" (no
+            # identity, no known_hosts entry on the head for its siblings).
+            # Convention: the SAME key named in node.ssh_key must also be
+            # staged at ~/.ssh/<basename> ON the head (see
+            # docs/09-multi-machine-cluster.md) — scp it there once per node.
+            agent = (f"ssh -i ~/.ssh/{os.path.basename(head.ssh_key or 'id_rsa')} "
+                     f"-o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
+                     f"-o UserKnownHostsFile=/dev/null -l {head.ssh_user or SSH_USER}")
+            compile_kwargs = {"rsh_agent": agent, "no_tree_spawn": True}
+        if len(nodes) > 1:
+            # Cross-node MPI: pin BOTH transport families to the real cluster
+            # fabric, not just whichever interface each library auto-selects.
+            # The unplanned `_run_launch` path already did this for the classic
+            # TCP BTL/OOB planes (see fabric_if_include); the planned path never
+            # did, and separately, TCP BTL/OOB pinning alone doesn't reach UCX
+            # (see _node_iface) — this suite's image (NVIDIA HPC-X) defaults to
+            # UCX/UCC, which has its own device-selection mechanism. Confirmed
+            # LIVE both were needed: `job-1e25ee9612ff` staged and launched
+            # cleanly with neither applied, then both ranks crashed inside
+            # MPI_Init's UCX/UCC transport setup on a shared box.
+            btl_inc, oob_inc = fabric_if_include(nodes)
+            mca = dict(compile_kwargs.get("mca") or {})
+            mca.update({"btl": "tcp,self", "btl_tcp_if_include": btl_inc,
+                       "oob_tcp_if_include": oob_inc})
+            compile_kwargs["mca"] = mca
+            compile_kwargs["node_ifaces"] = {n.name: self._node_iface(n) for n in nodes}
         rendering = launcher_adapter.compile(launch_plan, spec, node_ips=node_ips,
-                                             workdir=remote_workdir, image=remote_image)
+                                             workdir=remote_workdir, image=remote_image,
+                                             **compile_kwargs)
 
         require_preflight = bool(((spec.launch or {}).get("validation") or {})
                                  .get("require_preflight"))
@@ -987,7 +1137,7 @@ class KubernetesAdapter(ProviderAdapter):
     @staticmethod
     def _context_of(node: NodeRecord) -> str:
         """Which kube-context this slot targets: its own if set (multi-cluster:
-        the L20's cluster vs the 5060 Ti's), else the global CLUSTER_K8S_CONTEXT."""
+        an AWS worker's cluster vs the 5060 Ti's), else the global CLUSTER_K8S_CONTEXT."""
         return node.kube_context or K8S_CONTEXT
 
     def _kubectl_base(self, context: str = "") -> list[str]:
