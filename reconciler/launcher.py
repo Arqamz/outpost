@@ -99,7 +99,7 @@ class LauncherAdapter(ABC):
                            "explicit cores to at least one rank")
         if len({r.node for r in plan.ranks}) > 1 and not caps.get("explicit_rank_map"):
             reasons.append(f"{self.name} cannot place ranks across multiple nodes")
-        if any(r.gpu_uuid for r in plan.ranks) and not caps.get("gpu_visibility"):
+        if any(r.gpu_uuids for r in plan.ranks) and not caps.get("gpu_visibility"):
             reasons.append(f"{self.name} cannot restrict which GPU each rank sees")
 
         memory = intent["memory"]["strategy"]
@@ -143,7 +143,7 @@ class OpenMPILauncherAdapter(LauncherAdapter):
     def compile(self, plan: LaunchPlan, spec, *, node_ips: dict[str, str],
                 workdir: str, image: str, mca: dict[str, str] | None = None,
                 rsh_agent: str | None = None, no_tree_spawn: bool = False,
-                container_argv=None) -> LauncherRendering:
+                container_argv=None, node_ifaces: dict[str, str] | None = None) -> LauncherRendering:
         from .adapter import container_argv as default_container_argv
         build_argv = container_argv or default_container_argv
         import dataclasses
@@ -172,23 +172,47 @@ class OpenMPILauncherAdapter(LauncherAdapter):
 
         for rank in plan.ranks:
             env = dict(spec.env)
-            if rank.gpu_uuid:
+            if rank.gpu_uuids:
                 # By UUID, not by index: index order depends on the driver's
                 # enumeration and on CUDA_DEVICE_ORDER, and a plan that promised
-                # a specific physical device must not be re-pointed by either.
-                env["CUDA_VISIBLE_DEVICES"] = rank.gpu_uuid
+                # specific physical devices must not be re-pointed by either.
+                # Joined in gpu_uuids order — that order IS the container's own
+                # device-index order (visible_gpu_indices), by construction.
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(rank.gpu_uuids)
+            if node_ifaces and rank.node in node_ifaces:
+                # Pin UCX to the interface adapter.py's _node_iface found for
+                # this rank's node — reachable by the caller's SAME reasoning
+                # as CUDA_VISIBLE_DEVICES above: a value resolved once, per
+                # rank, by whoever actually knows the topology, not guessed
+                # here. `sm`/`self` add intra-node shared-memory/loopback,
+                # neither of which does any cross-node device selection, so
+                # restricting to them + `tcp` cannot reintroduce the bug.
+                env["UCX_NET_DEVICES"] = node_ifaces[rank.node]
+                env["UCX_TLS"] = "tcp,sm,self"
             per_rank_env[rank.global_rank] = env
 
-            rank_spec = dataclasses.replace(spec, image=image, gpu=bool(rank.gpu_uuid))
+            rank_spec = dataclasses.replace(spec, image=image, gpu=bool(rank.gpu_uuids))
             argv = build_argv(rank_spec, workdir, spec.output_dir, None, env)
 
             script_name = f"launcher-rank-{rank.global_rank}.sh"
             # `exec` so the rank process IS the workload: one less process in the
             # tree, and the affinity mask mpirun set is carried straight into it.
+            #
+            # `export` every per-rank env var (CUDA_VISIBLE_DEVICES included)
+            # into the SCRIPT'S OWN shell, not just onto the `--env` flag below:
+            # a preflight probe (adapter._with_preflight_probe) runs as a
+            # subshell spliced in BEFORE this `exec` line, on the bare host —
+            # `--env` only takes effect once apptainer actually starts the
+            # container, so without this export the probe reads an unset
+            # CUDA_VISIBLE_DEVICES and reports a false mismatch even when the
+            # container-side assignment (proven by the workload's own stdout)
+            # was correct. Found live on real cross-node AWS GPU-pinning runs.
+            export_lines = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in sorted(env.items()))
             files_extra[script_name] = (
                 "#!/bin/sh\n"
                 f"# global rank {rank.global_rank} (local {rank.local_rank}) on {rank.node}\n"
-                f"# cpus={list(rank.cpu_ids)} gpu={rank.gpu_uuid or '-'}\n"
+                f"# cpus={list(rank.cpu_ids)} gpu={','.join(rank.gpu_uuids) or '-'}\n"
+                f"{export_lines}"
                 f"exec {shlex.join(argv)}\n")
             appfile_lines.append(
                 f"-np 1 --host {node_ips[rank.node]} /bin/sh {workdir}/{script_name}")
@@ -264,17 +288,59 @@ class LocalProcessLauncherAdapter(LauncherAdapter):
         rank: RankPlacement = plan.ranks[0]
 
         env = dict(spec.env)
-        if rank.gpu_uuid:
-            env["CUDA_VISIBLE_DEVICES"] = rank.gpu_uuid
-        rank_spec = dataclasses.replace(spec, image=image, gpu=bool(rank.gpu_uuid))
+        if rank.gpu_uuids:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(rank.gpu_uuids)
+        rank_spec = dataclasses.replace(spec, image=image, gpu=bool(rank.gpu_uuids))
         argv = list(build_argv(rank_spec, workdir, spec.output_dir, None, env))
         if rank.cpu_ids:
             # taskset sets the affinity mask on itself and then execs, so every
             # descendant — apptainer, and the workload inside it — inherits it.
             argv = ["taskset", "-c", _compress(list(rank.cpu_ids))] + argv
 
+        # Same shape as OpenMPILauncherAdapter's per-rank script (script name,
+        # `export` of every per-rank var BEFORE `exec`, same reason: a
+        # preflight probe runs as a bare-host subshell spliced in before
+        # `exec` — adapter._with_preflight_probe — and only an exported var,
+        # not one only reaching the container via apptainer's --env, is
+        # visible to it). This is what lets that existing splice (matched on
+        # the "launcher-rank-" filename prefix + "\nexec " substring) work for
+        # this launcher unchanged — without it, require_preflight: true would
+        # silently never run the probe for a launcher: single job.
+        #
+        # placement-probe.sh identifies its own rank by reading
+        # OMPI_COMM_WORLD_RANK/PMIX_RANK/PMI_RANK — vars a real launcher sets,
+        # which none does here (this script runs directly, no mpirun of ANY
+        # kind wraps it — that absence is the whole point of this launcher).
+        # Confirmed live: without this, the probe correctly reports "I don't
+        # know my rank" (global_rank: null), and the receipt then discards an
+        # otherwise-correct observation as unattributable, reading `mismatched`
+        # for a placement that actually held. This launcher is exactly one
+        # rank by construction (checked above), so the identity is not
+        # detected, it is KNOWN — export it for the probe only, kept OUT of
+        # `env` (and so out of container_argv's --env) so it never reaches the
+        # workload itself: HPL's own internal mpirun inheriting a stray
+        # OMPI_COMM_WORLD_RANK from a "launch" that never happened is exactly
+        # the class of bug _with_preflight_probe's splice-before-exec ordering
+        # exists to avoid elsewhere.
+        probe_only = {
+            "OMPI_COMM_WORLD_RANK": str(rank.global_rank),
+            "OMPI_COMM_WORLD_LOCAL_RANK": str(rank.local_rank),
+            "OMPI_COMM_WORLD_SIZE": "1",
+        }
+        script_name = f"launcher-rank-{rank.global_rank}.sh"
+        export_lines = "".join(f"export {k}={shlex.quote(v)}\n"
+                               for k, v in sorted({**env, **probe_only}.items()))
+        script = (
+            "#!/bin/sh\n"
+            f"# global rank {rank.global_rank} (local {rank.local_rank}) on {rank.node}\n"
+            f"# cpus={list(rank.cpu_ids)} gpu={','.join(rank.gpu_uuids) or '-'}\n"
+            f"{export_lines}"
+            f"exec {shlex.join(argv)}\n")
+
         return LauncherRendering(
-            launcher=self.name, version="", argv=argv,
+            launcher=self.name, version="",
+            argv=["/bin/sh", f"{workdir}/{script_name}"],
+            files={script_name: script},
             per_rank_env={rank.global_rank: env},
             notes=("binding via taskset; this launcher has no binding report of its own, "
                    "so the preflight is the only confirmation",) if rank.cpu_ids else (),
@@ -287,8 +353,28 @@ LAUNCHERS: dict[str, LauncherAdapter] = {
 }
 
 
-def for_plan(plan: LaunchPlan) -> LauncherAdapter:
-    """The adapter that compiles this plan, by the launcher the nodes reported."""
+def for_plan(plan: LaunchPlan, job_launcher: str = "mpi") -> LauncherAdapter:
+    """The adapter that compiles this plan.
+
+    `job_launcher` is the JOB's OWN declared execution shape (JobSpec.launcher)
+    — a different question from `plan.launcher` (the node's INSTALLED MPI,
+    from topology probing). `job_launcher == "single"` ALWAYS takes the plain
+    taskset'd path, regardless of what MPI happens to be installed on the
+    node: a launcher: single container is, by definition, one self-contained
+    process tree (HPL's own internal mpirun, for one) — wrapping it in an
+    OUTER mpirun is not just unnecessary but actively wrong. Confirmed live:
+    OpenMPI refuses a nested invocation outright ("mpirun does not support
+    recursive calls") when the node's real, installed OpenMPI (needed for
+    cross-node launcher: mpi jobs on the same node) got auto-selected for a
+    launcher: single job whose container already runs its own internal
+    mpirun. `job_launcher == "mpi"` (the default, unchanged) is the only case
+    that asks for the node's own installed implementation."""
+    if job_launcher == "single":
+        if len(plan.ranks) != 1:
+            raise LauncherUnsupported(
+                f"launcher: single resolved to {len(plan.ranks)} rank(s); a single "
+                "container run can only ever be exactly one rank")
+        return LAUNCHERS[LocalProcessLauncherAdapter.name]
     kind = (plan.launcher or {}).get("type") or ""
     if len(plan.ranks) == 1 and kind not in LAUNCHERS:
         return LAUNCHERS[LocalProcessLauncherAdapter.name]

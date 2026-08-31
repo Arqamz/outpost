@@ -103,11 +103,27 @@ class TestOpenMpiRendering:
         seen = []
         for rank in plan.ranks:
             script = rendering.files[f"launcher-rank-{rank.global_rank}.sh"]
-            assert f"CUDA_VISIBLE_DEVICES={rank.gpu_uuid}" in script
-            seen.append(rank.gpu_uuid)
+            assert f"CUDA_VISIBLE_DEVICES={rank.gpu_uuids[0]}" in script
+            seen.append(rank.gpu_uuids[0])
         assert len(set(seen)) == 8
         # and the appfile still has exactly one line per rank pointing at them
         assert len(rendering.files[APPFILE].strip().splitlines()) == 8
+
+    def test_per_rank_env_is_exported_before_exec(self):
+        # A preflight probe is spliced in as a subshell BEFORE the `exec` line
+        # (adapter._with_preflight_probe), on the bare host — it never starts
+        # a container. CUDA_VISIBLE_DEVICES must therefore be `export`ed into
+        # the script's OWN shell, not just handed to apptainer via `--env`
+        # (which only takes effect once the container actually starts), or
+        # the probe reads it back unset and reports a false mismatch for a
+        # correctly-applied GPU assignment. Found live on real AWS hardware.
+        plan = resolve(intent(), [topo("2socket_8gpu")])
+        rendering = compiled(plan)
+        for rank in plan.ranks:
+            script = rendering.files[f"launcher-rank-{rank.global_rank}.sh"]
+            export_line = f"export CUDA_VISIBLE_DEVICES={rank.gpu_uuids[0]}"
+            assert export_line in script
+            assert script.index(export_line) < script.index("\nexec ")
 
     def test_devices_are_pinned_by_uuid_not_index(self):
         # Index order depends on driver enumeration and CUDA_DEVICE_ORDER; a plan
@@ -115,6 +131,49 @@ class TestOpenMpiRendering:
         rendering = compiled()
         for value in rendering.per_rank_env.values():
             assert value["CUDA_VISIBLE_DEVICES"].startswith("GPU-")
+
+
+class TestUcxDevicePinning:
+    # Found live: on a shared box also running a kubelet/CNI workload, UCX
+    # auto-selected a pod-network interface and advertised an address the
+    # peer rank could never reach, segfaulting MPI_Init on both ranks
+    # (job-1e25ee9612ff). btl_tcp_if_include's IP/subnet matching doesn't
+    # reach UCX, which needs an actual device name — node_ifaces threads
+    # that in, same shape as CUDA_VISIBLE_DEVICES above.
+
+    def test_node_ifaces_pins_ucx_net_devices_per_rank(self):
+        rendering = compiled(node_ifaces={"n1": "ens5"})
+        for env in rendering.per_rank_env.values():
+            assert env["UCX_NET_DEVICES"] == "ens5"
+            assert env["UCX_TLS"] == "tcp,sm,self"
+
+    def test_no_node_ifaces_means_no_ucx_pinning(self):
+        # Default (no cross-node fabric info supplied) — byte-identical to
+        # before this fix, no silent behavior change for single-node or
+        # non-UCX-affected callers.
+        rendering = compiled()
+        for env in rendering.per_rank_env.values():
+            assert "UCX_NET_DEVICES" not in env
+            assert "UCX_TLS" not in env
+
+    def test_unknown_node_gets_no_ucx_pinning(self):
+        # A node_ifaces map that doesn't cover a rank's node degrades to "no
+        # pinning for that rank" rather than a KeyError.
+        rendering = compiled(node_ifaces={"some-other-node": "eth0"})
+        for env in rendering.per_rank_env.values():
+            assert "UCX_NET_DEVICES" not in env
+
+    def test_ucx_pinning_is_exported_before_exec(self):
+        # Same reasoning as CUDA_VISIBLE_DEVICES: a preflight probe runs as a
+        # bare-host subshell before `exec`, so the value must be in the
+        # script's own shell env, not only apptainer's --env.
+        plan = resolve(intent(), [topo("2socket_8gpu")])
+        rendering = compiled(plan, node_ifaces={"n1": "ens5"})
+        for rank in plan.ranks:
+            script = rendering.files[f"launcher-rank-{rank.global_rank}.sh"]
+            export_line = "export UCX_NET_DEVICES=ens5"
+            assert export_line in script
+            assert script.index(export_line) < script.index("\nexec ")
 
     def test_rankfile_addresses_cores_as_socket_and_core(self):
         plan = resolve(intent(), [topo("2socket_8gpu")])
@@ -168,7 +227,7 @@ class TestOpenMpiRendering:
         plan = resolve(explicit_intent(
             process={"ranks_per_node": 1},
             cpu={"explicit_cpu_ids": [[0, 1]], "cores_per_rank": 2},
-            gpu={"explicit_gpu_uuids": [topology.gpus[0].uuid]}), [topology])
+            gpu={"explicit_gpu_uuids": [[topology.gpus[0].uuid]]}), [topology])
         assert plan.ranks[0].cpu_ids == (0, 1) and plan.ranks[0].cpu_slots == ()
         rendering = compiled(plan)
         assert RANKFILE not in rendering.files
@@ -244,7 +303,7 @@ class TestCapabilityRefusals:
         plan = resolve(explicit_intent(
             process={"ranks_per_node": 1},
             cpu={"explicit_cpu_ids": [[0, 1, 40, 41]], "cores_per_rank": 4},
-            gpu={"explicit_gpu_uuids": [t.gpus[0].uuid]}), [t])
+            gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid]]}), [t])
         spanning = [r for r in plan.ranks if len(r.numa_nodes) > 1]
         assert spanning, "fixture no longer produces a socket-spanning rank"
         reasons = OpenMPILauncherAdapter().unsupported(plan, intent())
@@ -263,7 +322,7 @@ class TestCapabilityRefusals:
         # Built directly rather than resolved: two nodes sharing a GPU UUID is
         # refused upstream, and this is about the launcher's own capability.
         from reconciler.placement import LaunchPlan, RankPlacement
-        ranks = tuple(RankPlacement(i, 0, f"n{i}", (), (), (), None, None, None)
+        ranks = tuple(RankPlacement(i, 0, f"n{i}", (), (), (), (), (), ())
                       for i in range(2))
         plan = LaunchPlan("lp-x", {"type": "local"}, ranks, {"warnings": ()}, {})
         reasons = LocalProcessLauncherAdapter().unsupported(plan, intent())
@@ -279,19 +338,46 @@ class TestLocalProcessRendering:
 
     def test_binding_uses_taskset(self):
         # No MPI in this path, so there is no rankfile; taskset sets the mask on
-        # itself and execs, and every descendant inherits it.
+        # itself and execs, and every descendant inherits it. Same probe-splice
+        # convention as OpenMPI's per-rank script, so the argv now references
+        # the script rather than running taskset directly.
         plan, rendering = self._single()
-        assert rendering.argv[:3] == ["taskset", "-c", "0-1"]
-        assert "apptainer" in rendering.argv
+        assert rendering.argv == ["/bin/sh", "/w/launcher-rank-0.sh"]
+        script = rendering.files["launcher-rank-0.sh"]
+        assert "exec taskset -c 0-1 " in script
+        assert "apptainer" in script
 
     def test_the_single_rank_still_gets_its_device(self):
         plan, rendering = self._single()
-        assert f"CUDA_VISIBLE_DEVICES={plan.ranks[0].gpu_uuid}" in " ".join(rendering.argv)
+        script = rendering.files["launcher-rank-0.sh"]
+        assert f"CUDA_VISIBLE_DEVICES={plan.ranks[0].gpu_uuids[0]}" in script
 
     def test_no_binding_report_is_admitted_not_faked(self):
         _, rendering = self._single()
         assert rendering.preview_argv is None
         assert any("no binding report" in n for n in rendering.notes)
+
+    def test_probe_rank_identity_is_exported_but_never_reaches_the_container(self):
+        # The regression this guards: placement-probe.sh identifies its own
+        # rank via OMPI_COMM_WORLD_RANK/PMIX_RANK/PMI_RANK — vars no launcher
+        # sets here (no mpirun of any kind wraps this script). Without an
+        # explicit export, the probe reports global_rank: null and the
+        # receipt discards an otherwise-correct observation as unattributable
+        # — confirmed live, `mismatched` for a placement that actually held.
+        # This launcher is exactly one rank by construction, so the identity
+        # is known, not detected. It must land in the script's own export
+        # lines (for the probe) but NEVER in per_rank_env / container --env
+        # (HPL's own internal mpirun inheriting a stray OMPI_COMM_WORLD_RANK
+        # from a "launch" that never happened is exactly the bug class
+        # _with_preflight_probe's splice-before-exec ordering exists to
+        # avoid elsewhere).
+        plan, rendering = self._single()
+        script = rendering.files["launcher-rank-0.sh"]
+        assert "export OMPI_COMM_WORLD_RANK=0" in script
+        assert "export OMPI_COMM_WORLD_LOCAL_RANK=0" in script
+        assert "export OMPI_COMM_WORLD_SIZE=1" in script
+        assert "OMPI_COMM_WORLD_RANK" not in rendering.per_rank_env[0]
+        assert not any("OMPI_COMM_WORLD_RANK" in arg for arg in rendering.argv)
 
 
 class TestSelection:
@@ -302,17 +388,41 @@ class TestSelection:
     def test_a_single_rank_on_an_unknown_launcher_runs_locally(self):
         from reconciler.placement import LaunchPlan, RankPlacement
         plan = LaunchPlan("lp-x", {"type": ""},
-                          (RankPlacement(0, 0, "n1", (), (), (), None, None, None),),
+                          (RankPlacement(0, 0, "n1", (), (), (), (), (), ()),),
                           {"warnings": ()}, {})
         assert isinstance(for_plan(plan), LocalProcessLauncherAdapter)
 
     def test_an_unknown_launcher_with_many_ranks_is_refused(self):
         from reconciler.placement import LaunchPlan, RankPlacement
-        ranks = tuple(RankPlacement(i, i, "n1", (), (), (), None, None, None)
+        ranks = tuple(RankPlacement(i, i, "n1", (), (), (), (), (), ())
                       for i in range(2))
         plan = LaunchPlan("lp-x", {"type": "slurm"}, ranks, {"warnings": ()}, {})
         with pytest.raises(LauncherUnsupported, match="no launcher adapter"):
             for_plan(plan)
+
+    def test_job_launcher_single_always_runs_locally_even_on_a_real_mpi_node(self):
+        # The regression this guards: a launcher: single job's container may
+        # run its OWN internal mpirun (HPL's hpl-mxp.sh, for one). Wrapping
+        # that in an OUTER mpirun — which is what happens if the node's own
+        # installed MPI (plan.launcher, from topology) picks the adapter
+        # instead of the job's declared shape — is not just redundant but
+        # broken: OpenMPI refuses a nested invocation outright ("mpirun does
+        # not support recursive calls"), confirmed live running real HPL on a
+        # real MPI-capable node. job_launcher="single" must win regardless of
+        # what plan.launcher reports.
+        plan = resolve(intent(cpu={"cores_per_rank": 2}), [topo("dev_1gpu")])
+        assert plan.launcher.get("type") == "openmpi"  # the node DOES have real MPI
+        assert isinstance(for_plan(plan, job_launcher="single"), LocalProcessLauncherAdapter)
+        assert isinstance(for_plan(plan, job_launcher="mpi"), OpenMPILauncherAdapter)
+
+    def test_job_launcher_single_refuses_a_multi_rank_plan(self):
+        from reconciler.placement import LaunchPlan, RankPlacement
+        ranks = tuple(RankPlacement(i, i, "n1", (), (), (), (), (), ())
+                      for i in range(2))
+        plan = LaunchPlan("lp-x", {"type": "openmpi", "version": "4.1.6"}, ranks,
+                          {"warnings": ()}, {})
+        with pytest.raises(LauncherUnsupported, match="resolved to 2 rank"):
+            for_plan(plan, job_launcher="single")
 
     def test_every_registered_adapter_declares_the_same_capability_keys(self):
         # A new adapter that forgot a key would read as "false" and quietly
