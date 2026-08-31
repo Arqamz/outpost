@@ -46,9 +46,14 @@ class RankPlacement:
     # compilable on its own rather than only alongside the machine snapshot.
     cpu_slots: tuple[tuple[int, int], ...]
     numa_nodes: tuple[int, ...]
-    gpu_uuid: str | None
-    gpu_pci_bus_id: str | None
-    visible_gpu_index: int | None
+    # () = no GPU. A rank can own more than one GPU (gpu.gpus_per_rank > 1) —
+    # e.g. HPL's own internal mpirun fans out across every GPU ITS ONE
+    # container is given, so "one rank" and "one GPU" are not the same thing.
+    # Order matters: gpu_uuids[i] is what CUDA_VISIBLE_DEVICES exposes as
+    # device i, so this order IS visible_gpu_indices, by construction.
+    gpu_uuids: tuple[str, ...]
+    gpu_pci_bus_ids: tuple[str, ...]
+    visible_gpu_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -76,8 +81,9 @@ class LaunchPlan:
                 cpu_ids=tuple(r["cpu_ids"]),
                 cpu_slots=tuple(tuple(slot) for slot in r["cpu_slots"]),
                 numa_nodes=tuple(r["numa_nodes"]),
-                gpu_uuid=r["gpu_uuid"], gpu_pci_bus_id=r["gpu_pci_bus_id"],
-                visible_gpu_index=r["visible_gpu_index"],
+                gpu_uuids=tuple(r["gpu_uuids"]),
+                gpu_pci_bus_ids=tuple(r["gpu_pci_bus_ids"]),
+                visible_gpu_indices=tuple(r["visible_gpu_indices"]),
             )
             for r in d["ranks"]
         )
@@ -152,42 +158,55 @@ def _ranks_per_node(intent: dict, topo: NodeTopology, mode: str,
     return len(topo.gpus)
 
 
-def _assign_gpu(intent: dict, topo: NodeTopology, local_rank: int,
-                ordered: list[Gpu], claimed: dict[str, str],
-                mode: str) -> Gpu | None:
+def _assign_gpus(intent: dict, topo: NodeTopology, local_rank: int,
+                 ordered: list[Gpu], claimed: dict[str, str],
+                 mode: str) -> list[Gpu]:
+    """Assign this rank its gpu.gpus_per_rank GPUs (0, 1, or more — a rank is
+    not necessarily one GPU; see RankPlacement.gpu_uuids)."""
     gpu_spec = intent["gpu"]
     strategy = gpu_spec["strategy"]
-    if strategy == "none" or gpu_spec["gpus_per_rank"] == 0:
-        return None
+    count = gpu_spec["gpus_per_rank"]
+    if strategy == "none" or count == 0:
+        return []
 
     if strategy == "explicit":
-        uuids = gpu_spec["explicit_gpu_uuids"] or []
-        if local_rank >= len(uuids):
+        lists = gpu_spec["explicit_gpu_uuids"] or []
+        if local_rank >= len(lists):
             raise PlacementError(
-                f"{topo.node}: gpu.explicit_gpu_uuids has {len(uuids)} entr(ies) but this "
+                f"{topo.node}: gpu.explicit_gpu_uuids has {len(lists)} entr(ies) but this "
                 f"node was resolved to at least {local_rank + 1} ranks")
-        wanted = uuids[local_rank]
-        found = next((g for g in ordered if g.uuid == wanted), None)
-        if found is None:
+        wanted = lists[local_rank]
+        if len(wanted) != count:
             raise PlacementError(
-                f"{topo.node}: gpu.explicit_gpu_uuids names {wanted!r}, which is not on "
-                f"this node (it has {[g.uuid for g in ordered]})")
-        gpu = found
+                f"{topo.node}: gpu.explicit_gpu_uuids[{local_rank}] has {len(wanted)} "
+                f"UUID(s) but gpu.gpus_per_rank is {count}")
+        gpus = []
+        for uuid in wanted:
+            found = next((g for g in ordered if g.uuid == uuid), None)
+            if found is None:
+                raise PlacementError(
+                    f"{topo.node}: gpu.explicit_gpu_uuids names {uuid!r}, which is not on "
+                    f"this node (it has {[g.uuid for g in ordered]})")
+            gpus.append(found)
     else:                                    # one_per_rank
-        if local_rank >= len(ordered):
+        start = local_rank * count
+        end = start + count
+        if end > len(ordered):
             raise PlacementError(
-                f"{topo.node}: gpu.strategy is one_per_rank and this node was resolved to "
-                f"{local_rank + 1} rank(s), but it has only {len(ordered)} GPU(s)")
-        gpu = ordered[local_rank]
+                f"{topo.node}: gpu.strategy is one_per_rank and rank {local_rank} needs "
+                f"{count} GPU(s) ({end} total through this rank), but this node has only "
+                f"{len(ordered)} GPU(s)")
+        gpus = ordered[start:end]
 
-    if not gpu_spec["allow_sharing"] and gpu.uuid in claimed:
-        raise PlacementError(
-            f"{topo.node}: GPU {gpu.uuid} would be assigned to more than one rank "
-            f"(already held by {claimed[gpu.uuid]}), and gpu.allow_sharing is false")
-    return gpu
+    for gpu in gpus:
+        if not gpu_spec["allow_sharing"] and gpu.uuid in claimed:
+            raise PlacementError(
+                f"{topo.node}: GPU {gpu.uuid} would be assigned to more than one rank "
+                f"(already held by {claimed[gpu.uuid]}), and gpu.allow_sharing is false")
+    return gpus
 
 
-def _assign_cores(intent: dict, topo: NodeTopology, local_rank: int, gpu: Gpu | None,
+def _assign_cores(intent: dict, topo: NodeTopology, local_rank: int, gpus: list[Gpu],
                   used: set[int], mode: str,
                   warnings: list[str]) -> tuple[tuple[int, ...], list[Core]]:
     cpu = intent["cpu"]
@@ -224,16 +243,16 @@ def _assign_cores(intent: dict, topo: NodeTopology, local_rank: int, gpu: Gpu | 
 
     chosen = None
     if strategy == "closest_to_gpu":
-        if gpu is None:
+        if not gpus:
             raise PlacementError(
                 f"{topo.node}: cpu.strategy is closest_to_gpu but rank {local_rank} was "
                 "assigned no GPU to be close to")
-        local = [c for c in candidates if _core_is_local_to(c, gpu)]
+        gpu_ids = [g.uuid or g.index for g in gpus]
+        local = [c for c in candidates if any(_core_is_local_to(c, g) for g in gpus)]
         if not local:
             message = (f"{topo.node}: cpu.strategy is closest_to_gpu but the topology "
-                       f"exposes no cores local to GPU {gpu.uuid or gpu.index} "
-                       f"(numa={gpu.numa}, source={gpu.numa_source}, "
-                       f"confidence={topo.confidence})")
+                       f"exposes no cores local to GPU(s) {gpu_ids} "
+                       f"(confidence={topo.confidence})")
             if mode == "strict":
                 raise PlacementError(message)
             warnings.append(message + " — falling back to any available core")
@@ -241,8 +260,8 @@ def _assign_cores(intent: dict, topo: NodeTopology, local_rank: int, gpu: Gpu | 
             chosen = _take_cores(local, used, count, cpu["allow_overlap"])
             if chosen is None and mode == "strict":
                 raise PlacementError(
-                    f"{topo.node}: rank {local_rank} needs {count} core(s) local to GPU "
-                    f"{gpu.uuid or gpu.index}, but only {len(local)} such core(s) exist "
+                    f"{topo.node}: rank {local_rank} needs {count} core(s) local to GPU(s) "
+                    f"{gpu_ids}, but only {len(local)} such core(s) exist "
                     f"and {len([c for c in local if set(c.cpu_ids) & used])} are taken")
             if chosen is None:
                 warnings.append(
@@ -316,10 +335,10 @@ def resolve(intent: dict, topologies: list[NodeTopology], *,
         claimed_gpus: dict[str, str] = {}
 
         for local_rank in range(per_node):
-            gpu = _assign_gpu(intent, topo, local_rank, ordered_gpus, claimed_gpus, mode)
-            cpu_ids, cores = _assign_cores(intent, topo, local_rank, gpu, used_cpus,
+            gpus = _assign_gpus(intent, topo, local_rank, ordered_gpus, claimed_gpus, mode)
+            cpu_ids, cores = _assign_cores(intent, topo, local_rank, gpus, used_cpus,
                                            mode, warnings)
-            if gpu is not None:
+            for gpu in gpus:
                 claimed_gpus[gpu.uuid] = f"rank {global_rank}"
             used_cpus.update(cpu for core in cores for cpu in core.cpu_ids)
 
@@ -343,12 +362,13 @@ def resolve(intent: dict, topologies: list[NodeTopology], *,
             ranks.append(RankPlacement(
                 global_rank=global_rank, local_rank=local_rank, node=topo.node,
                 cpu_ids=cpu_ids, cpu_slots=slots, numa_nodes=numa,
-                gpu_uuid=gpu.uuid if gpu else None,
-                gpu_pci_bus_id=gpu.pci_bus_id if gpu else None,
-                # With one device made visible per rank, the application sees it
-                # at index 0 regardless of its physical enumeration — that is the
-                # point of pinning visibility rather than trusting device order.
-                visible_gpu_index=0 if gpu else None,
+                gpu_uuids=tuple(g.uuid for g in gpus),
+                gpu_pci_bus_ids=tuple(g.pci_bus_id for g in gpus),
+                # With devices made visible in THIS order, the application sees
+                # gpu_uuids[i] as its own device i regardless of physical
+                # enumeration — that is the point of pinning visibility rather
+                # than trusting device order.
+                visible_gpu_indices=tuple(range(len(gpus))),
             ))
             global_rank += 1
 
@@ -381,13 +401,12 @@ def _assert_globally_consistent(intent: dict, ranks: list[RankPlacement]) -> Non
     if not intent["gpu"]["allow_sharing"]:
         seen: dict[str, int] = {}
         for rank in ranks:
-            if rank.gpu_uuid is None:
-                continue
-            if rank.gpu_uuid in seen:
-                raise PlacementError(
-                    f"GPU {rank.gpu_uuid} is assigned to both rank {seen[rank.gpu_uuid]} "
-                    f"and rank {rank.global_rank}, and gpu.allow_sharing is false")
-            seen[rank.gpu_uuid] = rank.global_rank
+            for uuid in rank.gpu_uuids:
+                if uuid in seen:
+                    raise PlacementError(
+                        f"GPU {uuid} is assigned to both rank {seen[uuid]} "
+                        f"and rank {rank.global_rank}, and gpu.allow_sharing is false")
+                seen[uuid] = rank.global_rank
 
     if not intent["cpu"]["allow_overlap"]:
         owner: dict[tuple[str, int], int] = {}

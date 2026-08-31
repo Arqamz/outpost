@@ -78,7 +78,7 @@ def _k8s_slots() -> list[NodeRecord]:
     pods. Slot count just bounds how many gangs Outpost hands KAI concurrently.
 
     Multi-cluster: CLUSTER_K8S_CLUSTERS lets several k8s clusters live under one
-    control plane (e.g. the VM's L20 + the PC's 5060 Ti). Format is a
+    control plane (e.g. an AWS GPU worker + the PC's 5060 Ti). Format is a
     comma-separated list of `name:kube_context:slots`, e.g.
     `vm:kind-vm:8,pc:kind-pc:4` -> slots `k8s-vm-0..7` (context kind-vm) +
     `k8s-pc-0..3` (context kind-pc). A `backend: k8s` job targets one via

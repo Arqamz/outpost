@@ -1,0 +1,10 @@
+# Single-node GPU smoke test on the AWS static-ssh worker (aws-gpu-1), through
+# the full reconciler pipeline (not raw apptainer) — confirms provision/
+# bootstrap/run/collect all work end-to-end against a real AWS box.
+name: aws-gpu-smoke
+gpu: true
+node_count: 1
+runtime: apptainer
+image: "docker://nvidia/cuda:12.6.3-base-ubuntu24.04"
+command: ["sh", "-c", "nvidia-smi | tee /out/nvidia-smi.txt"]
+output_dir: "/out"

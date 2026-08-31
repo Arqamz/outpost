@@ -26,7 +26,7 @@ is intentionally generic — the cluster runs *any* container:
 | `env` | map | env vars set inside the container |
 | `output_dir` | str | in-container path the job writes results to (bound to the host) |
 | `params` | map | opaque passthrough (ignored by the cluster) |
-| `launch` | map, optional | a semantic placement request (`launch-intent/v1`, see [`contract/README.md`](../contract/README.md)) — resolved against real topology for `launcher: mpi` jobs only; see "Placement" below. Absent = today's behavior, unchanged. |
+| `launch` | map, optional | a semantic placement request (`launch-intent/v1`, see [`contract/README.md`](../contract/README.md)) — resolved against real topology for `launcher: mpi` jobs (any `node_count`) or `launcher: single` at `node_count: 1`; see "Placement" below. Absent = today's behavior, unchanged. |
 
 **The cluster promises:** given a JobSpec, it schedules the right resource
 (waiting for capacity to free up if needed, not failing immediately — see
@@ -53,13 +53,16 @@ Two ways to write the spec today:
 
 ## Placement — declaring and verifying where ranks actually ran
 
-A `launcher: mpi` `JobSpec` may carry an optional `launch` block (`contract/
-launch-intent/v1/launch-intent.schema.json`) — a semantic statement of the
-placement a benchmark needs (ranks per node, cores per rank, GPU binding),
-with no CPU ids, device indices, or launcher flags (those depend on the
-allocation, which the caller cannot know at submit time). Any other launcher
-shape (`launcher: single`, `backend: k8s`) refuses a job carrying one rather
-than running it under a placement nobody chose.
+A `launcher: mpi` `JobSpec` (any `node_count`), or a `launcher: single`
+`JobSpec` at `node_count: 1` (one container, one node — e.g. HPL's own
+internal `mpirun` fanning out across every GPU its one container is given),
+may carry an optional `launch` block (`contract/launch-intent/v1/launch-
+intent.schema.json`) — a semantic statement of the placement a benchmark
+needs (ranks per node, cores per rank, GPU binding), with no CPU ids, device
+indices, or launcher flags (those depend on the allocation, which the caller
+cannot know at submit time). Any other shape (`launcher: single` at
+`node_count > 1`, `backend: k8s`) refuses a job carrying one rather than
+running it under a placement nobody chose.
 
 When present, the job passes through two additional states between
 `bootstrapping` and `running`:

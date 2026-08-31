@@ -48,8 +48,8 @@ def observation(plan, rank_index: int = 0, **over) -> dict:
         "allowed_cpus": ",".join(str(c) for c in rank.cpu_ids),
         "allowed_mems": "0", "current_cpu": rank.cpu_ids[0] if rank.cpu_ids else 0,
         "online_cpus": "0-7",
-        "cuda_visible_devices": rank.gpu_uuid or "",
-        "driver_gpu_uuids": rank.gpu_uuid or "",
+        "cuda_visible_devices": ",".join(rank.gpu_uuids),
+        "driver_gpu_uuids": ",".join(rank.gpu_uuids),
         "driver_gpu_count": 1,
     }
     return {**doc, **over}

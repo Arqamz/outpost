@@ -1,0 +1,31 @@
+# Cross-node GPU-affinity proof on the AWS pair (aws-gpu-1, aws-gpu-2), same
+# VPC/subnet. 1 rank/node, gpu.strategy: one_per_rank -> each node's single
+# GPU assigned to its local rank 0, receipt-verified. Non-collective workload
+# (device visibility only) so mpirun returns cleanly.
+name: aws-gpu-pinning-proof
+launcher: mpi
+node_count: 2
+gpu: true
+runtime: apptainer
+image: "docker://nvidia/cuda:12.6.3-base-ubuntu24.04"
+command: ["sh", "-c", "echo CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES; nvidia-smi --query-gpu=uuid,name --format=csv,noheader"]
+output_dir: "/out"
+launch:
+  schema_version: launch-intent/v1
+  approval: auto
+  process: { ranks_per_node: 1, threads_per_rank: 1 }
+  cpu:
+    cores_per_rank: null
+    strategy: none
+    binding_unit: none
+    smt: physical_only
+    allow_overlap: false
+    explicit_cpu_ids: null
+  memory: { strategy: none }
+  gpu:
+    gpus_per_rank: 1
+    strategy: one_per_rank
+    ordering: pci_bus
+    allow_sharing: false
+    explicit_gpu_uuids: null
+  validation: { mode: strict, require_preflight: true }

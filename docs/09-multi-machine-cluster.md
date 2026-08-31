@@ -23,8 +23,9 @@ The last two are the ones this doc wires up across machines.
 
 ## The two-machine layout used here
 
-- **VM** (server: 32c / 128 GB / L20 48 GB, native Ubuntu) → **control plane +
-  drop-zone**, its own CPU VMs, and a **k8s+HAMi cluster on the L20**.
+- **VM** (server, native Ubuntu) → **control plane + drop-zone**, its own CPU
+  VMs, and a **k8s+HAMi cluster on an AWS GPU worker instance** (see
+  `infra/aws/` + the `tashkil-golden-images` `worker` GPU flavor).
 - **PC** (NixOS: 16c / 64 GB / 5060 Ti 16 GB) → attached **two ways**: a
   **static-ssh GPU worker** (bare `apptainer --nv`) *and* its **own k8s+HAMi
   cluster** on the 5060 Ti. "PC is one cluster, VM is another" — both under the
@@ -75,10 +76,10 @@ add a dedicated selector later.)
 
 ## Step 3 — the two k8s+HAMi clusters
 
-- **VM L20** on native Ubuntu: follow
-  [`infra/k8s/ubuntu-l20-setup.md`](../infra/k8s/ubuntu-l20-setup.md) (simpler
-  than the NixOS recipe — stock `nvidia-container-toolkit`, no `/nix/store` CDI
-  work). Gives a kube-context, e.g. `kind-vm`.
+- **AWS GPU worker** on stock Ubuntu (the golden `worker` GPU flavor — driver +
+  `nvidia-container-toolkit` already baked, see `tashkil-golden-images`): follow
+  [`setup.sh`](../infra/k8s/setup.sh)'s stock-Ubuntu steps (simpler than the
+  NixOS recipe — no `/nix/store` CDI work). Gives a kube-context, e.g. `kind-aws`.
 - **PC 5060 Ti** on NixOS: already stood up via
   [`infra/k8s/setup.sh`](../infra/k8s/setup.sh) → context `kind-outpost`.
 
@@ -93,7 +94,7 @@ cluster as-is. Two options:
    context at `https://127.0.0.1:6444` (simplest for a demo; the tunnel must stay
    up while jobs run).
 
-Verify from the VM: `kubectl --context kind-vm get nodes` and
+Verify from the VM: `kubectl --context kind-aws get nodes` and
 `kubectl --context kind-pc get nodes` both succeed.
 
 ## Step 4 — seed both clusters as slot pools, then run
@@ -103,10 +104,10 @@ each becomes a pool of slots the reconciler can target:
 
 ```bash
 CLUSTER_K8S_BACKEND=1 \
-CLUSTER_K8S_CLUSTERS="vm:kind-vm:8,pc:kind-pc:4" \
+CLUSTER_K8S_CLUSTERS="aws:kind-aws:8,pc:kind-pc:4" \
   cluster seed-nodes
 cluster nodes
-#   k8s-slot-vm-0..7   gpu · k8s · ctx=kind-vm
+#   k8s-slot-aws-0..7   gpu · k8s · ctx=kind-aws
 #   k8s-slot-pc-0..3   gpu · k8s · ctx=kind-pc
 #   pc-gpu             gpu · static-ssh · binds=/nix/store,...
 #   + any VM CPU nodes
@@ -116,14 +117,14 @@ Target a specific cluster per job with `params.k8s_context` (else it lands on an
 free slot):
 
 ```yaml
-# a gang on the big L20 (48 GB -> big slices / many ranks)
-name: sim-l20
+# a gang on the AWS GPU worker (big slices / many ranks)
+name: sim-aws-gpu
 backend: k8s
 image: "nvcr.io/nvidia/pytorch:24.10-py3"
 command: ["bash","-lc","python -c 'import torch;print(torch.cuda.get_device_name())'"]
 node_count: 4
 gpu: true
-params: { gpu_memory_mb: 8192, k8s_context: kind-vm }
+params: { gpu_memory_mb: 8192, k8s_context: kind-aws }
 ```
 
 ```bash
@@ -146,7 +147,13 @@ make dashboard                          # gangs on both clusters, live
 
 - **Federation / cluster-of-clusters.** One reconciler, one pool. The k8s backend
   is the only "sub-scheduler under Outpost" that exists.
-- **A single `mpirun` spanning two machines.** The MPI fabric pinning is specific
-  to the single-host libvirt `/24` bridge (see `adapter.fabric_if_include`);
-  across a LAN/overlay it's latency-bound and mis-matches. Keep cross-machine
-  jobs `launcher: single`, or use a k8s gang (same GPU box) for multi-rank work.
+- **A single `mpirun` spanning two machines that aren't on one shared subnet.**
+  `adapter.fabric_if_include`'s `/24` subnet assumption needs both nodes'
+  `ip` values to actually share that subnet — true for the libvirt cluster0
+  bridge and for two AWS instances in the same VPC/subnet (use their
+  **private** IPs), false across a LAN/WAN/overlay with no shared subnet.
+  Keep cross-machine jobs `launcher: single` unless your nodes share a
+  subnet; the launch-control planned path (`_run_mpi_planned`) has been
+  exercised cross-node on same-subnet libvirt VMs (real hardware, see the
+  affinity-ticket summary doc) and is expected to work the same way against
+  two same-VPC AWS instances, unverified there yet.
