@@ -1,0 +1,10 @@
+# Static SSH GPU-worker manifest — tashkil-gpu-test-gpu-worker-2 (AWS EC2
+# g4dn.xlarge, us-east-1, same VPC/subnet as node.aws-gpu-1.yaml). See that
+# file for the SSM/SSH-tunnel notes.
+#   cluster add-node --spec node.aws-gpu-2.yaml
+name: aws-gpu-2
+ip: 172.31.94.28                   # PRIVATE IP — see node.aws-gpu-1.yaml for why
+ssh_user: ubuntu
+ssh_key: ~/.ssh/outpost-ec2
+gpu: true
+runtime: apptainer

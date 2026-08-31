@@ -50,6 +50,29 @@ class ApprovalPending(Exception):
     Not a job defect — the job stays in PLAN_READY, holding its nodes, and
     tick() retries next time, exactly like NoCapacity."""
 
+
+def _launch_plannable(spec: JobSpec) -> tuple[bool, str]:
+    """Can this backend resolve+compile+verify a launch plan for this job shape?
+
+    launcher: mpi -> any node_count (one rank per node/container, the shape
+    the resolver was built for).
+    launcher: single -> only node_count == 1: one container, one node — HPL's
+    own internal mpirun (see hpl.py) only ever sees ONE container, so a plan
+    resolved against >1 claimed node has no launch path that spans it.
+    backend: k8s -> never: KubernetesAdapter.run() never consumes `plan` — the
+    kubelet, not this resolver, owns in-pod CPU/GPU assignment.
+    """
+    if spec.backend == "k8s":
+        return False, ("backend: k8s does not consume a resolved launch plan — "
+                        "in-pod CPU/GPU assignment is the kubelet's job, not this resolver's")
+    if spec.launcher == "mpi":
+        return True, ""
+    if spec.launcher == "single" and spec.node_count == 1:
+        return True, ""
+    return False, (f"launcher={spec.launcher!r} with node_count={spec.node_count} is not "
+                   "a shape this backend resolves plans for (launcher: mpi at any "
+                   "node_count, or launcher: single at node_count: 1, only)")
+
 # Cap on how many jobs' phases run concurrently in one tick. Threads, not
 # processes — each phase is I/O-bound (ssh/scp/subprocess), so this is cheap;
 # it exists to bound simultaneous ssh/ansible load against the VM pool, not
@@ -242,19 +265,20 @@ class Reconciler:
         unsupported = launch_models.unsupported_reason(spec.launch)
         if unsupported:
             raise ValueError(unsupported)
-        # _phase_plan (placement.resolve + launcher.for_plan, wired below) only
-        # targets the one-rank-per-node/per-container shape launcher: mpi gives
-        # it. launcher: single packs every rank into ONE container's own
-        # internal mpirun (see hpl.py) — nothing here compiles a plan for that.
+        # _phase_plan (placement.resolve + launcher.for_plan, wired below)
+        # targets launcher: mpi (any node_count — one rank per node/container)
+        # and launcher: single at node_count: 1 (one container, one node —
+        # HPL's own internal mpirun, see hpl.py, only ever sees ONE container).
         # backend: k8s is further out still: the kubelet, not this cluster,
-        # owns in-pod CPU/GPU assignment. Both still refuse loudly rather than
-        # run the requested placement silently ignored.
-        if spec.launch is not None and spec.launcher != "mpi":
-            raise ValueError(
-                f"spec.launch was supplied with launcher={spec.launcher!r}, but this "
-                "backend only resolves launch plans for launcher: mpi today. Refusing "
-                "rather than running the benchmark with the requested placement "
-                "silently ignored.")
+        # owns in-pod CPU/GPU assignment. Everything else still refuses loudly
+        # rather than run the requested placement silently ignored.
+        if spec.launch is not None:
+            ok, reason = _launch_plannable(spec)
+            if not ok:
+                raise ValueError(
+                    f"spec.launch was supplied, but {reason}. Refusing rather than "
+                    "running the benchmark with the requested placement silently "
+                    "ignored.")
         # Claim BEFORE transitioning state: if the pool can't cover this job
         # (NoCapacity), the job must stay untouched in SUBMITTED so tick()'s
         # wait-and-retry path has something to retry — not a half-provisioned
@@ -264,7 +288,7 @@ class Reconciler:
             # a small pool of interchangeable k8s slots); node_count is the gang
             # size, realized as N pods inside the KubernetesAdapter's run().
             # params.k8s_context optionally pins the job to one cluster (e.g. the
-            # 48GB L20 vs the 16GB 5060 Ti) when several are registered.
+            # 48GB A100 vs the 16GB 5060 Ti) when several are registered.
             target_ctx = spec.params.get("k8s_context") or None
             kind = f"k8s (gang x{spec.node_count}{f' @ {target_ctx}' if target_ctx else ''})"
             nodes = self.registry.claim(job.job_id, 1, backend="k8s", kube_context=target_ctx)
@@ -316,14 +340,14 @@ class Reconciler:
     def _phase_plan(self, job: JobRecord) -> None:
         """Resolve spec.launch against the topology actually allocated.
 
-        OPT-IN ONLY: a job with no placement request, or on a launcher this
+        OPT-IN ONLY: a job with no placement request, or on a shape this
         cluster does not resolve plans for yet (enforced earlier, in
-        _phase_provision), skips PLANNING/PLAN_READY entirely and runs exactly
-        the path it always did — _phase_run, unchanged. Only a launcher: mpi
-        job carrying a launch block takes the new states.
+        _phase_provision, and re-checked here defensively via the same
+        _launch_plannable helper), skips PLANNING/PLAN_READY entirely and runs
+        exactly the path it always did — _phase_run, unchanged.
         """
         spec = JobSpec.from_dict(job.spec)
-        if spec.launch is None or spec.launcher != "mpi":
+        if spec.launch is None or not _launch_plannable(spec)[0]:
             self._phase_run(job)
             return
         self._set_job(job, JobState.PLANNING, "resolving placement against allocated topology")
@@ -363,6 +387,24 @@ class Reconciler:
             raise RuntimeError(f"workload exited {result.exit_code}")
 
     def _phase_collect(self, job: JobRecord) -> None:
+        if job.run is None:
+            # _phase_run is the ONLY place job.run is set, right after
+            # adapter.run() returns. A RUNNING job with no run result means
+            # the reconciler process that launched it died before
+            # adapter.run() ever returned — the RUNNING dispatch entry maps
+            # here (not back to _phase_run) deliberately, since blindly
+            # re-running could duplicate a workload still in flight on the
+            # remote nodes. But collecting anyway would silently promote a
+            # job that may never have actually run: refuse instead, the same
+            # rule this repo applies everywhere else (a declared-but-
+            # uncaptured result is a bug, not something to paper over).
+            # Found live: a killed reconcile tick left a job "promoted" with
+            # an empty drop-zone and no launch-receipt.yaml.
+            raise RuntimeError(
+                "job is RUNNING but has no run result recorded — the process "
+                "that launched it likely died before the workload finished; "
+                "refusing to collect an unverified result rather than "
+                "promoting a job that may never have actually run")
         spec = JobSpec.from_dict(job.spec)
         self._set_job(job, JobState.COLLECTING, "collecting artifacts to drop-zone")
         nodes = [self.store.get_node(nid) for nid in job.assigned_nodes]

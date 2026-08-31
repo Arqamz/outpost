@@ -134,7 +134,7 @@
         },
         "strategy": {
           "enum": ["none", "one_per_rank", "explicit"],
-          "description": "'one_per_rank': assign a distinct discovered GPU to each rank. 'explicit': use explicit_gpu_uuids verbatim. 'none': make no GPU assignment (the workload sees whatever the container exposes)."
+          "description": "'one_per_rank': assign the next gpus_per_rank distinct discovered GPU(s), in device order, to each rank (gpus_per_rank == 1 is the common case — one distinct GPU per rank). 'explicit': use explicit_gpu_uuids verbatim. 'none': make no GPU assignment (the workload sees whatever the container exposes)."
         },
         "ordering": {
           "enum": ["pci_bus", "fastest_first"],
@@ -147,8 +147,12 @@
         "explicit_gpu_uuids": {
           "type": ["array", "null"],
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 },
-          "description": "Per-rank GPU UUIDs, indexed by LOCAL rank, matching the cpu.explicit_cpu_ids convention. Required when strategy is 'explicit' and forbidden otherwise. Each UUID is validated to exist on the node the rank lands on."
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "description": "Per-rank GPU UUID lists, indexed by LOCAL rank, matching the cpu.explicit_cpu_ids convention. Each inner list's length must equal gpus_per_rank. Required when strategy is 'explicit' and forbidden otherwise. Each UUID is validated to exist on the node the rank lands on."
         }
       },
       "allOf": [

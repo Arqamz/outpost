@@ -126,21 +126,39 @@ class TestFailurePaths:
         assert job.assigned_nodes == [], "a rejected shape must not hold capacity"
         assert_pool_returned(store)
 
-    def test_launch_intent_on_an_unsupported_launcher_is_refused_before_claiming(
+    def test_launch_intent_on_single_launcher_with_multiple_nodes_is_refused_before_claiming(
             self, store, seed, make_reconciler, spec):
-        # Planning only resolves launcher: mpi jobs — a launch block on the
-        # default launcher: single must still stop the job before it claims
-        # anything, or it would run under whatever placement the launcher
-        # defaults to while the caller believes their request was applied.
+        # launcher: single is one container, one node — HPL's own internal
+        # mpirun only ever sees ONE container, so a plan resolved against >1
+        # claimed node has no launch path that spans it. Must still stop the
+        # job before it claims anything.
         intent = launch_intent()
         seed(cpu=2)
         rec, fake = make_reconciler()
-        job_id = rec.submit(spec(launch=intent))        # launcher defaults to "single"
+        job_id = rec.submit(spec(launcher="single", node_count=2, launch=intent))
         drive(rec)
 
         job = store.get_job(job_id)
         assert job.state == FAILED
-        assert "only resolves launch plans for launcher: mpi" in job.error
+        assert "not a shape this backend resolves plans for" in job.error
+        assert job.assigned_nodes == [], "a job we cannot run must not hold capacity"
+        assert fake.phases_for(job_id) == [], "nothing should have been provisioned"
+        assert_pool_returned(store)
+
+    def test_launch_intent_on_k8s_backend_is_refused_before_claiming(
+            self, store, seed, make_reconciler, spec):
+        # The kubelet, not this resolver, owns in-pod CPU/GPU assignment —
+        # widening the launcher gate must not let a k8s job sail through
+        # planning only to have KubernetesAdapter.run() silently drop the plan.
+        intent = launch_intent()
+        seed(cpu=2)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec(backend="k8s", launcher="single", node_count=1, launch=intent))
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == FAILED
+        assert "kubelet" in job.error
         assert job.assigned_nodes == [], "a job we cannot run must not hold capacity"
         assert fake.phases_for(job_id) == [], "nothing should have been provisioned"
         assert_pool_returned(store)
@@ -191,6 +209,39 @@ class TestFailurePaths:
         drive(rec)
         # The reason on record is the bootstrap failure, not the cleanup noise.
         assert "injected bootstrap failure" in store.get_job(job_id).error
+
+    def test_a_job_found_running_with_no_run_result_fails_cleanly(self, store, seed,
+                                                                   make_reconciler, spec):
+        # Simulates a reconciler process that died mid-_phase_run: job.state
+        # was already persisted as RUNNING (_phase_run's first action) but
+        # job.run was never set (its last). The RUNNING dispatch entry maps
+        # to _phase_collect, not back to _phase_run, on purpose (re-running
+        # blindly could duplicate a workload still in flight on the remote
+        # nodes) -- but _phase_collect must refuse rather than silently
+        # collect+promote a job that may never have actually run. Found
+        # live: exactly this sequence left a real job "promoted" with an
+        # empty drop-zone and no launch-receipt.yaml.
+        seed(cpu=1)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec())
+        rec.tick()                                    # claim + provision
+        rec.tick()                                    # bootstrap (nodes -> ready)
+        job = store.get_job(job_id)
+        assert job.state == JobState.BOOTSTRAPPING.value
+        job.state = JobState.RUNNING.value
+        job.run = None
+        store.put_job(job)
+        for nid in job.assigned_nodes:
+            rec.registry.advance(nid, NodeState.BUSY, "test: simulate a run already in flight")
+
+        rec.tick()
+
+        job = store.get_job(job_id)
+        assert job.state == FAILED
+        assert "no run result" in job.error
+        assert "run" not in fake.phases_for(job_id), \
+            "must not blindly re-launch a workload that may still be in flight"
+        assert_pool_returned(store)
 
     def test_node_failure_quarantines_it_and_fails_its_job(self, store, seed, make_reconciler,
                                                            spec):
@@ -325,6 +376,24 @@ class TestPlanning:
         assert job.plan_status == "approved"
         assert job.plan and len(job.plan["ranks"]) == 2   # 1 GPU/node (one_per_rank) x 2 nodes
         assert fake.phases_for(job_id).count("probe_topology") == 2  # one per node
+
+    def test_single_launcher_single_node_resolves_and_runs_a_plan(
+            self, store, seed, make_reconciler, spec):
+        # launcher: single at node_count: 1 is the other plannable shape (one
+        # container, one node — HPL's own internal mpirun): same intent
+        # example, same auto-approval override, just one node instead of two.
+        intent = launch_intent()
+        intent["approval"] = "auto"
+        seed(cpu=1)
+        rec, fake = make_reconciler()
+        job_id = rec.submit(spec(launcher="single", node_count=1, launch=intent))
+        drive(rec)
+
+        job = store.get_job(job_id)
+        assert job.state == PROMOTED
+        assert job.plan_status == "approved"
+        assert job.plan and len(job.plan["ranks"]) == 1
+        assert fake.phases_for(job_id).count("probe_topology") == 1
 
     def test_manual_approval_holds_the_job_in_plan_ready_until_approved(
             self, store, seed, make_reconciler, spec):

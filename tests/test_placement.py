@@ -62,7 +62,7 @@ class TestOneRankPerGpu:
 
     def test_each_rank_gets_a_distinct_gpu(self):
         plan = resolve(intent(), [topo("2socket_8gpu")])
-        uuids = [r.gpu_uuid for r in plan.ranks]
+        uuids = [r.gpu_uuids[0] for r in plan.ranks]
         assert len(set(uuids)) == 8 and all(uuids)
 
     def test_cores_are_local_to_the_assigned_gpu(self):
@@ -89,11 +89,11 @@ class TestOneRankPerGpu:
         # whatever its physical enumeration — that is the point of pinning
         # visibility rather than trusting device order.
         plan = resolve(intent(), [topo("2socket_8gpu")])
-        assert {r.visible_gpu_index for r in plan.ranks} == {0}
+        assert {r.visible_gpu_indices for r in plan.ranks} == {(0,)}
 
     def test_pci_addresses_are_carried_for_verification(self):
         plan = resolve(intent(), [topo("2socket_8gpu")])
-        assert all(r.gpu_pci_bus_id for r in plan.ranks)
+        assert all(r.gpu_pci_bus_ids for r in plan.ranks)
 
 
 class TestSmt:
@@ -258,16 +258,16 @@ class TestExplicitPlacement:
 
     def test_explicit_cpus_and_gpus_are_honoured_verbatim(self):
         t = topo("2socket_8gpu")
-        doc = self._explicit(gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[1].uuid]})
+        doc = self._explicit(gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[1].uuid]]})
         plan = resolve(doc, [t])
         assert [r.cpu_ids for r in plan.ranks] == [(0, 1, 2, 3), (8, 9, 10, 11)]
-        assert [r.gpu_uuid for r in plan.ranks] == [t.gpus[0].uuid, t.gpus[1].uuid]
+        assert [r.gpu_uuids[0] for r in plan.ranks] == [t.gpus[0].uuid, t.gpus[1].uuid]
 
     def test_cpus_outside_the_allocation_are_refused(self):
         t = topo("cgroup_restricted")
         doc = self._explicit(
             cpu={"explicit_cpu_ids": [[0, 1, 2, 3], [90, 91, 92, 93]]},
-            gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[1].uuid]})
+            gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[1].uuid]]})
         with pytest.raises(PlacementError, match="not in this allocation"):
             resolve(doc, [t])
 
@@ -275,7 +275,7 @@ class TestExplicitPlacement:
         t = topo("2socket_8gpu")
         doc = self._explicit(
             cpu={"explicit_cpu_ids": [[0, 1, 2, 3], [3, 4, 5, 6]]},
-            gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[1].uuid]})
+            gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[1].uuid]]})
         with pytest.raises(PlacementError, match="already assigned"):
             resolve(doc, [t])
 
@@ -283,39 +283,71 @@ class TestExplicitPlacement:
         t = topo("2socket_8gpu")
         doc = self._explicit(
             cpu={"explicit_cpu_ids": [[0, 1, 2, 3], [3, 4, 5, 6]], "allow_overlap": True},
-            gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[1].uuid]})
+            gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[1].uuid]]})
         assert len(resolve(doc, [t]).ranks) == 2
 
     def test_an_unknown_gpu_uuid_is_refused(self):
         t = topo("2socket_8gpu")
-        doc = self._explicit(gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, "GPU-not-here"]})
+        doc = self._explicit(gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], ["GPU-not-here"]]})
         with pytest.raises(PlacementError, match="not on this node"):
             resolve(doc, [t])
 
     def test_a_duplicate_gpu_is_refused(self):
         t = topo("2socket_8gpu")
-        doc = self._explicit(gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[0].uuid]})
+        doc = self._explicit(gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[0].uuid]]})
         with pytest.raises(PlacementError, match="more than one rank"):
             resolve(doc, [t])
 
     def test_sharing_is_allowed_when_asked_for(self):
         t = topo("2socket_8gpu")
-        doc = self._explicit(gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[0].uuid],
+        doc = self._explicit(gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[0].uuid]],
                                   "allow_sharing": True})
-        assert {r.gpu_uuid for r in resolve(doc, [t]).ranks} == {t.gpus[0].uuid}
+        assert {r.gpu_uuids[0] for r in resolve(doc, [t]).ranks} == {t.gpus[0].uuid}
 
     def test_too_few_explicit_entries_for_the_rank_count_is_refused(self):
         t = topo("2socket_8gpu")
         doc = self._explicit(process={"ranks_per_node": 3},
-                             gpu={"explicit_gpu_uuids": [t.gpus[0].uuid, t.gpus[1].uuid]})
+                             gpu={"explicit_gpu_uuids": [[t.gpus[0].uuid], [t.gpus[1].uuid]]})
         with pytest.raises(PlacementError, match="entr"):
             resolve(doc, [t])
+
+
+class TestMultiGpuPerRank:
+    """gpus_per_rank > 1: one rank owns several GPUs (e.g. HPL's own internal
+    mpirun fanning out across every GPU its one container is given). No real
+    hardware has ≥2 GPUs on one node today, so this is proven in-process only,
+    the same way the existing intra-node multi-GPU gap is already documented
+    as untestable on real hardware elsewhere."""
+
+    def test_one_per_rank_takes_a_contiguous_slice_per_rank(self):
+        t = topo("2socket_8gpu")
+        doc = intent(process={"ranks_per_node": 2}, cpu={"cores_per_rank": 2},
+                    gpu={"gpus_per_rank": 2, "strategy": "one_per_rank"})
+        plan = resolve(doc, [t])
+        assert len(plan.ranks) == 2
+        assert [r.gpu_uuids for r in plan.ranks] == [
+            tuple(g.uuid for g in t.gpus[0:2]),
+            tuple(g.uuid for g in t.gpus[2:4]),
+        ]
+        assert plan.ranks[0].visible_gpu_indices == (0, 1)
+        assert plan.ranks[1].visible_gpu_indices == (0, 1)
+
+    def test_explicit_strategy_honours_a_multi_gpu_list_per_rank(self):
+        t = topo("2socket_8gpu")
+        doc = json.loads((EXAMPLES / "explicit-placement.json").read_text())
+        doc = _merge(doc, {
+            "process": {"ranks_per_node": 1},
+            "cpu": {"explicit_cpu_ids": [[0, 1, 2, 3]]},
+            "gpu": {"gpus_per_rank": 2, "explicit_gpu_uuids": [[t.gpus[3].uuid, t.gpus[0].uuid]]},
+        })
+        plan = resolve(doc, [t])
+        assert plan.ranks[0].gpu_uuids == (t.gpus[3].uuid, t.gpus[0].uuid)
 
 
 class TestDeviceOrdering:
     def test_pci_bus_order_is_stable(self):
         plan = resolve(intent(), [topo("2socket_8gpu")])
-        pci = [r.gpu_pci_bus_id for r in plan.ranks]
+        pci = [r.gpu_pci_bus_ids[0] for r in plan.ranks]
         assert pci == sorted(pci)
 
     def test_fastest_first_prefers_the_larger_device(self):
@@ -324,7 +356,7 @@ class TestDeviceOrdering:
         t = normalize(doc, "n1")
         plan = resolve(intent(gpu={"ordering": "fastest_first"},
                               cpu={"cores_per_rank": 2}), [t])
-        assert plan.ranks[0].gpu_uuid == doc["gpus"][3]["uuid"]
+        assert plan.ranks[0].gpu_uuids[0] == doc["gpus"][3]["uuid"]
 
 
 class TestNoOpinion:
@@ -336,7 +368,7 @@ class TestNoOpinion:
                               gpu={"strategy": "none", "gpus_per_rank": 0}),
                        [topo("vm_guest")])
         assert len(plan.ranks) == 2
-        assert all(r.cpu_ids == () and r.gpu_uuid is None for r in plan.ranks)
+        assert all(r.cpu_ids == () and r.gpu_uuids == () for r in plan.ranks)
 
 
 class TestGlobalConsistency:

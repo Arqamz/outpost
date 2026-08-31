@@ -158,7 +158,7 @@ class NodeRecord:
     # detects). Only consulted for gpu runs; empty = plain --nv.
     gpu_binds: str = ""
     # for a k8s-backend slot: which kube-context (i.e. which cluster) it targets,
-    # so several k8s clusters (e.g. the VM's L20 + the PC's 5060 Ti) can live
+    # so several k8s clusters (e.g. an AWS GPU worker + the PC's 5060 Ti) can live
     # under ONE control plane. "" -> the adapter's global CLUSTER_K8S_CONTEXT
     # (current kube-context). Ignored by every non-k8s node.
     kube_context: str = ""

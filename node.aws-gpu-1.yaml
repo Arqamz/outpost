@@ -1,0 +1,22 @@
+# Static SSH GPU-worker manifest — tashkil-gpu-test-gpu-worker-1 (AWS EC2
+# g4dn.xlarge, us-east-1, vpc-04b53daf3842d623d). No inbound SG rule for SSH
+# (self-referencing SG only) — reachable from this control plane via an SSM
+# port-forward, transparently, through a `~/.ssh/config` Host block keyed on
+# this IP (see outpost's docs/09-multi-machine-cluster.md).
+#
+# MUST be the PRIVATE IP, not public: this same node.ip is also what
+# _run_mpi_planned puts in the mpirun appfile's --host for cross-node MPI
+# (launcher: mpi + a launch: intent) — a public IP isn't bound to any local
+# interface (NAT'd at the VPC edge only), so OpenMPI can't route to it, not
+# even for the box's own rank ("ORTE does not know how to route a message to
+# the specified daemon"). Confirmed live. Single-node (launcher: single) GPU
+# jobs would've worked fine with either IP; this only bites multi-node MPI.
+#   cluster add-node --spec node.aws-gpu-1.yaml
+name: aws-gpu-1
+ip: 172.31.87.50                   # PRIVATE IP; SSH tunnels over SSM (see ~/.ssh/config)
+ssh_user: ubuntu
+ssh_key: ~/.ssh/outpost-ec2
+gpu: true
+runtime: apptainer
+# Ubuntu 24.04: apptainer --nv self-detects the NVIDIA driver via ldconfig,
+# so NO gpu_binds (a missing bind source is a hard apptainer error).

@@ -48,7 +48,7 @@ class Store:
         is how a `backend: k8s` job claims a k8s slot instead of a VM/host.
 
         kube_context set (only meaningful with provider="k8s") -> match ONLY
-        slots on that cluster, so a job can target the L20 vs the 5060 Ti when
+        slots on that cluster, so a job can target one AWS GPU worker vs the 5060 Ti when
         several k8s clusters are registered. None -> any slot of the backend.
 
         provider=None (default, the VM/host/static pool) -> require_gpu=True

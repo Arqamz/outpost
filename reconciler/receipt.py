@@ -47,8 +47,8 @@ class RankVerification:
     observed: bool
     planned_cpu_ids: tuple[int, ...]
     observed_cpu_ids: tuple[int, ...]
-    planned_gpu_uuid: str | None
-    observed_gpu_uuid: str | None
+    planned_gpu_uuids: tuple[str, ...]
+    observed_gpu_uuids: tuple[str, ...]
     launcher_claim: str | None            # what --report-bindings said, verbatim
     mismatches: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
@@ -110,7 +110,7 @@ def _verify_rank(planned, observation: dict | None,
         return RankVerification(
             global_rank=planned.global_rank, node=planned.node, observed=False,
             planned_cpu_ids=planned.cpu_ids, observed_cpu_ids=(),
-            planned_gpu_uuid=planned.gpu_uuid, observed_gpu_uuid=None,
+            planned_gpu_uuids=planned.gpu_uuids, observed_gpu_uuids=(),
             launcher_claim=(report or {}).get("claim"),
             mismatches=("no preflight observation was returned for this rank; its placement "
                         "is unknown, which is not the same as correct",))
@@ -146,16 +146,21 @@ def _verify_rank(planned, observation: dict | None,
     if report is not None and report.get("bound") is False and planned.cpu_ids:
         mismatches.append(f"the launcher reported this rank as not bound: {report['claim']}")
 
-    observed_gpu = (observation.get("cuda_visible_devices") or "").strip() or None
-    if planned.gpu_uuid:
-        if observed_gpu != planned.gpu_uuid:
+    observed_raw = (observation.get("cuda_visible_devices") or "").strip() or None
+    observed_gpus = tuple(u.strip() for u in (observed_raw or "").split(",") if u.strip())
+    if planned.gpu_uuids:
+        # Order-sensitive: CUDA_VISIBLE_DEVICES order IS the visible-index
+        # order the plan promised, not just set membership.
+        if observed_gpus != planned.gpu_uuids:
             mismatches.append(
-                f"planned GPU {planned.gpu_uuid} but the rank was given "
-                f"CUDA_VISIBLE_DEVICES={observed_gpu!r}")
-        driver = (observation.get("driver_gpu_uuids") or "").split(",")
-        if planned.gpu_uuid not in [d.strip() for d in driver if d.strip()]:
+                f"planned GPU(s) {list(planned.gpu_uuids)} but the rank was given "
+                f"CUDA_VISIBLE_DEVICES={observed_raw!r}")
+        driver = {d.strip() for d in (observation.get("driver_gpu_uuids") or "").split(",")
+                 if d.strip()}
+        missing = [u for u in planned.gpu_uuids if u not in driver]
+        if missing:
             mismatches.append(
-                f"planned GPU {planned.gpu_uuid} is not among the devices the driver exposes "
+                f"planned GPU(s) {missing} are not among the devices the driver exposes "
                 f"on {observation.get('hostname')}")
 
     if observation.get("hostname") and planned.node not in str(observation["hostname"]):
@@ -170,7 +175,7 @@ def _verify_rank(planned, observation: dict | None,
     return RankVerification(
         global_rank=planned.global_rank, node=planned.node, observed=True,
         planned_cpu_ids=planned.cpu_ids, observed_cpu_ids=observed_cpus,
-        planned_gpu_uuid=planned.gpu_uuid, observed_gpu_uuid=observed_gpu,
+        planned_gpu_uuids=planned.gpu_uuids, observed_gpu_uuids=observed_gpus,
         launcher_claim=(report or {}).get("claim"),
         mismatches=tuple(mismatches), notes=tuple(notes),
     )
@@ -201,7 +206,7 @@ def build_receipt(plan: LaunchPlan, observations: list[dict], *,
             RankVerification(
                 global_rank=p.global_rank, node=p.node, observed=False,
                 planned_cpu_ids=p.cpu_ids, observed_cpu_ids=(),
-                planned_gpu_uuid=p.gpu_uuid, observed_gpu_uuid=None,
+                planned_gpu_uuids=p.gpu_uuids, observed_gpu_uuids=(),
                 launcher_claim=(report.get(p.global_rank) or {}).get("claim"))
             for p in plan.ranks)
         return LaunchReceipt(
