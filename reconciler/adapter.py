@@ -59,6 +59,20 @@ RUNS_DIR = os.path.join(REPO_ROOT, ".var", "runs")   # per-job host workdirs
 LOGS_DIR = os.path.join(REPO_ROOT, ".var", "logs")   # replay transcripts (gitignored)
 SIF_CACHE_DIR = os.path.join(REPO_ROOT, ".var", "sif-cache")  # docker://→SIF, keyed by digest
 
+# Remote-side counterpart of SIF_CACHE_DIR — a shared, digest-keyed SIF cache
+# ON EACH REMOTE NODE, reused across every job that node ever runs (not
+# per-job like remote_workdir). Deliberately NOT under /tmp/cluster/<job_id>:
+# that dir is wholly owned by one job and wiped/globbed by collect()'s
+# `rm -f {remote_workdir}/*.sif` teardown, which must never touch this cache.
+# A plain path (no dedicated big disk assumed): safe on any node. A node with
+# extra fast local storage (e.g. an AWS instance-store NVMe) can transparently
+# redirect it with one symlink at setup time (`ln -sfn /mnt/<bigdisk>/outpost-sif-cache
+# /tmp/outpost-sif-cache`) — the code never needs to know or care.
+REMOTE_SIF_CACHE_DIR = os.environ.get("CLUSTER_REMOTE_SIF_CACHE_DIR", "/tmp/outpost-sif-cache")
+# Safety margin for the remote-pull headroom check, on top of the 2-3x
+# multiplier already applied to the known SIF size (see _ensure_remote_sif).
+REMOTE_PULL_HEADROOM_MARGIN_BYTES = 2 * 1024 ** 3
+
 # SSH params for reaching VMs (match infra/libvirt/config.env defaults).
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
 SSH_KEY = os.environ.get("CLUSTER_SSH_PRIVKEY", os.path.expanduser("~/.ssh/outpost-cluster-ssh"))
@@ -832,14 +846,95 @@ class LibvirtAdapter(ProviderAdapter):
                 "pin UCX away from any other interface (e.g. a CNI veth) on the box")
         return iface
 
+    def _remote_free_bytes(self, node: NodeRecord) -> int:
+        """Free space on WHATEVER filesystem actually backs REMOTE_SIF_CACHE_DIR
+        — not `/` unconditionally. A node with a dedicated big/fast disk (e.g.
+        an AWS instance-store NVMe) symlinks REMOTE_SIF_CACHE_DIR onto it (see
+        the constant's docstring); `df` follows the symlink to the real mount
+        on its own, so this reports THAT filesystem's headroom, not root's."""
+        target = shlex.quote(REMOTE_SIF_CACHE_DIR)
+        proc = subprocess.run(
+            self._ssh_base(node) + [f"mkdir -p {target} && df --output=avail -B1 {target} | tail -1"],
+            capture_output=True, text=True)
+        try:
+            return int(proc.stdout.strip())
+        except ValueError:
+            return 0  # df failed/unparseable -> treat as no headroom, forces the safe scp fallback
+
+    def _ensure_remote_sif(self, node: NodeRecord, image: str, job_id: str) -> str:
+        """Get `image` onto `node`'s own disk as a cached, digest-keyed SIF at
+        REMOTE_SIF_CACHE_DIR — shared across every job that node ever runs, not
+        just this one. First job to touch a given digest on a given node pays a
+        real transfer; every later job on that node wanting the SAME digest (all
+        four gtl suites share one pinned image today) is a cache hit — zero
+        transfer, zero build. Mirrors ensure_local_sif's shared-cache/flock
+        design, remote side.
+
+        For a cold cache, prefers a direct remote `apptainer build --force
+        <tmp> docker://…` (the node's own internet egress — confirmed live to
+        be fast, unlike the ~0.7-0.9MB/s SSM-tunnelled scp this would otherwise
+        go through) over scp-ing a locally-built copy, but ONLY when the node
+        reports enough free disk for apptainer's docker:// -> SIF build:
+        roughly 2-3x the final image size at once (compressed OCI layers in
+        its blob cache + the unpacked rootfs mid-conversion + the final SIF)
+        — see _run_launch's docstring for the earlier attempt that hit
+        "no space left on device" without this check. Falls back to the
+        original scp-from-local-cache path when headroom is insufficient or
+        the node's free space can't be read, landing in the shared cache
+        instead of a per-job dir either way."""
+        name = _sif_cache_name(image)
+        final = f"{REMOTE_SIF_CACHE_DIR}/{name}"
+        lock = f"{REMOTE_SIF_CACHE_DIR}/{name}.lock"
+        probe = subprocess.run(self._ssh_base(node) +
+                               [f"mkdir -p {REMOTE_SIF_CACHE_DIR} && test -f {final}"])
+        if probe.returncode == 0:
+            self.log(f"[sif-cache] {node.name}: {name} already cached, reusing (no transfer)")
+            return final
+
+        local_image = ensure_local_sif(image, job_id)
+        size = os.path.getsize(local_image)
+        avail = self._remote_free_bytes(node)
+        headroom_needed = size * 3 + REMOTE_PULL_HEADROOM_MARGIN_BYTES
+        tmp = f"{final}.{job_id}.tmp"
+        if avail >= headroom_needed:
+            self.log(f"[sif-cache] {node.name}: remote-pulling {image} directly "
+                     f"({avail / 1e9:.1f}GB avail >= {headroom_needed / 1e9:.1f}GB needed for the build)")
+            # apptainer's OWN OCI blob cache + build-time rootfs unpack tmpdir
+            # default to $HOME/.apptainer/cache and $TMPDIR/system-/tmp — NOT
+            # wherever the final SIF is told to land. Left unredirected, the
+            # headroom check above is checking the wrong filesystem for two of
+            # the build's three space consumers: confirmed LIVE, a build with
+            # 116GB free at REMOTE_SIF_CACHE_DIR still filled a 15GB root disk
+            # ("no space left on device" mid-unpack under /tmp) because the
+            # blob cache and rootfs tmpdir both silently used root. Pinning
+            # both env vars onto REMOTE_SIF_CACHE_DIR's own filesystem is what
+            # actually makes the headroom check meaningful.
+            oci_cache = f"{REMOTE_SIF_CACHE_DIR}/.apptainer-cache"
+            build_tmp = f"{REMOTE_SIF_CACHE_DIR}/.apptainer-tmp"
+            env = f"APPTAINER_CACHEDIR={shlex.quote(oci_cache)} APPTAINER_TMPDIR={shlex.quote(build_tmp)}"
+            build = (f"mkdir -p {oci_cache} {build_tmp} && test -f {final} || "
+                    f"({env} apptainer build --force {tmp} {shlex.quote(image)} && mv {tmp} {final})")
+            cmd = f"mkdir -p {REMOTE_SIF_CACHE_DIR} && flock {shlex.quote(lock)} -c {shlex.quote(build)}"
+            run_logged(self._ssh_base(node) + [cmd], job_id)
+        else:
+            self.log(f"[sif-cache] {node.name}: insufficient remote headroom for a direct pull "
+                     f"({avail / 1e9:.1f}GB avail < {headroom_needed / 1e9:.1f}GB needed) — "
+                     f"falling back to scp")
+            self._scp_to(node, local_image, tmp, job_id)
+            place = f"test -f {final} || mv {tmp} {final}; rm -f {tmp}"
+            cmd = f"mkdir -p {REMOTE_SIF_CACHE_DIR} && flock {shlex.quote(lock)} -c {shlex.quote(place)}"
+            run_logged(self._ssh_base(node) + [cmd], job_id)
+        return final
+
     def _run_launch(self, nodes: list[NodeRecord], job_id: str, spec: JobSpec,
                     remote_workdir: str, plan: dict | None = None) -> RunResult:
         """Multi-node launch: mpirun runs on the head VM (installed by the
         bootstrap role) and execs `apptainer exec <image> ...` per rank on
         every claimed node over ssh — the container never needs its own MPI
-        launcher, only a matching libmpi. Image is per-job (built from the
-        nodes THIS job claimed, not the cluster-wide 8) and staged fresh onto
-        every claimed node under remote_workdir.
+        launcher, only a matching libmpi. The image is staged onto every
+        claimed node via _ensure_remote_sif — a shared, digest-keyed cache
+        PER NODE (REMOTE_SIF_CACHE_DIR), not a fresh per-job copy: repeat jobs
+        on a node that already has the digest cost zero transfer.
 
         `plan`: a resolved LaunchPlan dict (reconciler.py's _phase_plan) routes
         to _run_planned — per-rank rankfile/argv/env (or, for a single-rank
@@ -847,26 +942,21 @@ class LibvirtAdapter(ProviderAdapter):
         launcher.for_plan(), instead of the one shared command below. None
         (no placement request) keeps this EXACT path, unchanged.
 
-        Tried and reverted: letting a single remote node pull `spec.image`
-        itself (skipping ensure_local_sif + scp) to dodge the SSM-tunnelled
-        scp's throughput cap. Confirmed LIVE that this backfires on a large
-        multi-layer image: apptainer's own `docker://` -> SIF build needs
-        roughly 2-3x the final image size on the TARGET's disk at once
-        (compressed OCI layers in its blob cache + the unpacked rootfs during
-        conversion + the final SIF), not just the final size — it failed with
-        "no space left on device" mid-unpack on a node that had comfortably
-        enough free space for the final SIF alone. A pre-built local SIF
-        scp'd byte-for-byte only ever needs the final size on the target, so
-        it is the disk-SAFER of the two despite being network-slower. Revisit
-        remote pull only alongside a real remote disk-headroom check, not as
-        an unconditional single-node default. (A follow-up PR does exactly
-        that — see the SIF-cache/SSM-speed fix, tracked separately.)"""
-        head = nodes[0]
-        local_image = ensure_local_sif(spec.image, job_id)
-        remote_image = f"{remote_workdir}/{os.path.basename(local_image)}"
+        Direct remote pull (skipping ensure_local_sif + scp entirely) was
+        tried once before and reverted: apptainer's own `docker://` -> SIF
+        build needs roughly 2-3x the final image size on the TARGET's disk at
+        once (compressed OCI layers in its blob cache + the unpacked rootfs
+        during conversion + the final SIF), not just the final size — it
+        failed with "no space left on device" mid-unpack on a node that had
+        comfortably enough free space for the final SIF alone. _ensure_remote_sif
+        now makes that exact call itself per node (real headroom check before
+        choosing pull vs. scp), so this call site no longer needs to pick a
+        strategy — see its docstring for the decision."""
+        remote_image = None
         for n in nodes:
             run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
-            self._scp_to(n, local_image, remote_image, job_id)
+            remote_image = self._ensure_remote_sif(n, spec.image, job_id)
+        head = nodes[0]
 
         if plan is not None:
             return self._run_planned(nodes, job_id, spec, remote_workdir, remote_image, plan)
