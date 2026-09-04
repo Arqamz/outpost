@@ -143,13 +143,18 @@ def _static_nodes(now: float) -> list[dict]:
         return out
     for n in nodes:
         argv = ssh_base(n.ip, *node_ssh_id(n))
-        argv[1:1] = ["-o", "ConnectTimeout=2", "-o", "BatchMode=yes"]
+        # ConnectTimeout=2 undercounted a real ProxyCommand-tunneled node (e.g.
+        # AWS SSM session start): observed 3.2s to the SSH banner, well past
+        # 2s, so every poll reported reachable:false for a genuinely-up node.
+        # Cached for STATIC_TTL (5s default) regardless, so the slower timeout
+        # doesn't cost extra polling.
+        argv[1:1] = ["-o", "ConnectTimeout=8", "-o", "BatchMode=yes"]
         argv += ["head -n1 /proc/stat; "
                  "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; nproc"]
         card = {"name": n.name, "kind": "remote", "vcpus": None, "cpu_pct": None,
                 "mem_used_mib": None, "mem_total_mib": None, "reachable": False}
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=4)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
             lines = r.stdout.split("\n")
             vals = list(map(int, lines[0].split()[1:]))       # cpu aggregate line
             mi = {}

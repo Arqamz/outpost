@@ -1,0 +1,16 @@
+# Static SSH GPU-worker manifest template for a Nebius L40S verification VM
+# booted from the tashkil-golden-images gpubench golden image
+# (images/releases/nebius-gpubench.json once a bake writes it).
+#
+# Copy to node.nebius-l40s.yaml, fill in the real IP/key from the bake output
+# (build-nebius.sh's --keep-builder trailer, or `nebius compute instance get`),
+# and register it:
+#   cluster add-node --spec node.nebius-l40s.yaml
+name: nebius-l40s-1
+ip: 0.0.0.0                        # REPLACE: the booted VM's public IP (ASSIGN_PUBLIC_IP=1)
+ssh_user: ubuntu                   # matches build-nebius.sh's default $SSH_USER
+ssh_key: ~/.ssh/nebius-l40s-demo   # REPLACE: path to the matching private key
+gpu: true
+runtime: apptainer
+# Ubuntu 24.04 (the golden image's base OS): apptainer --nv self-detects the
+# NVIDIA driver via ldconfig, so NO gpu_binds — same as node.aws-gpu-1.yaml.

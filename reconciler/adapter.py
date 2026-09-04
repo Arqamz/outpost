@@ -326,7 +326,7 @@ def fabric_if_include(nodes: list[NodeRecord]) -> tuple[str, str]:
 
 def mpirun_argv(np: int, hostfile: str, btl_if_include: str, oob_if_include: str,
                 per_rank_argv: list[str], rsh_agent: str | None = None,
-                no_tree_spawn: bool = False) -> list[str]:
+                no_tree_spawn: bool = False, env_vars: dict[str, str] | None = None) -> list[str]:
     """Wrap a per-rank container argv (from container_argv) in mpirun, one rank
     per claimed node (--map-by node) over the cluster's own TCP fabric — the MCA
     if_include options (see fabric_if_include) keep mpirun off any other interface.
@@ -337,7 +337,14 @@ def mpirun_argv(np: int, hostfile: str, btl_if_include: str, oob_if_include: str
     to use the cluster key + user explicitly. no_tree_spawn forces every remote
     launch to originate from the head — OpenMPI's default tree spawn would make
     one VM launch its sibling re-using the same agent string, whose key path
-    only exists on the host."""
+    only exists on the host.
+
+    env_vars: exported via `-x` to every rank. btl/oob_if_include (above) only
+    pins the classic TCP BTL/OOB planes — an HPC-X image's UCX/UCC transport has
+    its own device-selection mechanism those MCA params never reach (see
+    _node_iface); passing UCX_NET_DEVICES/UCX_TLS here is this path's
+    counterpart of the per-rank env injection _run_planned's launcher.compile()
+    already does."""
     argv = [
         "mpirun", "-np", str(np), "--hostfile", hostfile, "--map-by", "node",
         "--mca", "btl", "tcp,self",
@@ -348,6 +355,8 @@ def mpirun_argv(np: int, hostfile: str, btl_if_include: str, oob_if_include: str
         argv += ["--mca", "plm_rsh_agent", rsh_agent]
     if no_tree_spawn:
         argv += ["--mca", "plm_rsh_no_tree_spawn", "1"]
+    for k, v in (env_vars or {}).items():
+        argv += ["-x", f"{k}={v}"]
     return argv + per_rank_argv
 
 
@@ -973,7 +982,36 @@ class LibvirtAdapter(ProviderAdapter):
 
         rank_spec = dataclasses.replace(spec, image=remote_image)
         per_rank = container_argv(rank_spec, remote_workdir, spec.output_dir)
-        argv = mpirun_argv(len(nodes), remote_hostfile, btl_inc, oob_inc, per_rank)
+        # Same gap _run_planned already closes for a static-ssh head (see its
+        # comment): mpirun runs ON the head here too, and a static-ssh box
+        # never gets the libvirt fabric's default-`ssh`-just-works key — it
+        # needs its own credential (the SAME key named in node.ssh_key, staged
+        # at ~/.ssh/<basename> ON the head) to reach its siblings directly.
+        # Confirmed live: without this, default rsh -> "Permission denied
+        # (publickey)" (no usable default identity on the head for its
+        # sibling's node.ip).
+        mpirun_kwargs: dict = {}
+        if head.provider == "static-ssh":
+            agent = (f"ssh -i ~/.ssh/{os.path.basename(head.ssh_key or 'id_rsa')} "
+                     f"-o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
+                     f"-o UserKnownHostsFile=/dev/null -l {head.ssh_user or SSH_USER}")
+            mpirun_kwargs = {"rsh_agent": agent, "no_tree_spawn": True}
+        if len(nodes) > 1:
+            # btl/oob_tcp_if_include (above) only pins the classic TCP BTL/OOB
+            # planes; an HPC-X image's UCX/UCC transport has its own device
+            # selection UCX_NET_DEVICES/UCX_TLS (see 8c41148's fix to
+            # _run_planned for the same gap). Confirmed live on this exact
+            # path: on a box also running a kubelet/CNI (flannel.1/cni0), UCX
+            # auto-picked the pod-network interface and advertised an address
+            # the peer rank could never reach — segfault inside MPI_Init's
+            # ucc_core_addr_exchange. Only safe to pin when every claimed node
+            # shares the same interface name (a single mpirun -x broadcasts
+            # one value to every rank); skip rather than pin the wrong node's
+            # value if they ever differ.
+            ifaces = {self._node_iface(n) for n in nodes}
+            if len(ifaces) == 1:
+                mpirun_kwargs["env_vars"] = {"UCX_NET_DEVICES": ifaces.pop(), "UCX_TLS": "tcp,sm,self"}
+        argv = mpirun_argv(len(nodes), remote_hostfile, btl_inc, oob_inc, per_rank, **mpirun_kwargs)
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
         # Same reasoning as the single-node path: tee mpirun's combined output
