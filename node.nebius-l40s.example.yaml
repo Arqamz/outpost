@@ -14,3 +14,15 @@ gpu: true
 runtime: apptainer
 # Ubuntu 24.04 (the golden image's base OS): apptainer --nv self-detects the
 # NVIDIA driver via ldconfig, so NO gpu_binds — same as node.aws-gpu-1.yaml.
+#
+# cluster_ip: REQUIRED for any 2+-node MPI job (e.g. gtl's `osu` suite) —
+# leave unset for single-node suites (hpl/stream/nccl-tests), which never
+# reach this code path. `ip` above is a Nebius PUBLIC NAT'd address: it's
+# what THIS machine uses to ssh in, but it is never bound to any interface on
+# the guest itself, so a peer rank's hostfile entry / fabric_if_include /
+# _node_iface lookup against it fails outright. Set cluster_ip to the VM's
+# PRIVATE address (`nebius compute instance get --id <id> --format json |
+# jq '.status.network_interfaces[0].ip_address.address'`, an ip in the
+# subnet's ipv4_private_cidrs, e.g. 10.0.x.x) — nodes sharing a Nebius subnet
+# already reach each other over it for free, no VPN/bastion/Tailscale needed.
+# cluster_ip: 10.0.0.13

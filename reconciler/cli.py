@@ -254,12 +254,18 @@ def cmd_add_node(args):
         # gpu_binds: this node's OWN `apptainer --nv` driver binds (a NixOS GPU
         # worker needs /nix/store,/run/opengl-driver; Ubuntu leaves it empty).
         gpu_binds=d.get("gpu_binds", "") or "",
+        # cluster_ip: the address PEER ranks use for MPI (see
+        # NodeRecord.mpi_ip) when it differs from `ip` (the orchestrator's ssh
+        # target) — e.g. a NAT'd cloud where `ip` is a public address never
+        # bound on the guest. "" -> mpi_ip falls back to `ip`, unchanged.
+        cluster_ip=str(d.get("cluster_ip", "") or ""),
     )
     store.put_node(node)
     print(f"added static-ssh node {node.name} at {node.ip} "
           f"({'gpu' if node.gpu else 'cpu'}, ssh {node.ssh_user or '<cluster-default>'}"
           f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}"
-          f"{f', gpu_binds={node.gpu_binds}' if node.gpu_binds else ''}). "
+          f"{f', gpu_binds={node.gpu_binds}' if node.gpu_binds else ''}"
+          f"{f', cluster_ip={node.cluster_ip} (MPI-facing)' if node.cluster_ip else ''}). "
           f"Bake apptainer into the image before running real jobs.")
 
 

@@ -318,9 +318,12 @@ def fabric_if_include(nodes: list[NodeRecord]) -> tuple[str, str]:
     Both are GLOBAL to the mpirun and forwarded to every orted, so both must be
     valid on every node: each node matches its own /32 in the OOB list (and
     ignores the rest — OpenMPI tolerates non-matching list entries), and every
-    node's cluster address is inside the /24."""
-    oob = ",".join(f"{n.ip}/32" for n in nodes)
-    btl = ".".join(nodes[0].ip.split(".")[:3]) + ".0/24"
+    node's cluster address is inside the /24.
+
+    Uses `mpi_ip`, not `ip` — this is peer-facing (what one orted advertises
+    to the others), not the orchestrator's SSH target (see NodeRecord.mpi_ip)."""
+    oob = ",".join(f"{n.mpi_ip}/32" for n in nodes)
+    btl = ".".join(nodes[0].mpi_ip.split(".")[:3]) + ".0/24"
     return btl, oob
 
 
@@ -643,7 +646,9 @@ class LocalHostAdapter(ProviderAdapter):
         # VM ranks: no GPU on the guest -> plain launch (no --nv, no host binds).
         vm_argv = container_argv(dataclasses.replace(rank_spec, gpu=False),
                                  workdir, spec.output_dir)
-        rank_lines = [(head.ip, host_argv)] + [(n.ip, vm_argv) for n in nodes[1:]]
+        # mpi_ip, not ip — the appfile line is what a PEER rank connects to,
+        # not the orchestrator's ssh target (see NodeRecord.mpi_ip).
+        rank_lines = [(head.mpi_ip, host_argv)] + [(n.mpi_ip, vm_argv) for n in nodes[1:]]
         write_appfile(appfile, rank_lines)
 
         btl_inc, oob_inc = fabric_if_include(nodes)
@@ -831,11 +836,20 @@ class LibvirtAdapter(ProviderAdapter):
         scp_to(node.ip, src, dst, job_id, *node_ssh_id(node))
 
     def _node_iface(self, node: NodeRecord) -> str:
-        """The network interface actually carrying `node.ip` on `node` — needed
-        to pin UCX's own device selection for cross-node MPI. `fabric_if_include`
-        (below) already pins the classic TCP BTL/OOB planes by IP/subnet, which
-        OpenMPI's `*_if_include` options accept directly; UCX has no such
-        subnet-matching mode — `UCX_NET_DEVICES` wants an actual device name.
+        """The network interface actually carrying `node.mpi_ip` on `node` —
+        needed to pin UCX's own device selection for cross-node MPI.
+        `fabric_if_include` (below) already pins the classic TCP BTL/OOB
+        planes by IP/subnet, which OpenMPI's `*_if_include` options accept
+        directly; UCX has no such subnet-matching mode — `UCX_NET_DEVICES`
+        wants an actual device name.
+
+        Looked up against `mpi_ip`, not `ip` — deliberately: this asks "which
+        interface does a PEER rank's traffic land on," and on a NAT'd cloud
+        (confirmed on Nebius) `ip` (the orchestrator's SSH target, a public
+        address) is never bound to any interface on the guest at all — only
+        the private `mpi_ip` is. Reached over SSH via `ip` regardless; the
+        grep target inside that session is `mpi_ip`.
+
         Confirmed LIVE this matters, not just in theory: on a shared box that
         also runs a kubelet/CNI workload (see the summary doc's "Operational
         findings"), UCX auto-selected a pod-network veth and advertised an
@@ -846,13 +860,15 @@ class LibvirtAdapter(ProviderAdapter):
         the same way CUDA_VISIBLE_DEVICES tells it which GPU to use."""
         proc = subprocess.run(
             self._ssh_base(node) +
-            [f"ip -o -4 addr show | grep -F {shlex.quote(node.ip + '/')} | awk '{{print $2}}' | head -1"],
+            [f"ip -o -4 addr show | grep -F {shlex.quote(node.mpi_ip + '/')} | awk '{{print $2}}' | head -1"],
             capture_output=True, text=True)
         iface = proc.stdout.strip()
         if not iface:
             raise RuntimeError(
-                f"could not determine {node.name}'s network interface for {node.ip} — needed to "
-                "pin UCX away from any other interface (e.g. a CNI veth) on the box")
+                f"could not determine {node.name}'s network interface for {node.mpi_ip} "
+                f"(mpi_ip{'=cluster_ip' if node.cluster_ip else ', same as ip since cluster_ip is unset'}) "
+                "— needed to pin UCX away from any other interface (e.g. a CNI veth) on the box"
+            )
         return iface
 
     def _remote_free_bytes(self, node: NodeRecord) -> int:
@@ -977,7 +993,9 @@ class LibvirtAdapter(ProviderAdapter):
         local_hostfile = os.path.join(local_scratch, "hostfile")
         with open(local_hostfile, "w") as f:
             for n in nodes:
-                f.write(f"{n.ip} slots=1\n")
+                # mpi_ip: this is what a PEER orted dials, not the
+                # orchestrator's ssh target (see NodeRecord.mpi_ip).
+                f.write(f"{n.mpi_ip} slots=1\n")
         self._scp_to(head, local_hostfile, remote_hostfile, job_id)
 
         rank_spec = dataclasses.replace(spec, image=remote_image)
@@ -989,7 +1007,7 @@ class LibvirtAdapter(ProviderAdapter):
         # at ~/.ssh/<basename> ON the head) to reach its siblings directly.
         # Confirmed live: without this, default rsh -> "Permission denied
         # (publickey)" (no usable default identity on the head for its
-        # sibling's node.ip).
+        # sibling's mpi_ip).
         mpirun_kwargs: dict = {}
         if head.provider == "static-ssh":
             agent = (f"ssh -i ~/.ssh/{os.path.basename(head.ssh_key or 'id_rsa')} "
@@ -1037,7 +1055,9 @@ class LibvirtAdapter(ProviderAdapter):
 
         head = nodes[0]
         launch_plan = LaunchPlan.from_dict(plan)
-        node_ips = {n.name: n.ip for n in nodes}
+        # mpi_ip: this feeds per-rank rankfile/appfile addressing — what a PEER
+        # rank dials, not the orchestrator's ssh target (see NodeRecord.mpi_ip).
+        node_ips = {n.name: n.mpi_ip for n in nodes}
         launcher_adapter = launcher_mod.for_plan(launch_plan, spec.launcher)
         # Checked BEFORE compiling: a capability gap should read as itself
         # ("this launcher cannot bind ranks to CPUs"), not as whatever a
@@ -1049,11 +1069,11 @@ class LibvirtAdapter(ProviderAdapter):
         if head.provider == "static-ssh":
             # mpirun runs ON the head (a static-ssh box, not our libvirt
             # fabric), so it needs its OWN credential to reach the other
-            # claimed nodes directly over their (private) node.ip — unlike
-            # libvirt VMs, static-ssh nodes never get the ansible fabric key
-            # that makes plain default `ssh` just work between them. Confirmed
-            # live: default rsh -> "Host key verification failed" (no
-            # identity, no known_hosts entry on the head for its siblings).
+            # claimed nodes directly over their mpi_ip — unlike libvirt VMs,
+            # static-ssh nodes never get the ansible fabric key that makes
+            # plain default `ssh` just work between them. Confirmed live:
+            # default rsh -> "Host key verification failed" (no identity, no
+            # known_hosts entry on the head for its siblings).
             # Convention: the SAME key named in node.ssh_key must also be
             # staged at ~/.ssh/<basename> ON the head (see
             # docs/09-multi-machine-cluster.md) — scp it there once per node.
