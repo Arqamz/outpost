@@ -162,12 +162,32 @@ class NodeRecord:
     # under ONE control plane. "" -> the adapter's global CLUSTER_K8S_CONTEXT
     # (current kube-context). Ignored by every non-k8s node.
     kube_context: str = ""
+    # the address OTHER ranks use to reach this node for MPI (hostfile/appfile
+    # entries, fabric_if_include's BTL/OOB subnet matching, _node_iface's
+    # interface lookup) — NOT necessarily the same address the orchestrator
+    # uses to SSH in and drive the node (`ip`). For libvirt/local nodes and the
+    # AWS static-ssh proof, one address satisfies both (orchestrator and peers
+    # share reachability to it), so "" -> fall back to `ip` via the `mpi_ip`
+    # property below and nothing changes. It diverges for a cloud that NATs
+    # public IPs (confirmed on Nebius): the orchestrator needs the public IP
+    # to reach the node at all, but that address is never bound on the guest's
+    # own interface, so every MPI-facing lookup against it fails — the guest
+    # only answers to its private VPC IP. Two same-subnet nodes already reach
+    # each other over that private IP for free; this field just says which one
+    # to use for MPI purposes instead of routing around it with a VPN/bastion.
+    cluster_ip: str = ""
     updated_at: str | None = None
 
     @property
     def adapter_key(self) -> str:
         """The adapters-dict key that routes this node (see Reconciler._adapter_for)."""
         return self.provider or ("local" if self.local else "libvirt")
+
+    @property
+    def mpi_ip(self) -> str:
+        """The address to use for anything a PEER rank (not the orchestrator)
+        needs to reach this node at — see `cluster_ip`'s docstring."""
+        return self.cluster_ip or self.ip
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -177,7 +197,7 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "gpu_binds", "kube_context", "updated_at"}
+                "gpu_binds", "kube_context", "cluster_ip", "updated_at"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 
