@@ -8,6 +8,8 @@ notes/
 # The *.example.yaml files are the committed templates; these are per-machine.
 node.ec2.yaml
 node.l20.yaml
+node.nebius-l40s-1.yaml
+node.nebius-l40s-2.yaml
 
 # Scratch: one-off debug scripts, personal test job specs, and benchmark
 # output logs — never something another machine/clone should rely on.
