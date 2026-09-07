@@ -32,13 +32,22 @@ class NodeRegistry:
 
     def claim(self, job_id: str, count: int, require_gpu: bool = False,
               hybrid: bool = False, backend: str | None = None,
-              kube_context: str | None = None) -> list[NodeRecord]:
+              kube_context: str | None = None,
+              node_name: str | None = None) -> list[NodeRecord]:
         """Exclusively lock `count` matching nodes for job_id. All-or-nothing.
 
         backend set (e.g. "k8s") claims from that backend's pool of slots by
         provider, ignoring require_gpu/hybrid — a k8s job claims one slot and
         does the N-way parallelism inside the pod group, not in the node pool.
         kube_context (with backend="k8s") targets a specific cluster's slots.
+
+        node_name set pins the claim to one exact node by name, bypassing the
+        gpu/backend pool logic entirely — the caller already knows which node
+        it wants (e.g. a specific static-ssh box when several share a pool).
+        Only meaningful for count=1: a named node is one physical machine, so a
+        multi-node job with node_name set will legitimately fail to claim past
+        the first node and roll back (NoCapacity) rather than silently
+        targeting only part of the job at the named node.
 
         hybrid=True is the one shape that mixes pools: 1 GPU node + (count-1)
         CPU nodes, claimed GPU-first so claimed[0] is always the host — the
@@ -52,10 +61,11 @@ class NodeRegistry:
         claimed: list[NodeRecord] = []
         for need_gpu in needs:
             # backend claims match by provider (+ optional cluster context);
-            # pool claims match by gpu flag.
+            # pool claims match by gpu flag; node_name claims match by name alone.
             n = self.store.claim_node(job_id, require_gpu=bool(need_gpu),
                                       provider=backend,
-                                      kube_context=kube_context)  # atomic AVAILABLE -> CLAIMED
+                                      kube_context=kube_context,
+                                      node_name=node_name)  # atomic AVAILABLE -> CLAIMED
             if n is None:
                 for c in claimed:               # roll back partial claim
                     self.release(c.node_id, reason=f"rollback claim for {job_id}")
