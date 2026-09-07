@@ -83,7 +83,8 @@ class TestCompetingMultiNodeClaims:
         barrier = threading.Barrier(2, timeout=5)
         acquire = store.claim_node
 
-        def claim_then_wait(job_id, require_gpu=False, provider=None, kube_context=None):
+        def claim_then_wait(job_id, require_gpu=False, provider=None, kube_context=None,
+                            node_name=None):
             # Hold at the barrier after the FIRST node so both jobs are holding one
             # before either asks for its second — the interleaving that starves.
             node = acquire(job_id, require_gpu=require_gpu)

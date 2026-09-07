@@ -40,7 +40,8 @@ class Store:
 
     def claim_node(self, job_id: str, require_gpu: bool = False,
                    provider: str | None = None,
-                   kube_context: str | None = None) -> NodeRecord | None:
+                   kube_context: str | None = None,
+                   node_name: str | None = None) -> NodeRecord | None:
         """Atomically move one AVAILABLE node -> CLAIMED(owner=job_id).
 
         provider set (e.g. "k8s") -> match ONLY nodes on that backend, ignoring
@@ -51,10 +52,19 @@ class Store:
         slots on that cluster, so a job can target one AWS GPU worker vs the 5060 Ti when
         several k8s clusters are registered. None -> any slot of the backend.
 
-        provider=None (default, the VM/host/static pool) -> require_gpu=True
-        matches only GPU-capable nodes; False matches only non-GPU nodes (so CPU
-        jobs never squat the host GPU) AND backend nodes (provider "k8s") are
-        excluded, so a normal job never grabs a k8s slot. None if none match.
+        node_name set -> match ONLY the node with that exact name (e.g. a specific
+        static-ssh box like a Nebius/AWS host), ignoring require_gpu/provider —
+        the caller identified the exact node it wants, so trust it rather than
+        second-guessing with the pool's own flags. A named node that is not
+        AVAILABLE (busy, quarantined, or nonexistent) is "no match" same as any
+        other claim miss, which feeds the normal wait-and-retry capacity path
+        rather than failing the job outright.
+
+        provider=None, node_name=None (default, the VM/host/static pool) ->
+        require_gpu=True matches only GPU-capable nodes; False matches only
+        non-GPU nodes (so CPU jobs never squat the host GPU) AND backend nodes
+        (provider "k8s") are excluded, so a normal job never grabs a k8s slot.
+        None if none match.
         """
         raise NotImplementedError
 
@@ -187,22 +197,27 @@ class FileStore(Store):
         with self._locked() as (d, _):
             return d[COL_NODES].pop(node_id, None) is not None
 
-    def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None):
+    def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None,
+                   node_name=None):
         with self._locked() as (d, _):
             for nid, nd in d[COL_NODES].items():
                 if nd["state"] != NodeState.AVAILABLE.value:
                     continue
-                np = self._node_provider(nd)
-                if provider is not None:
-                    if np != provider:
-                        continue
-                    if kube_context is not None and nd.get("kube_context", "") != kube_context:
+                if node_name is not None:
+                    if nd.get("name") != node_name:
                         continue
                 else:
-                    if np == "k8s":            # backend slot, only via explicit provider
-                        continue
-                    if bool(nd.get("gpu", False)) != bool(require_gpu):
-                        continue
+                    np = self._node_provider(nd)
+                    if provider is not None:
+                        if np != provider:
+                            continue
+                        if kube_context is not None and nd.get("kube_context", "") != kube_context:
+                            continue
+                    else:
+                        if np == "k8s":            # backend slot, only via explicit provider
+                            continue
+                        if bool(nd.get("gpu", False)) != bool(require_gpu):
+                            continue
                 nd["state"] = NodeState.CLAIMED.value
                 nd["owner_job"] = job_id
                 nd["updated_at"] = now_iso()
@@ -257,9 +272,12 @@ class MongoStore(Store):
     def delete_node(self, node_id: str) -> bool:
         return self.nodes.delete_one({"node_id": node_id}).deleted_count > 0
 
-    def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None):
+    def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None,
+                   node_name=None):
         # find_one_and_update is atomic server-side -> exclusive lock.
-        if provider is not None:
+        if node_name is not None:
+            q = {"state": NodeState.AVAILABLE.value, "name": node_name}
+        elif provider is not None:
             q = {"state": NodeState.AVAILABLE.value, "provider": provider}
             if kube_context is not None:
                 q["kube_context"] = kube_context
