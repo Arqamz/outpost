@@ -294,10 +294,13 @@ class Reconciler:
             nodes = self.registry.claim(job.job_id, 1, backend="k8s", kube_context=target_ctx)
             claimed_n = 1
         else:
-            # params.node_name pins the claim to one exact static-ssh/host node by
-            # name (e.g. a specific Nebius/AWS box) instead of whichever node in
-            # the pool happens to be free — same opaque-passthrough mechanism as
-            # params.k8s_context above, just for the VM/host pool.
+            # params.node_name pins the claim to exact static-ssh/host node(s) by
+            # name (e.g. specific Nebius/AWS boxes) instead of whichever nodes in
+            # the pool happen to be free — same opaque-passthrough mechanism as
+            # params.k8s_context above, just for the VM/host pool. One name, or
+            # `node_count` names (comma-separated or a list) for a multi-node job
+            # that must land on those exact machines. A pin never degrades to a
+            # pool claim: if the node is busy the job waits for it.
             target_node = spec.params.get("node_name") or None
             kind = (f"hybrid (1 GPU + {spec.node_count - 1} CPU)" if spec.hybrid
                     else ("GPU" if spec.gpu else "CPU"))
