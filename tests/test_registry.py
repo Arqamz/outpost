@@ -163,3 +163,54 @@ class TestReleaseAndQuarantine:
         transitions = [(e["from"], e["to"]) for e in store.list_audit("n1")]
         assert (NodeState.AVAILABLE.value, NodeState.CLAIMED.value) in transitions
         assert (NodeState.CLAIMED.value, NodeState.AVAILABLE.value) in transitions
+
+
+class TestPinnedPlacement:
+    """params.node_name pins a job to exact machines; it never degrades to the pool."""
+
+    def test_a_single_name_claims_that_node_and_no_other(self, store, registry):
+        _seed(store, cpu=3)
+        claimed = registry.claim("job-a", 1, node_name="n2")
+        assert [n.name for n in claimed] == ["n2"]
+
+    def test_a_name_per_node_claims_them_in_rank_order(self, store, registry):
+        # The 2-node distributed case: rank 0 takes names[0], rank 1 takes names[1],
+        # so an MPI job lands on the exact pair it was scheduled for.
+        _seed(store, cpu=4)
+        claimed = registry.claim("job-a", 2, node_name=["n3", "n1"])
+        assert [n.name for n in claimed] == ["n3", "n1"]
+
+    def test_a_comma_separated_string_is_the_same_pin(self, store, registry):
+        _seed(store, cpu=4)
+        assert [n.name for n in registry.claim("job-a", 2, node_name="n3,n1")] == ["n3", "n1"]
+
+    def test_a_pin_never_falls_back_to_a_free_pool_node(self, store, registry):
+        # THE bug this exists for: the named node is busy but others are free. The
+        # job must wait, not silently run somewhere else and be recorded as that
+        # somewhere else. Rollback leaves the rest of the pool untouched.
+        _seed(store, cpu=3)
+        registry.claim("job-busy", 1, node_name="n2")
+        with pytest.raises(NoCapacity, match="the pinned node 'n2'"):
+            registry.claim("job-a", 1, node_name="n2")
+        free = [n.name for n in store.list_nodes() if n.state == NodeState.AVAILABLE.value]
+        assert sorted(free) == ["n1", "n3"]
+
+    def test_a_partially_available_pin_rolls_back_whole(self, store, registry):
+        _seed(store, cpu=3)
+        registry.claim("job-busy", 1, node_name="n3")
+        with pytest.raises(NoCapacity, match="the pinned node 'n3'"):
+            registry.claim("job-a", 2, node_name=["n1", "n3"])
+        assert store.get_node("n1").state == NodeState.AVAILABLE.value
+
+    def test_pinning_a_different_number_of_nodes_than_the_job_needs_is_refused(
+            self, store, registry):
+        # Naming one node for a 2-node job used to claim it, then fail on the
+        # second and roll back — the same outcome by accident. Say so up front.
+        _seed(store, cpu=4)
+        with pytest.raises(NoCapacity, match="pins 1 node.*but the job needs 2"):
+            registry.claim("job-a", 2, node_name="n1")
+        assert all(n.state == NodeState.AVAILABLE.value for n in store.list_nodes())
+
+    def test_an_unpinned_claim_still_uses_the_pool(self, store, registry):
+        _seed(store, cpu=2)
+        assert len(registry.claim("job-a", 2)) == 2
