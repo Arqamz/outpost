@@ -6,10 +6,12 @@ notes/
 
 # Live static-node manifests — hold a real instance IP that changes per launch.
 # The *.example.yaml files are the committed templates; these are per-machine.
-node.ec2.yaml
-node.l20.yaml
-node.nebius-l40s-1.yaml
-node.nebius-l40s-2.yaml
+# Glob, not an exact list: an exact list silently stops covering a manifest the
+# moment its filename doesn't match one of these — which is exactly what
+# happened to node.aws-l40s-1.yaml, node.nebius-h100-{1,2}.yaml and
+# node.nebius-l40s.yaml (untracked with no git safety net, 2026-09-14).
+node.*.yaml
+!node.*.example.yaml
 
 # Scratch: one-off debug scripts, personal test job specs, and benchmark
 # output logs — never something another machine/clone should rely on.
