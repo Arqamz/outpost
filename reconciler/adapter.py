@@ -77,6 +77,34 @@ REMOTE_PULL_HEADROOM_MARGIN_BYTES = 2 * 1024 ** 3
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
 SSH_KEY = os.environ.get("CLUSTER_SSH_PRIVKEY", os.path.expanduser("~/.ssh/outpost-cluster-ssh"))
 
+# Keepalives are LOAD-BEARING, not hygiene. A job phase runs the benchmark
+# through a single foreground ssh, and a benchmark is silent for minutes at a
+# time (STREAM prints nothing while "Optimizing..."). A silent TCP connection
+# across a NAT — every cloud node reached over a public address — gets reaped by
+# an idle timer with no FIN, and ssh with no keepalive then blocks FOREVER on a
+# socket that will never speak again.
+#
+# That is not one lost job: the reconciler drives every node from one loop, so a
+# single hung ssh starves the whole cluster. Observed live 2026-09-14 — an L40S
+# STREAM run finished on the node (results in stdout.log, zero apptainer procs)
+# while the reconciler sat in that ssh for 25 minutes and nine jobs queued for a
+# completely idle H100 behind it.
+#
+# With these set, a dead connection dies after roughly
+# SSH_ALIVE_INTERVAL * SSH_ALIVE_COUNT seconds and the phase fails loudly, which
+# the job state machine already knows how to handle. Generous by default: the
+# point is to bound the wait, not to police a slow link.
+SSH_ALIVE_INTERVAL = int(os.environ.get("CLUSTER_SSH_ALIVE_INTERVAL", "30"))
+SSH_ALIVE_COUNT = int(os.environ.get("CLUSTER_SSH_ALIVE_COUNT", "10"))
+SSH_CONNECT_TIMEOUT = int(os.environ.get("CLUSTER_SSH_CONNECT_TIMEOUT", "30"))
+
+
+def ssh_keepalive_opts() -> list[str]:
+    """ssh -o flags that bound how long a dead connection can hang."""
+    return ["-o", f"ServerAliveInterval={SSH_ALIVE_INTERVAL}",
+            "-o", f"ServerAliveCountMax={SSH_ALIVE_COUNT}",
+            "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}"]
+
 # ── Kubernetes (KAI + HAMi) backend params ──────────────────────────────────
 # The whole cluster + KAI + HAMi are stood up out of band by infra/k8s/setup.sh;
 # the adapter only templates kubectl against it. All env-overridable so a
@@ -171,13 +199,17 @@ def ssh_base(ip: str, user: str | None = None, key: str | None = None) -> list[s
     into VMs with the exact same fabric. user/key default to the cluster fabric's;
     a static node passes its own (see node_ssh_id)."""
     return ["ssh", "-i", key or SSH_KEY, "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null", f"{user or SSH_USER}@{ip}"]
+            "-o", "UserKnownHostsFile=/dev/null", *ssh_keepalive_opts(),
+            f"{user or SSH_USER}@{ip}"]
 
 
 def scp_to(ip: str, src: str, dst: str, job_id: str,
            user: str | None = None, key: str | None = None) -> None:
+    # scp inherits the same hazard: a 5 GB SIF transfer across a NAT is exactly
+    # the long, quiet connection an idle timer kills.
     argv = ["scp", "-i", key or SSH_KEY, "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null", src, f"{user or SSH_USER}@{ip}:{dst}"]
+            "-o", "UserKnownHostsFile=/dev/null", *ssh_keepalive_opts(),
+            src, f"{user or SSH_USER}@{ip}:{dst}"]
     run_logged(argv, job_id)
 
 
@@ -1201,7 +1233,7 @@ class LibvirtAdapter(ProviderAdapter):
                    job_id, check=False)
         user, key = node_ssh_id(head)
         run_logged(["scp", "-i", key, "-o", "StrictHostKeyChecking=no",
-                   "-o", "UserKnownHostsFile=/dev/null", "-r",
+                   "-o", "UserKnownHostsFile=/dev/null", *ssh_keepalive_opts(), "-r",
                    f"{user}@{head.ip}:{remote_workdir}/.", dest], job_id, check=False)
         return dest
 
