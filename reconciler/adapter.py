@@ -564,7 +564,16 @@ class LocalHostAdapter(ProviderAdapter):
             return self._run_local_planned(node, job_id, spec, workdir, plan)
         # GPU jobs get the driver bind/env the nix shell exported declaratively.
         extra_binds, extra_env = gpu_launch_extras() if spec.gpu else ([], {})
-        argv = container_argv(spec, workdir, spec.output_dir, extra_binds, extra_env)
+        # Same digest-keyed SIF cache the hybrid MPI path already uses
+        # (ensure_local_sif) — without this, a plain single-node job re-pulled
+        # AND re-converted spec.image's docker:// ref from scratch via
+        # apptainer's own ephemeral build on EVERY run, even repeat runs of
+        # the identical image on this same host. The conversion only needs to
+        # happen once per digest, not once per job.
+        run_spec = spec
+        if spec.runtime != "docker" and "://" in spec.image:
+            run_spec = dataclasses.replace(spec, image=ensure_local_sif(spec.image, job_id))
+        argv = container_argv(run_spec, workdir, spec.output_dir, extra_binds, extra_env)
         stdout_path = os.path.join(workdir, "stdout.log")
         header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
         self.log(f"[localhost] {header}")
@@ -860,7 +869,19 @@ class LibvirtAdapter(ProviderAdapter):
         # counterpart of the host's CLUSTER_GPU_BINDS (LocalHostAdapter), except
         # it's per-node because it's the REMOTE box's filesystem, not ours.
         extra_binds = node_gpu_binds(head) if spec.gpu else []
-        argv = container_argv(spec, remote_workdir, spec.output_dir, extra_binds=extra_binds)
+        # Same digest-keyed SIF cache _run_launch already uses for multi-node
+        # jobs (_ensure_remote_sif) — without this, a plain single-node job
+        # (launcher: single, the common case) re-pulled AND re-converted
+        # spec.image's docker:// ref from scratch via apptainer's own
+        # ephemeral build on EVERY run, even repeat runs of the identical
+        # image on the identical node. Confirmed live: a large image took on
+        # the order of hours to mksquashfs (gzip-only mksquashfs on the
+        # worker AMI) — the conversion only needs to happen once per (node,
+        # digest), not once per job.
+        run_spec = spec
+        if spec.runtime != "docker" and "://" in spec.image:
+            run_spec = dataclasses.replace(spec, image=self._ensure_remote_sif(head, spec.image, job_id))
+        argv = container_argv(run_spec, remote_workdir, spec.output_dir, extra_binds=extra_binds)
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
         # tee into the workdir (not just captured by run_logged's replay log):
