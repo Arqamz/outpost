@@ -164,15 +164,18 @@ def append_job_log(job_id: str, text: str) -> None:
         f.write(text)
 
 
-def run_logged(argv: list[str], job_id: str, cwd: str | None = None, check: bool = True) -> int:
+def run_logged(argv: list[str], job_id: str, cwd: str | None = None, check: bool = True,
+               env: dict | None = None) -> int:
     """Run a subprocess, streaming combined stdout+stderr live to THIS process's
     stdout (so a `reconcile` tick is still watchable in real time) while also
     appending every line to the job's replay log. Returns the exit code; raises
-    CalledProcessError on failure unless check=False (matches subprocess.run)."""
+    CalledProcessError on failure unless check=False (matches subprocess.run).
+    env=None inherits this process's environment (subprocess.Popen's own
+    default); pass a dict to override/extend it."""
     header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
     print(header)
     append_job_log(job_id, f"{now_iso()} {header}")
-    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     lines = []
     for line in proc.stdout:
@@ -288,7 +291,21 @@ def ensure_local_sif(image: str, job_id: str) -> str:
         fcntl.flock(lk, fcntl.LOCK_EX)
         if not os.path.isfile(cached):
             tmp = f"{cached}.{job_id}.tmp"   # build to tmp, atomic-rename in on success
-            run_logged(["apptainer", "build", "--force", tmp, image], job_id)
+            # Unset, apptainer's rootfs-unpack tmpdir defaults to $TMPDIR/tmp,
+            # which on this host is a 31G tmpfs (RAM-backed) shared with
+            # everything else — fine for a small image, but a 16G+ image's
+            # rootfs unpack exceeded its free space outright ("no space left
+            # on device" mid-unpack, confirmed live on the 3B LoRA image).
+            # Point both the OCI blob cache and the unpack tmpdir at
+            # SIF_CACHE_DIR instead — real disk, not memory, and where the
+            # remote static-ssh build path already points its own equivalents
+            # (see the APPTAINER_CACHEDIR/APPTAINER_TMPDIR env line below).
+            build_env = dict(os.environ)
+            build_env["APPTAINER_CACHEDIR"] = os.path.join(SIF_CACHE_DIR, ".apptainer-cache")
+            build_env["APPTAINER_TMPDIR"] = os.path.join(SIF_CACHE_DIR, ".apptainer-tmp")
+            os.makedirs(build_env["APPTAINER_CACHEDIR"], exist_ok=True)
+            os.makedirs(build_env["APPTAINER_TMPDIR"], exist_ok=True)
+            run_logged(["apptainer", "build", "--force", tmp, image], job_id, env=build_env)
             os.replace(tmp, cached)
     return cached
 
