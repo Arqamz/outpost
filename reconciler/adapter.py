@@ -73,6 +73,17 @@ REMOTE_SIF_CACHE_DIR = os.environ.get("CLUSTER_REMOTE_SIF_CACHE_DIR", "/tmp/outp
 # multiplier already applied to the known SIF size (see _ensure_remote_sif).
 REMOTE_PULL_HEADROOM_MARGIN_BYTES = 2 * 1024 ** 3
 
+# Free space a node must report before we let IT pull and convert the image
+# itself, rather than building locally and scp-ing. An absolute floor, not a
+# multiple of the image size: knowing the size means pulling the image, which
+# is exactly the work this decision exists to avoid (see _ensure_remote_sif).
+# 60 GB covers apptainer's OCI blob cache + the unpacked rootfs + the final SIF
+# for the largest image outpost runs today (the 13 GB gtl_qwen2_5_sft SIF came
+# from ~18 GB of rootfs) with room to spare. Tune per-fleet if a node type is
+# routinely tighter than this.
+REMOTE_PULL_FLOOR_BYTES = int(os.environ.get(
+    "CLUSTER_REMOTE_PULL_FLOOR_BYTES", str(60 * 1024 ** 3)))
+
 # SSH params for reaching VMs (match infra/libvirt/config.env defaults).
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
 SSH_KEY = os.environ.get("CLUSTER_SSH_PRIVKEY", os.path.expanduser("~/.ssh/outpost-cluster-ssh"))
@@ -999,14 +1010,28 @@ class LibvirtAdapter(ProviderAdapter):
             self.log(f"[sif-cache] {node.name}: {name} already cached, reusing (no transfer)")
             return final
 
-        local_image = ensure_local_sif(image, job_id)
-        size = os.path.getsize(local_image)
         avail = self._remote_free_bytes(node)
-        headroom_needed = size * 3 + REMOTE_PULL_HEADROOM_MARGIN_BYTES
         tmp = f"{final}.{job_id}.tmp"
-        if avail >= headroom_needed:
+        if avail >= REMOTE_PULL_FLOOR_BYTES:
+            # NOTE: deliberately NOT calling ensure_local_sif() here. It used to
+            # run unconditionally, above this branch, purely so os.path.getsize()
+            # could size a headroom check — meaning the control plane pulled and
+            # mksquashfs'd the whole image locally and then, on this path, threw
+            # it away unused. For the 13 GB gtl_qwen2_5_sft image that was tens
+            # of minutes of wasted local work per cold digest, it grew a 37 GB
+            # local cache, and it FAILED JOBS: job-924b58eadc6e died with
+            # "no space left on device" on the CONTROL PLANE while building a SIF
+            # that the remote path would never have touched (2026-09-16).
+            #
+            # Sizing the check needs the image size, which cannot be known
+            # without pulling it — and pulling it is the thing being avoided. So
+            # the check becomes an absolute floor instead of a multiple: enough
+            # room for apptainer's blob cache + unpacked rootfs + final SIF for
+            # any image outpost ships, with margin. Below the floor we fall back
+            # to the local build + scp, which is when paying for a local SIF is
+            # actually justified.
             self.log(f"[sif-cache] {node.name}: remote-pulling {image} directly "
-                     f"({avail / 1e9:.1f}GB avail >= {headroom_needed / 1e9:.1f}GB needed for the build)")
+                     f"({avail / 1e9:.1f}GB avail >= {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor)")
             # apptainer's OWN OCI blob cache + build-time rootfs unpack tmpdir
             # default to $HOME/.apptainer/cache and $TMPDIR/system-/tmp — NOT
             # wherever the final SIF is told to land. Left unredirected, the
@@ -1026,8 +1051,9 @@ class LibvirtAdapter(ProviderAdapter):
             run_logged(self._ssh_base(node) + [cmd], job_id)
         else:
             self.log(f"[sif-cache] {node.name}: insufficient remote headroom for a direct pull "
-                     f"({avail / 1e9:.1f}GB avail < {headroom_needed / 1e9:.1f}GB needed) — "
+                     f"({avail / 1e9:.1f}GB avail < {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor) — "
                      f"falling back to scp")
+            local_image = ensure_local_sif(image, job_id)
             self._scp_to(node, local_image, tmp, job_id)
             place = f"test -f {final} || mv {tmp} {final}; rm -f {tmp}"
             cmd = f"mkdir -p {REMOTE_SIF_CACHE_DIR} && flock {shlex.quote(lock)} -c {shlex.quote(place)}"
