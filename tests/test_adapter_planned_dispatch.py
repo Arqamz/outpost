@@ -40,6 +40,8 @@ class TestPlannedDispatch:
     def test_single_node_with_no_plan_falls_to_the_plain_path(self, adapter, monkeypatch):
         launch_called, plain_called = [], []
         monkeypatch.setattr(adapter, "_run_launch", lambda *a, **kw: launch_called.append(True))
+        # The plain path stages the SIF itself now, which is a real ssh.
+        monkeypatch.setattr(adapter, "_ensure_remote_sif", lambda *a, **kw: "/tmp/cached.sif")
         monkeypatch.setattr("reconciler.adapter.run_logged",
                             lambda *a, **kw: plain_called.append(True) or 0)
         adapter.run([node()], "job-1", spec(image="docker://x"), plan=None)
