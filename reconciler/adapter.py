@@ -1108,7 +1108,25 @@ class LibvirtAdapter(ProviderAdapter):
         self._scp_to(head, local_hostfile, remote_hostfile, job_id)
 
         rank_spec = dataclasses.replace(spec, image=remote_image)
-        per_rank = container_argv(rank_spec, remote_workdir, spec.output_dir)
+        # WHERE THE RANKS MEET. Only the launcher knows which node is rank 0 —
+        # the hostfile above is written here, from this node list, in this
+        # order — so publishing it is this layer's job, not the payload's. A
+        # framework that rendezvouses over TCP (torch.distributed/NCCL, JAX,
+        # DeepSpeed) needs exactly this one address and cannot derive it:
+        # inside the container it can see its own MPI rank but not who rank 0
+        # is. The hostfile itself is scp'd to the HEAD only, so a non-head rank
+        # cannot read it either.
+        #
+        # mpi_ip, not ip: this is the address a PEER dials, and on a NAT'd
+        # cloud the orchestrator's ssh target is not bound on the guest at all
+        # (the same distinction the hostfile above already makes).
+        #
+        # The same value for every rank by definition, so it rides in the one
+        # shared per-rank argv rather than needing the appfile path. The PORT
+        # is deliberately not published: it is the payload's choice, and every
+        # framework has a sane default.
+        per_rank = container_argv(rank_spec, remote_workdir, spec.output_dir,
+                                  extra_env={"MASTER_ADDR": head.mpi_ip})
         # Same gap _run_planned already closes for a static-ssh head (see its
         # comment): mpirun runs ON the head here too, and a static-ssh box
         # never gets the libvirt fabric's default-`ssh`-just-works key — it
