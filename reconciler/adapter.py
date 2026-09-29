@@ -1086,10 +1086,24 @@ class LibvirtAdapter(ProviderAdapter):
         now makes that exact call itself per node (real headroom check before
         choosing pull vs. scp), so this call site no longer needs to pick a
         strategy — see its docstring for the decision."""
-        remote_image = None
+        # Same guard the single-node path applies (see _run's run_spec): only a
+        # ref with a scheme has to be FETCHED and converted. An image that is
+        # already a node-local path is what apptainer runs, so staging it asks
+        # apptainer to build a SIF out of a SIF — which SUCCEEDS, and that is
+        # the problem: it silently re-creates a multi-GB image under a hashed
+        # cache name, once per node, for no benefit. Measured at 4.6 GB and
+        # ~30s a node on the gtl-qwen SIF.
+        #
+        # The two paths had drifted — the guard was added to _run and not here
+        # — so a locally-staged image took the cheap path at node_count 1 and
+        # the expensive one above it. Resolving it once, before the loop, is
+        # what keeps them from drifting again.
+        remote_image = spec.image
+        stage = spec.runtime != "docker" and "://" in spec.image
         for n in nodes:
             run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
-            remote_image = self._ensure_remote_sif(n, spec.image, job_id)
+            if stage:
+                remote_image = self._ensure_remote_sif(n, spec.image, job_id)
         head = nodes[0]
 
         if plan is not None:
