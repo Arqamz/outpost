@@ -391,13 +391,33 @@ def fabric_if_include(nodes: list[NodeRecord]) -> tuple[str, str]:
     Both are GLOBAL to the mpirun and forwarded to every orted, so both must be
     valid on every node: each node matches its own /32 in the OOB list (and
     ignores the rest — OpenMPI tolerates non-matching list entries), and every
-    node's cluster address is inside the /24.
+    node's cluster address is inside one of the BTL /24s.
+
+    The BTL value is EVERY node's /24, deduplicated, not just rank 0's. It used
+    to be rank 0's alone, which silently assumed one flat /24 — true of the
+    libvirt fabric this was written for (192.168.71.0/24) and false on a cloud
+    VPC, where two instances in one subnet group routinely land in different
+    /24s. On an AWS pair at 172.31.30.182 and 172.31.29.187 the include was
+    `172.31.30.0/24`, which excludes rank 1 outright: orted starts, the first
+    collective finds no usable route, and the job dies with the generic
+    "lack of common network interfaces" wall of text that names everything
+    except the cause. A one-subnet cluster is unaffected — the set collapses to
+    the single entry it produced before.
+
+    Still /24s rather than one widened prefix: the docstring above is why. A
+    /32 BTL list is broken in OpenMPI 4.1.x (it matches every interface), and
+    widening to a /16 would re-admit exactly the unreachable host interfaces
+    the /24 exists to exclude.
 
     Uses `mpi_ip`, not `ip` — this is peer-facing (what one orted advertises
     to the others), not the orchestrator's SSH target (see NodeRecord.mpi_ip)."""
     oob = ",".join(f"{n.mpi_ip}/32" for n in nodes)
-    btl = ".".join(nodes[0].mpi_ip.split(".")[:3]) + ".0/24"
-    return btl, oob
+    subnets: list[str] = []
+    for n in nodes:
+        net = ".".join(n.mpi_ip.split(".")[:3]) + ".0/24"
+        if net not in subnets:
+            subnets.append(net)
+    return ",".join(subnets), oob
 
 
 def mpirun_argv(np: int, hostfile: str, btl_if_include: str, oob_if_include: str,
