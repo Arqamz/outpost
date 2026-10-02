@@ -18,8 +18,15 @@ from urllib.parse import urlparse, parse_qs
 _JOB_ID_RE = re.compile(r"^(job-[0-9a-f]+|__reconciler__)$")  # matches models.new_id("job")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.environ.get("CLUSTER_ROOT") or os.path.dirname(HERE)
-sys.path.insert(0, REPO_ROOT)  # viz/ is a sibling of reconciler/, not a package under it
+# Two different roots, and conflating them broke the second dashboard: the
+# reconciler PACKAGE ships with this file and is found relative to it, while
+# CLUSTER_ROOT says only where the STATE lives. Pointing CLUSTER_ROOT at a
+# second cluster's var directory used to move the import path with it and
+# raise ModuleNotFoundError. adapter.py and launch_models.py already draw this
+# line ("derived from THIS FILE, not CLUSTER_ROOT"); this now matches them.
+CODE_ROOT = os.path.dirname(HERE)  # viz/ is a sibling of reconciler/, not a package under it
+REPO_ROOT = os.environ.get("CLUSTER_ROOT") or CODE_ROOT
+sys.path.insert(0, CODE_ROOT)
 
 from reconciler.adapter import job_log_path, ssh_base, node_ssh_id  # noqa: E402
 from reconciler.reconciler import GLOBAL_LOG, clear_jobs  # noqa: E402
