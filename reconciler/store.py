@@ -41,7 +41,8 @@ class Store:
     def claim_node(self, job_id: str, require_gpu: bool = False,
                    provider: str | None = None,
                    kube_context: str | None = None,
-                   node_name: str | None = None) -> NodeRecord | None:
+                   node_name: str | None = None,
+                   min_host_memory: int = 0) -> NodeRecord | None:
         """Atomically move one AVAILABLE node -> CLAIMED(owner=job_id).
 
         provider set (e.g. "k8s") -> match ONLY nodes on that backend, ignoring
@@ -198,10 +199,15 @@ class FileStore(Store):
             return d[COL_NODES].pop(node_id, None) is not None
 
     def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None,
-                   node_name=None):
+                   node_name=None, min_host_memory=0):
         with self._locked() as (d, _):
             for nid, nd in d[COL_NODES].items():
                 if nd["state"] != NodeState.AVAILABLE.value:
+                    continue
+                # A node too small for the payload is not a candidate, pinned or
+                # not. 0 means the node was never probed, which is not evidence of
+                # enough memory, so it does not satisfy a stated requirement.
+                if min_host_memory and int(nd.get("host_memory_bytes", 0) or 0) < min_host_memory:
                     continue
                 if node_name is not None:
                     if nd.get("name") != node_name:
@@ -273,7 +279,7 @@ class MongoStore(Store):
         return self.nodes.delete_one({"node_id": node_id}).deleted_count > 0
 
     def claim_node(self, job_id, require_gpu=False, provider=None, kube_context=None,
-                   node_name=None):
+                   node_name=None, min_host_memory=0):
         # find_one_and_update is atomic server-side -> exclusive lock.
         if node_name is not None:
             q = {"state": NodeState.AVAILABLE.value, "name": node_name}
@@ -286,6 +292,12 @@ class MongoStore(Store):
             # unset both mean the VM/host/static pool, so $nin covers them.
             q = {"state": NodeState.AVAILABLE.value, "gpu": bool(require_gpu),
                  "provider": {"$nin": ["k8s"]}}
+        # Same rule as the file store, expressed in the query so the filter stays
+        # inside the atomic find_one_and_update rather than racing outside it.
+        # $gte excludes a missing field, which is exactly right: never probed is
+        # not evidence of enough memory.
+        if min_host_memory:
+            q["host_memory_bytes"] = {"$gte": int(min_host_memory)}
         d = self.nodes.find_one_and_update(
             q,
             {"$set": {"state": NodeState.CLAIMED.value, "owner_job": job_id, "updated_at": now_iso()}},

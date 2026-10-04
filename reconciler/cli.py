@@ -228,6 +228,30 @@ def cmd_nodes(args):
               f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}{extra}")
 
 
+def _probe_host_memory(ip: str, user: str, key: str) -> int:
+    """MemTotal on the node, in bytes, read from the node itself. 0 if unreachable.
+
+    Probed at registration rather than declared in the manifest because a
+    hand-written number is a number that drifts: the whole point of the check it
+    feeds is to refuse a job the node genuinely cannot hold, and a stale manifest
+    would refuse the wrong jobs and admit the wrong ones. `host_memory_bytes:` in
+    the spec still overrides it, for a node that cannot be reached at add time.
+
+    Failure is 0 ("never probed"), not an error: registering a node must not
+    depend on it, and 0 is already the honest value everywhere else.
+    """
+    import subprocess
+    from .adapter import ssh_base
+    try:
+        out = subprocess.run(
+            [*ssh_base(ip, user or None, key or None),
+             "awk '/^MemTotal:/ {print $2}' /proc/meminfo"],
+            capture_output=True, text=True, timeout=30)
+        return int(out.stdout.strip()) * 1024 if out.stdout.strip().isdigit() else 0
+    except Exception:
+        return 0
+
+
 def cmd_add_node(args):
     """Register a pre-provisioned, already-running ssh host (e.g. an EC2
     instance) as a worker, from a YAML manifest (see node.ec2.example.yaml).
@@ -259,13 +283,21 @@ def cmd_add_node(args):
         # target) — e.g. a NAT'd cloud where `ip` is a public address never
         # bound on the guest. "" -> mpi_ip falls back to `ip`, unchanged.
         cluster_ip=str(d.get("cluster_ip", "") or ""),
+        # Probed from the node unless the manifest states it. Feeds the
+        # host-memory admission check: a job that needs more than this is refused
+        # up front instead of being OOM-killed part-way through.
+        host_memory_bytes=int(d.get("host_memory_bytes", 0) or 0) or _probe_host_memory(
+            str(d["ip"]), d.get("ssh_user", "") or "",
+            os.path.expanduser(key) if key else ""),
     )
     store.put_node(node)
     print(f"added static-ssh node {node.name} at {node.ip} "
           f"({'gpu' if node.gpu else 'cpu'}, ssh {node.ssh_user or '<cluster-default>'}"
           f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}"
           f"{f', gpu_binds={node.gpu_binds}' if node.gpu_binds else ''}"
-          f"{f', cluster_ip={node.cluster_ip} (MPI-facing)' if node.cluster_ip else ''}). "
+          f"{f', cluster_ip={node.cluster_ip} (MPI-facing)' if node.cluster_ip else ''}"
+          f", host_memory="
+          f"{f'{node.host_memory_bytes / 2**30:.1f}GiB' if node.host_memory_bytes else 'UNPROBED'}). "
           f"Bake apptainer into the image before running real jobs.")
 
 

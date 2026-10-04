@@ -7,7 +7,7 @@ import pytest
 
 from reconciler.audit import Audit
 from reconciler.models import NodeRecord
-from reconciler.registry import NoCapacity, NodeRegistry
+from reconciler.registry import NoCapacity, NodeRegistry, Unsatisfiable
 from reconciler.states import NodeState
 
 
@@ -22,6 +22,66 @@ def _seed(store, cpu: int = 4, gpu: bool = False) -> None:
     if gpu:
         store.put_node(NodeRecord(node_id="host", name="host", index=0, ip="10.0.0.100",
                                   gpu=True, local=True))
+
+
+class TestHostMemoryAdmission:
+    """A payload too big for a node's RAM must be refused BEFORE it is claimed.
+
+    HPL-MxP keeps an FP64 copy of the matrix on the host, so the same N that
+    fits a 32 GiB box is OOM-killed on a 16 GiB one with the same GPU. That
+    failure costs a claimed GPU node, the whole solve, and the measurement --
+    and it reports itself as a dead process, not as a job that was always
+    impossible. The check turns it into a refusal at admission.
+    """
+
+    def _sized(self, store, **sizes):
+        for i, (name, gib) in enumerate(sizes.items(), start=1):
+            store.put_node(NodeRecord(node_id=name, name=name, index=i, ip=f"10.0.0.{i}",
+                                      host_memory_bytes=int(gib * 2**30)))
+
+    def test_a_node_with_enough_memory_is_claimed(self, store, registry):
+        self._sized(store, big=32)
+        assert len(registry.claim("job-a", 1, min_host_memory=12 * 2**30)) == 1
+
+    def test_a_node_too_small_is_refused_not_queued(self, store, registry):
+        """Unsatisfiable, not NoCapacity: waiting does not grow RAM. Queuing it
+        would hold the job open for the whole capacity timeout and then blame
+        contention."""
+        self._sized(store, small=8)
+        with pytest.raises(Unsatisfiable):
+            registry.claim("job-a", 1, min_host_memory=17 * 2**30)
+
+    def test_it_picks_the_node_that_fits(self, store, registry):
+        self._sized(store, small=8, big=64)
+        claimed = registry.claim("job-a", 1, min_host_memory=17 * 2**30)
+        assert [n.name for n in claimed] == ["big"]
+
+    def test_an_unprobed_node_does_not_satisfy_a_requirement(self, store, registry):
+        """0 means never asked, which is not evidence of enough memory. Treating
+        it as 'fine' is how the OOM happened in the first place."""
+        store.put_node(NodeRecord(node_id="n1", name="n1", index=1, ip="10.0.0.1"))
+        with pytest.raises(Unsatisfiable, match="unprobed"):
+            registry.claim("job-a", 1, min_host_memory=4 * 2**30)
+
+    def test_no_requirement_ignores_memory_entirely(self, store, registry):
+        """Absence is not a claim: a job that states nothing runs exactly as before,
+        on nodes that were never probed."""
+        store.put_node(NodeRecord(node_id="n1", name="n1", index=1, ip="10.0.0.1"))
+        assert len(registry.claim("job-a", 1)) == 1
+
+    def test_a_pinned_node_that_is_too_small_is_refused(self, store, registry):
+        """A pin names the machine the measurement is OF, so it must not quietly
+        fall through to another node -- but it must not be run on a box that
+        cannot hold the payload either."""
+        self._sized(store, pinned=8, other=64)
+        with pytest.raises(Unsatisfiable):
+            registry.claim("job-a", 1, node_name="pinned", min_host_memory=17 * 2**30)
+
+    def test_the_refusal_names_the_shortfall_and_the_remedy(self, store, registry):
+        self._sized(store, small=8)
+        with pytest.raises(Unsatisfiable) as e:
+            registry.claim("job-a", 1, min_host_memory=17 * 2**30)
+        assert "17.0 GiB" in str(e.value) and "small=8.0GiB" in str(e.value)
 
 
 class TestClaim:
@@ -84,7 +144,7 @@ class TestCompetingMultiNodeClaims:
         acquire = store.claim_node
 
         def claim_then_wait(job_id, require_gpu=False, provider=None, kube_context=None,
-                            node_name=None):
+                            node_name=None, min_host_memory=0):
             # Hold at the barrier after the FIRST node so both jobs are holding one
             # before either asks for its second — the interleaving that starves.
             node = acquire(job_id, require_gpu=require_gpu)

@@ -56,6 +56,15 @@ class JobSpec:
     # Unlike `params`, this is NOT opaque passthrough: it is validated on parse and
     # a block we cannot honour refuses the job (see launch_models).
     launch: dict[str, Any] | None = None
+    # HOST RAM the payload needs, in bytes. 0 = the caller states no requirement,
+    # which is every job written before this existed and stays the default.
+    #
+    # A scheduling constraint, not passthrough: a job that needs more host memory
+    # than a node has is not slow, it is OOM-killed part-way through a solve, and
+    # the measurement is lost along with the GPU time that produced it. HPL-MxP
+    # keeps an FP64 copy of the matrix on the host, so the same N that fits a
+    # 32 GiB box is killed on a 16 GiB one with the same GPU.
+    host_memory_bytes: int = 0
     # legacy label (kept so old specs still parse)
     workload: str = ""
 
@@ -86,6 +95,10 @@ class JobSpec:
             output_dir=d.get("output_dir", "/out"),
             params=d.get("params", {}) or {},
             launch=launch,
+            # Parsed, not dropped. A requirement silently discarded is worse than
+            # one never stated: the job runs, gets OOM-killed, and nothing says
+            # why -- the same failure mode `launch` above is parsed to avoid.
+            host_memory_bytes=int(d.get("host_memory_bytes", 0) or 0),
             workload=d.get("workload", "") or "",
         )
 
@@ -157,6 +170,15 @@ class NodeRecord:
     # which exist on that node), while an Ubuntu worker wants "" (--nv self-
     # detects). Only consulted for gpu runs; empty = plain --nv.
     gpu_binds: str = ""
+    # TOTAL host RAM on this node, in bytes, as the node itself reported it at
+    # registration (MemTotal). 0 = never probed, which is every node registered
+    # before this existed.
+    #
+    # Nothing is inferred from 0: a job that states a host_memory_bytes
+    # requirement is REFUSED on an unprobed node rather than gambled on, because
+    # the gamble is paid for in GPU time and a lost measurement. Re-register the
+    # node (remove-node + add-node) and it is probed.
+    host_memory_bytes: int = 0
     # for a k8s-backend slot: which kube-context (i.e. which cluster) it targets,
     # so several k8s clusters (e.g. an AWS GPU worker + the PC's 5060 Ti) can live
     # under ONE control plane. "" -> the adapter's global CLUSTER_K8S_CONTEXT
@@ -197,7 +219,8 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "gpu_binds", "kube_context", "cluster_ip", "updated_at"}
+                "gpu_binds", "kube_context", "cluster_ip", "updated_at",
+                "host_memory_bytes"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 

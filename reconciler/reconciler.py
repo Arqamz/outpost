@@ -27,7 +27,8 @@ from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
                       REPO_ROOT, LOGS_DIR, append_job_log)
 from .audit import Audit
 from .models import JobRecord, JobSpec, NodeRecord
-from .registry import NodeRegistry, NoCapacity  # NoCapacity: a submitted job waits, it doesn't fail
+from .registry import (  # NoCapacity: a submitted job waits, it doesn't fail
+    NodeRegistry, NoCapacity, Unsatisfiable)
 from .states import JobState, NodeState, JOB_TERMINAL, assert_job
 from .store import Store, now_iso
 from .topology import normalize as normalize_topology
@@ -198,6 +199,12 @@ class Reconciler:
         wait, timeout, fail) is handled here so pool.map can't abort early."""
         try:
             return self._advance(job)
+        except Unsatisfiable as e:
+            # Not contention: no node can serve this job however long it waits.
+            # Fail it now. Retrying would hold the submission open for the whole
+            # capacity timeout and then report the wrong reason.
+            self._fail(job, str(e))
+            return True
         except NoCapacity as e:
             # Pool contention, not a job defect — leave the job as-is (still
             # SUBMITTED, since _phase_provision only transitions on success)
@@ -308,7 +315,8 @@ class Reconciler:
                 kind += f" @ {target_node}"
             nodes = self.registry.claim(job.job_id, spec.node_count,
                                         require_gpu=spec.gpu, hybrid=spec.hybrid,
-                                        node_name=target_node)
+                                        node_name=target_node,
+                                        min_host_memory=spec.host_memory_bytes)
             claimed_n = spec.node_count
         self._set_job(job, JobState.PROVISIONING, f"claimed {claimed_n} {kind} node(s)")
         job.assigned_nodes = [n.node_id for n in nodes]
