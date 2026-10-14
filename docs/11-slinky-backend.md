@@ -1,10 +1,10 @@
 # 11 · Slinky backend: Slurm on Kubernetes
 
-> **Status: implemented and live-verified** on a tashkil AWS child cluster
-> (2026-10-14): kubeadm 1.35, 2 × g4dn.xlarge (T4), Slinky 1.2.2, Slurm 26.05,
-> pyxis/enroot, `/scratch` on FSx for Lustre. A GPU smoke job and GTL's STREAM
-> suite both ran from `submit` through the reconciler to `promoted`, with
-> output in the drop-zone.
+> **Status: implemented and live-verified** on tashkil AWS child clusters
+> (2026-10-14): kubeadm 1.35, Slinky 1.2.2, Slurm 26.05, pyxis/enroot,
+> `/scratch` on FSx for Lustre, 2 × T4 and up to 2 × A10G. GTL's STREAM,
+> HPL-MxP and 2-node nccl-tests ran from `gtl submit` through the reconciler
+> to fingerprints. See the end of this page for exactly what was run.
 
 `SlinkyAdapter` runs a JobSpec as a Slurm batch job on a
 [Slinky](https://github.com/SlinkyProject/slurm-operator) cluster. The JobSpec
@@ -68,10 +68,10 @@ which GPU the task gets. A job's own `env` overrides both.
 
 | JobSpec | sbatch / srun |
 |---|---|
-| `node_count` | `--nodes=N`, one task per node |
+| `node_count` | `--nodes=N`, one task per node; with per-node slots also `--nodelist`, `--exclusive` |
 | `launcher: single` | `srun --ntasks=1` (first node) |
 | `launcher: mpi` | `srun --ntasks=N --mpi=$CLUSTER_SLINKY_MPI` (default `pmix`) |
-| `gpu: true` | `--gres=gpu:<params.gpu_count, default 1>` |
+| `gpu: true` | per-node slots: `--gres=gpu:<the node's GPU count>`; cluster-wide: `--gres=gpu:<params.gpu_count, default 1>` |
 | `env` | `export`ed in the batch script; `MASTER_ADDR` (first allocated host), `MASTER_PORT`, `WORLD_SIZE` are set first |
 | `output_dir` | `--container-mounts=<workdir>:<output_dir>`, `--container-workdir` |
 | `params.time_limit` | `--time` |
@@ -87,22 +87,38 @@ failed straight away instead of waiting out `CLUSTER_SLINKY_RUN_TIMEOUT`
 
 ## Routing: slots
 
-As with k8s, a Slinky cluster appears in the registry as **slots** (provider
-`slinky`). A slot is a concurrency bound on one cluster, not a machine. A plain
-pool claim never takes a backend slot (`BACKEND_PROVIDERS` in `models.py`).
-A job reaches a slot in one of two ways:
+A Slinky cluster appears in the registry as **slots** (provider `slinky`). A
+plain pool claim never takes a backend slot (`BACKEND_PROVIDERS` in
+`models.py`). There are two kinds:
 
-- `backend: slinky`, optionally with `params.slinky_context` (the slot's
-  kube-context) or `params.node_name` (one exact slot);
-- **a `params.node_name` pin naming the slot, with no `backend` set.** This is
-  how GTL gets there: its deployment targets pin node names, so a target whose
-  `node_names` is `[slinky-aws-t4]` runs on that cluster without GTL knowing
-  Slurm exists. The reconciler sees the pinned node is a slinky slot and
-  claims that one slot (`node_count` stays the Slurm node count).
+- **Per-node slots** (`add-slinky --per-node`): one slot per Slurm node, found
+  with `sinfo -N` through the login pod and named `slinky-<name>-<i>` in sinfo
+  order. Each carries its Slurm node name and GPU count. A job takes
+  `node_count` of them and runs on exactly those nodes: `--nodelist`,
+  `--exclusive`, `--gres=gpu:<all of the node's GPUs>`. Rank i runs on the i-th
+  slot named (srun `--distribution=arbitrary` over a hostfile in pin order), and
+  `MASTER_ADDR` is the first. This matches a bare-metal claim: whole nodes, in
+  rank order. If the cluster's nodes are replaced, `remove-node` the slots and
+  register again; bootstrap refuses a pinned node Slurm no longer has or
+  reports down.
+- **Cluster-wide slots** (`--slots N`, the default 1): a concurrency bound, not
+  a machine. A job takes one, and Slurm picks `node_count` nodes and gives each
+  task `params.gpu_count` GPUs (default 1).
+
+A job reaches slots in one of two ways:
+
+- `backend: slinky`, optionally with `params.slinky_context` (one cluster) or
+  `params.node_name` (exact slots);
+- **a `params.node_name` pin naming slinky slots, with no `backend` set.** This
+  is how GTL gets there: a deployment target pins node names, so a target whose
+  `node_names` is `[slinky-a10g-0, slinky-a10g-1]` is a 2-node job on those two
+  Slurm nodes, and GTL never learns Slurm is involved. A pin of per-node slots
+  must name exactly `node_count` of them, all on one cluster. A cluster-wide slot
+  carries a whole job, so a pin names at most one.
 
 ```bash
-cluster add-slinky --name aws-t4 --context <kube-context> --gpu   # -> slot slinky-aws-t4
-cluster add-slinky --name big --context big --slots 4               # -> slinky-big-0..3
+cluster add-slinky --name a10g --context <kube-context> --per-node  # -> slinky-a10g-0, -1, ...
+cluster add-slinky --name big --context big --slots 4                # -> slinky-big-0..3 (cluster-wide)
 cluster submit --spec job.slinky.smoke.yaml
 cluster reconcile --execute
 ```
@@ -125,6 +141,15 @@ A10G: an outpost STREAM job submitted as soon as Slurm answered overlapped
 acceptance's HPL-MxP, acceptance failed on performance, and the platform
 decommissioned the cluster as its policy says.
 
+**A job can take Slurm's controller down with it.** slurmctld runs as a pod on
+one of the GPU workers, and Slurm enforces no memory limit on jobs there. Seen
+2026-10-14 on 2 × g5.xlarge (16 GiB): HPL-MxP at `n=45056` (≈17 GB host) drove
+its worker `NotReady`, and slurmctld, on that same worker, went down until the
+node recovered. The adapter now waits out such an outage
+(`CLUSTER_SLINKY_CTLD_GRACE`) instead of failing every job. Size host-memory
+hungry jobs for the node (GTL's HPL host-memory rule: `n=36864` fits a
+g5.xlarge).
+
 The reconciler reaches the cluster the way cluster-service does: through the
 management cluster's chisel door, with a kubeconfig whose server is a local
 port-forward.
@@ -145,29 +170,36 @@ port-forward.
 | `CLUSTER_SLINKY_RUN_TIMEOUT` | `3600` | seconds, submit to terminal |
 | `CLUSTER_SLINKY_POLL_INTERVAL` | `10` | |
 | `CLUSTER_SLINKY_KEEP_WORKDIR` | `0` | `1` keeps the workdir after teardown |
+| `CLUSTER_SLINKY_CTLD_GRACE` | `600` | seconds slurmctld may be unreachable before poll, provision or teardown give up |
 | `CLUSTER_SLINKY_TRANSPORT_RETRIES` | `6` | attempts for a call cut by a kubectl transport error (not a command failure) |
 | `CLUSTER_SLINKY_TRANSPORT_BACKOFF` | `5` | seconds between those attempts |
 
 ## What was verified, and what was not
 
-Verified live (T4 cluster unless noted):
-- single-node GPU jobs (`launcher: single`) on a T4, with both a plain image and an NGC image;
-- import → submit → poll → collect → teardown;
-- three back-to-back jobs on one slot;
+Verified live, on T4 (2 × g4dn.xlarge) and A10G (1 and 2 × g5.xlarge) clusters:
+- single-node GPU jobs (`launcher: single`), with a plain image and an NGC image;
+- import → submit → poll → collect → teardown, and back-to-back jobs on one slot;
 - a failure path (an enroot import failure fails the job and cleans up);
-- GTL's STREAM suite on an A10G cluster via `gtl submit --target`: a
-  node_name-pinned slot, the pinned NGC image, Triad 513 GB/s (85.5% of the 600
-  GB/s ceiling). `gtl ingest` wrote candidate fingerprints recording
-  `scheduler: slurm`;
-- a `launcher: mpi`, `node_count: 2` job: one task on each node, each on its own T4.
-  `--mpi=pmix` works in the stock slurmd image (`PMIX_RANK` 0/1), and
-  `MASTER_ADDR` is the first node.
+- **per-node slots** (2 × A10G): `add-slinky --per-node` found both Slurm
+  nodes. A job pinning them in reverse order ran rank 0 on the first pin, with
+  `MASTER_ADDR` = that node and one GPU per rank, and PMIx ranks matching Slurm's.
+  Two 1-node jobs on the two slots ran at the same time;
+- GTL through `gtl submit --target` → `gtl ingest`, all fingerprints recording
+  `scheduler: slurm`:
+  - STREAM, 3 runs: Triad 523.5 GB/s (87.3% of 600 GB/s), variance 0.65%. This
+    matches the non-Slinky A10G Triad in staging (523.4);
+  - HPL-MxP at `n=36864`, 3 runs: 13,406 GFLOPS, variance 1.6%. That's 8% below
+    the staging g5.xlarge record (14,620). HPL-MxP is CPU-heavy outside the
+    solve, and this worker also hosts slurmctld and the platform's operators;
+  - nccl-tests `all_reduce` across both nodes (`launcher: mpi`, `srun
+    --mpi=pmix` inside the NGC image): real NCCL traffic over the pod network,
+    zero wrong results, about 0.9 GB/s bus bandwidth on a 10 Gbit/s link;
+- a slurmctld outage while a job runs (see above): the adapter now waits it out.
 
 Not yet exercised live:
 
-- **Real MPI/NCCL traffic between slurmd pods.** The 2-node launch above ran
-  no MPI library.
-- **Multi-GPU nodes:** with `NVIDIA_VISIBLE_DEVICES=all`, it's unconfirmed
-  that a task requesting fewer GPUs than the node has sees only its own.
+- **Multi-GPU nodes.** The tashkil AWS account's on-demand G quota (8 vCPU)
+  cannot hold a 4-GPU instance, so `--exclusive` with several GPUs per node and
+  more than one rank per node are untested.
 - **Private registries (ECR):** `enroot import` needs credentials
   (`$ENROOT_CONFIG_PATH/.credentials`) in the login pod; none are configured.
