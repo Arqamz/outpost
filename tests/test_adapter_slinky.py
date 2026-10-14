@@ -171,3 +171,65 @@ def test_a_launch_block_is_refused_on_slinky(store, slinky_pool, rec):
     job = store.get_job(job_id)
     assert job.state == JobState.FAILED.value and "slinky" in job.error
     assert slinky.calls == []
+
+
+# ── kubectl transport failures ──────────────────────────────────────────────
+
+class _Proc:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+@pytest.fixture()
+def quick(monkeypatch):
+    import reconciler.adapter as ad
+    monkeypatch.setattr(ad, "SLINKY_TRANSPORT_BACKOFF_S", 0)
+    monkeypatch.setattr(ad.time, "sleep", lambda s: None)
+    a = SlinkyAdapter(log=lambda m: None)
+    monkeypatch.setattr(a, "_login_pod", lambda ctx: "login-0")
+    return a
+
+
+def _script(monkeypatch, replies):
+    """subprocess.run answers from `replies` in order; returns the scripts run."""
+    import reconciler.adapter as ad
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(argv[-1])
+        return replies.pop(0)
+    monkeypatch.setattr(ad.subprocess, "run", run)
+    return seen
+
+
+def test_a_dropped_stream_is_retried(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "", "error: unexpected EOF"), _Proc(0, "ok", "")])
+    assert quick._exec("ctx", "login-0", "true") == (0, "ok", "")
+    assert len(seen) == 2
+
+
+def test_the_command_failing_is_not_retried(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "", "slurm_load_jobs error: Invalid job id")])
+    assert quick._exec("ctx", "login-0", "scontrol show job 9")[0] == 1
+    assert len(seen) == 1
+
+
+def test_a_cut_submit_adopts_the_job_slurm_already_has(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "", "error: lost connection to pod"),
+                                 _Proc(0, "42\n", "")])
+    assert quick._submit("ctx", "login-0", "job-abc", "/w", "#!/bin/bash\n") == "42"
+    assert "sbatch" in seen[0] and "squeue" in seen[1] and len(seen) == 2
+
+
+def test_a_cut_submit_that_never_landed_is_resubmitted(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "", "error: unexpected EOF"),
+                                 _Proc(0, "", ""), _Proc(0, "43\n", "")])
+    assert quick._submit("ctx", "login-0", "job-abc", "/w", "#!/bin/bash\n") == "43"
+    assert [("sbatch" in s, "squeue" in s) for s in seen] == [(True, False), (False, True),
+                                                             (True, False)]
+
+
+def test_sbatch_refusing_is_not_retried(quick, monkeypatch):
+    _script(monkeypatch, [_Proc(1, "", "sbatch: error: Invalid generic resource (gres) specification")])
+    with pytest.raises(RuntimeError, match="sbatch refused"):
+        quick._submit("ctx", "login-0", "job-abc", "/w", "#!/bin/bash\n")

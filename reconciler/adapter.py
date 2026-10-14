@@ -188,6 +188,14 @@ SLINKY_POLL_INTERVAL_S = float(os.environ.get("CLUSTER_SLINKY_POLL_INTERVAL", "1
 SLINKY_KEEP_WORKDIR = os.environ.get("CLUSTER_SLINKY_KEEP_WORKDIR", "0") == "1"
 SLINKY_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
                           "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
+# kubectl-side failures that say nothing about the command being run, so a
+# safe-to-repeat call is retried (CLUSTER_SLINKY_TRANSPORT_RETRIES attempts).
+KUBECTL_TRANSPORT_ERRORS = ("unexpected EOF", "lost connection", "connection refused",
+                            "connection reset by peer", "Unable to connect to the server",
+                            "i/o timeout", "TLS handshake timeout", "error dialing backend",
+                            "http2: client connection lost", "use of closed network connection")
+SLINKY_TRANSPORT_RETRIES = int(os.environ.get("CLUSTER_SLINKY_TRANSPORT_RETRIES", "6"))
+SLINKY_TRANSPORT_BACKOFF_S = float(os.environ.get("CLUSTER_SLINKY_TRANSPORT_BACKOFF", "5"))
 # enroot's nvidia hook injects the driver only when the container environment
 # names the GPUs; NGC images set these, plain images do not. Slurm's own GRES
 # binding still decides which GPU the task gets.
@@ -1907,6 +1915,13 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
     return "\n".join(lines) + "\n"
 
 
+def is_kubectl_transport_error(stderr: str) -> bool:
+    """kubectl itself failing to reach the cluster or keep an exec stream
+    open, as opposed to the command in the pod failing. Seen through a
+    port-forwarded API server: "error: unexpected EOF", "lost connection"."""
+    return any(m in stderr for m in KUBECTL_TRANSPORT_ERRORS)
+
+
 def parse_slurm_job(text: str) -> tuple[str, str, int | None]:
     """(state, reason, exit_code) from `scontrol show job -o` output. The exit
     code is the first half of ExitCode=<code>:<signal>; a non-zero signal with
@@ -1946,12 +1961,37 @@ class SlinkyAdapter(ProviderAdapter):
     def _kubectl_base(self, context: str) -> list[str]:
         return ["kubectl"] + (["--context", context] if context else [])
 
+    def _exec(self, context: str, pod: str, script: str, job_id: str | None = None,
+              input: str | None = None) -> tuple[int, str, str]:
+        """Run a shell snippet in the login pod. A kubectl transport failure
+        (the API connection or the exec stream dropping) is retried; the
+        snippet itself failing is returned as-is. Only for snippets that are
+        safe to run twice. With job_id, the command and output go to the
+        job's replay log."""
+        argv = self._exec_argv(context, pod, script, stdin=input is not None)
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            proc = subprocess.run(argv, input=input, capture_output=True, text=True)
+            if job_id:
+                append_job_log(job_id, f"{now_iso()} $ {' '.join(shlex.quote(a) for a in argv)}\n"
+                                       f"{proc.stdout}{proc.stderr}")
+            if proc.returncode == 0 or not is_kubectl_transport_error(proc.stderr) \
+                    or attempt == SLINKY_TRANSPORT_RETRIES:
+                return proc.returncode, proc.stdout, proc.stderr
+            self.log(f"[slinky] kubectl transport error ({proc.stderr.strip()[:120]}); "
+                     f"retry {attempt}/{SLINKY_TRANSPORT_RETRIES - 1}")
+            time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
+        raise AssertionError("unreachable")
+
     def _login_pod(self, context: str) -> str:
-        proc = subprocess.run(
-            self._kubectl_base(context) + [
-                "get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
-                "--field-selector=status.phase=Running", "-o", "name"],
-            capture_output=True, text=True)
+        argv = self._kubectl_base(context) + [
+            "get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
+            "--field-selector=status.phase=Running", "-o", "name"]
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            if proc.returncode == 0 or not is_kubectl_transport_error(proc.stderr):
+                break
+            if attempt < SLINKY_TRANSPORT_RETRIES:
+                time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
         pods = [p.split("/", 1)[-1] for p in proc.stdout.split() if p]
         if proc.returncode != 0 or not pods:
             raise RuntimeError(
@@ -1968,28 +2008,17 @@ class SlinkyAdapter(ProviderAdapter):
             ["-n", SLINKY_NAMESPACE, pod, "-c", SLINKY_LOGIN_CONTAINER, "--",
              "bash", "-lc", script])
 
-    def _login(self, context: str, script: str, job_id: str, pod: str | None = None,
-               check: bool = True) -> int:
-        """Run a shell snippet in the login pod, streamed into the replay log."""
-        pod = pod or self._login_pod(context)
-        return run_logged(self._exec_argv(context, pod, script), job_id, check=check)
-
-    def _login_out(self, context: str, pod: str, script: str,
-                   input: str | None = None) -> tuple[int, str, str]:
-        proc = subprocess.run(self._exec_argv(context, pod, script, stdin=input is not None),
-                              input=input, capture_output=True, text=True)
-        return proc.returncode, proc.stdout, proc.stderr
-
     # ── node lifecycle (verify only) ─────────────────────────────────────
     def provision(self, node, job_id):
         ctx = self._context_of(node)
         pod = self._login_pod(ctx)
         self.log(f"[slinky] slot {node.name}: login pod {pod}"
                  f"{f' (context {ctx})' if ctx else ''}; checking slurmctld")
-        if self._login(ctx, "scontrol ping && sinfo", job_id, pod=pod, check=False) != 0:
+        rc, _, err = self._exec(ctx, pod, "scontrol ping && sinfo", job_id)
+        if rc != 0:
             raise RuntimeError(
-                f"slurmctld does not answer from {pod} (`scontrol ping` failed) — check the "
-                f"Controller pod in namespace {SLINKY_NAMESPACE!r}")
+                f"slurmctld does not answer from {pod} (`scontrol ping` failed: {err.strip()}) "
+                f"— check the Controller pod in namespace {SLINKY_NAMESPACE!r}")
 
     def bootstrap(self, nodes, job_id):
         ctx = self._context_of(nodes[0])
@@ -2008,8 +2037,9 @@ class SlinkyAdapter(ProviderAdapter):
             checks.append((f"sinfo -h -p {shlex.quote(SLINKY_PARTITION)} -o %P | grep -q .",
                            f"partition {SLINKY_PARTITION!r} does not exist"))
         for script, why in checks:
-            if self._login(ctx, script, job_id, pod=pod, check=False) != 0:
-                raise RuntimeError(why)
+            rc, _, err = self._exec(ctx, pod, script, job_id)
+            if rc != 0:
+                raise RuntimeError(f"{why} ({err.strip()})" if err.strip() else why)
 
     def deprovision(self, node, job_id):
         ctx = self._context_of(node)
@@ -2021,14 +2051,15 @@ class SlinkyAdapter(ProviderAdapter):
         script = f"scancel --name=outpost-{job_id} || true"
         if not SLINKY_KEEP_WORKDIR:
             script += f"; rm -rf {shlex.quote(self._workdir(job_id))}"
-        self._login(ctx, script, job_id, pod=pod, check=False)
+        self._exec(ctx, pod, script, job_id)
 
     # ── workload lifecycle ────────────────────────────────────────────────
     def _stage_image(self, ctx: str, pod: str, image: str, job_id: str) -> str:
         """Import the image once per digest onto the shared filesystem and
         return the squashfs path. Done from the login pod (enroot runs there),
         so no slurmd pulls the image and every later job starts from the cache.
-        The layer cache is shared too; only the unpack happens pod-locally."""
+        The layer cache is shared too; only the unpack happens pod-locally.
+        Safe to repeat: the import writes a per-job temp file and renames it."""
         if image.startswith("/"):
             return image
         images = f"{SLINKY_WORKDIR_ROOT}/.images"
@@ -2048,11 +2079,38 @@ class SlinkyAdapter(ProviderAdapter):
                   f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "
                   f"rm -f {tmp}; enroot import -o {tmp} {shlex.quote(uri)} && mv -f {tmp} {sqsh}")
         self.log(f"[slinky] staging {uri} -> {sqsh}")
-        rc = self._login(ctx, script, job_id, pod=pod, check=False)
+        rc, _, _ = self._exec(ctx, pod, script, job_id)
         if rc != 0:
             raise RuntimeError(f"enroot import of {uri} failed in {pod} (exit {rc}); the "
                                f"import output is in `cluster logs {job_id}`")
         return sqsh
+
+    def _submit(self, ctx: str, pod: str, job_id: str, workdir: str, script: str) -> str:
+        """sbatch the script and return the Slurm job id. Submitting is not
+        safe to repeat, so after a transport failure the job is looked up by
+        name first and only resubmitted if Slurm never got it."""
+        q = shlex.quote(workdir)
+        submit = (f"mkdir -p {q} && cat > {q}/launcher-slinky.sbatch "
+                  f"&& sbatch --parsable {q}/launcher-slinky.sbatch")
+        lookup = f"squeue -h -n outpost-{job_id} -o %i; sacct -n -X -P --name=outpost-{job_id} -o JobID"
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            if attempt > 1:
+                _, out, _ = self._exec(ctx, pod, lookup, job_id)
+                found = [x for x in out.split() if x.isdigit()]
+                if found:
+                    self.log(f"[slinky] Slurm already has outpost-{job_id} as job {found[0]}")
+                    return found[0]
+            argv = self._exec_argv(ctx, pod, submit, stdin=True)
+            proc = subprocess.run(argv, input=script, capture_output=True, text=True)
+            append_job_log(job_id, f"{now_iso()} [slinky] sbatch rc={proc.returncode} "
+                                   f"{proc.stdout.strip()} {proc.stderr.strip()}")
+            if proc.returncode == 0:
+                return proc.stdout.strip().split(";")[0]
+            if not is_kubectl_transport_error(proc.stderr):
+                raise RuntimeError(f"sbatch refused the job on {pod}: "
+                                   f"{proc.stderr.strip() or proc.stdout.strip()}")
+            time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
+        raise RuntimeError(f"could not reach {pod} to submit the job: {proc.stderr.strip()}")
 
     def run(self, nodes, job_id, spec, plan=None):
         slot = nodes[0]
@@ -2068,21 +2126,13 @@ class SlinkyAdapter(ProviderAdapter):
         with open(os.path.join(local, "launcher-slinky.sbatch"), "w") as f:
             f.write(script)
         append_job_log(job_id, f"{now_iso()} [slinky] sbatch script:\n{script}")
-        rc, out, err = self._login_out(
-            ctx, pod,
-            f"mkdir -p {shlex.quote(workdir)} && cat > {shlex.quote(workdir)}/launcher-slinky.sbatch "
-            f"&& sbatch --parsable {shlex.quote(workdir)}/launcher-slinky.sbatch",
-            input=script)
-        append_job_log(job_id, f"{now_iso()} [slinky] sbatch rc={rc} {out.strip()} {err.strip()}")
-        if rc != 0:
-            raise RuntimeError(f"sbatch refused the job on {pod}: {err.strip() or out.strip()}")
-        slurm_id = out.strip().split(";")[0]
+        slurm_id = self._submit(ctx, pod, job_id, workdir, script)
         self.log(f"[slinky] submitted Slurm job {slurm_id} from {pod} (workdir {workdir})")
         with open(os.path.join(local, "slurm-job-id"), "w") as f:
             f.write(slurm_id + "\n")
         state, code = self._await(ctx, pod, slurm_id, job_id)
         stdout_path = os.path.join(local, "stdout.log")
-        _, log_text, _ = self._login_out(ctx, pod, f"cat {shlex.quote(workdir)}/stdout.log")
+        _, log_text, _ = self._exec(ctx, pod, f"cat {shlex.quote(workdir)}/stdout.log")
         with open(stdout_path, "w") as f:
             f.write(log_text)
         append_job_log(job_id, f"{now_iso()} [slinky] stdout.log:\n{log_text}")
@@ -2095,10 +2145,10 @@ class SlinkyAdapter(ProviderAdapter):
         deadline = time.monotonic() + SLINKY_RUN_TIMEOUT_S
         last = None
         while True:
-            rc, out, err = self._login_out(ctx, pod, f"scontrol show job -o {slurm_id}")
+            rc, out, err = self._exec(ctx, pod, f"scontrol show job -o {slurm_id}")
             if rc != 0:
-                raise RuntimeError(f"Slurm job {slurm_id} is no longer known to slurmctld "
-                                   f"({err.strip()}); its result cannot be read")
+                raise RuntimeError(f"cannot read Slurm job {slurm_id} from {pod}: "
+                                   f"{err.strip()}")
             state, reason, code = parse_slurm_job(out)
             if (state, reason) != last:
                 msg = f"[slinky] job {slurm_id}: {state} ({reason})"
@@ -2108,31 +2158,42 @@ class SlinkyAdapter(ProviderAdapter):
             if state in SLINKY_TERMINAL_STATES:
                 return state, code
             if state == "PENDING" and reason in SLINKY_FATAL_PENDING_REASONS:
-                self._login(ctx, f"scancel {slurm_id}", job_id, pod=pod, check=False)
+                self._exec(ctx, pod, f"scancel {slurm_id}", job_id)
                 raise RuntimeError(f"Slurm job {slurm_id} can never start: {reason}")
             if time.monotonic() >= deadline:
-                self._login(ctx, f"scancel {slurm_id}", job_id, pod=pod, check=False)
+                self._exec(ctx, pod, f"scancel {slurm_id}", job_id)
                 raise RuntimeError(f"Slurm job {slurm_id} did not finish within "
                                    f"{SLINKY_RUN_TIMEOUT_S:.0f}s (last state {state})")
             time.sleep(SLINKY_POLL_INTERVAL_S)
 
     def collect(self, nodes, job_id, spec, dest):
         """Stream the shared workdir out of the login pod as a tar, keeping
-        stdout.log and output_dir files and dropping staging artifacts."""
+        stdout.log and output_dir files and dropping staging artifacts. A
+        stream cut by a transport failure is fetched again from the start."""
         import tarfile
         ctx = self._context_of(nodes[0])
         pod = self._login_pod(ctx)
         os.makedirs(dest, exist_ok=True)
         argv = self._exec_argv(ctx, pod, f"tar -C {shlex.quote(self._workdir(job_id))} -cf - .")
-        append_job_log(job_id, f"{now_iso()} $ {' '.join(shlex.quote(a) for a in argv)}")
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
-            for member in tar:
-                top = member.name.lstrip("./").split("/", 1)[0]
-                if not top or _is_staging_artifact(top):
-                    continue
-                tar.extract(member, dest, filter="data")
-        err = proc.stderr.read().decode(errors="replace")
-        if proc.wait() != 0:
-            raise RuntimeError(f"collect from {pod} failed: {err.strip()}")
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            append_job_log(job_id, f"{now_iso()} $ {' '.join(shlex.quote(a) for a in argv)}")
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                    for member in tar:
+                        top = member.name.lstrip("./").split("/", 1)[0]
+                        if not top or _is_staging_artifact(top):
+                            continue
+                        tar.extract(member, dest, filter="data")
+            except tarfile.TarError as e:
+                tar_error = str(e)
+            else:
+                tar_error = ""
+            err = proc.stderr.read().decode(errors="replace")
+            if proc.wait() == 0 and not tar_error:
+                return dest
+            if not is_kubectl_transport_error(err) or attempt == SLINKY_TRANSPORT_RETRIES:
+                raise RuntimeError(f"collect from {pod} failed: {err.strip() or tar_error}")
+            self.log(f"[slinky] collect cut off ({err.strip()[:120]}); retry {attempt}")
+            time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
         return dest
