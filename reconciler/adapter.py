@@ -4,9 +4,9 @@ There is deliberately no separate "executor" abstraction: running a container
 is just what an adapter does once it owns a node. Which adapter is used is
 decided by the node itself — a `local` node (the control-plane host,
 GPU-capable) uses LocalHostAdapter (apptainer --nv, run in-process); any other
-node uses LibvirtAdapter (ssh + apptainer into the VM). NullAdapter is the
-dry-run no-op. A future backend (real cloud VMs, KinD, Slinky, whatever) just
-implements the same five methods.
+node uses LibvirtAdapter (ssh + apptainer into the VM); a backend slot uses
+its cluster's adapter (KubernetesAdapter, SlinkyAdapter). NullAdapter is the
+dry-run no-op. Another backend just implements the same five methods.
 """
 from __future__ import annotations
 import dataclasses
@@ -169,10 +169,18 @@ SLINKY_LOGIN_SELECTOR = os.environ.get("CLUSTER_SLINKY_LOGIN_SELECTOR",
                                        "app.kubernetes.io/name=login")
 SLINKY_LOGIN_CONTAINER = os.environ.get("CLUSTER_SLINKY_LOGIN_CONTAINER", "login")
 SLINKY_WORKDIR_ROOT = os.environ.get("CLUSTER_SLINKY_WORKDIR_ROOT", "/scratch/outpost")
-# Where enroot unpacks layers while building a squashfs. Must NOT be the shared
-# filesystem: enroot overlay-mounts the unpacked layers, and Lustre cannot back
-# an overlay ("failed to mount overlay: Invalid argument", seen on FSx).
+# Where enroot unpacks layers while building a squashfs. It needs a filesystem
+# that takes overlay whiteouts AND can back an overlay mount, which rules out
+# all three a login pod has by default (seen on FSx, 2026-10-14): Lustre fails
+# the overlay mount, the container's own overlay root refuses whiteout device
+# nodes, and /tmp is a RAM tmpfs too small for an NGC image. So by default the
+# temp dir is a sparse ext4 image on the shared filesystem, loop-mounted in the
+# (privileged) login pod. Set CLUSTER_SLINKY_ENROOT_TEMP_IMAGE="" when the
+# temp dir is already a suitable local volume.
 SLINKY_ENROOT_TEMP = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP", "/var/tmp/outpost-enroot")
+SLINKY_ENROOT_TEMP_IMAGE = os.environ.get(
+    "CLUSTER_SLINKY_ENROOT_TEMP_IMAGE", f"{SLINKY_WORKDIR_ROOT}/.images/enroot-temp.ext4")
+SLINKY_ENROOT_TEMP_SIZE = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP_SIZE", "64G")
 SLINKY_PARTITION = os.environ.get("CLUSTER_SLINKY_PARTITION", "")   # "" = the cluster's default
 SLINKY_MPI = os.environ.get("CLUSTER_SLINKY_MPI", "pmix")           # srun --mpi for launcher: mpi
 SLINKY_RUN_TIMEOUT_S = float(os.environ.get("CLUSTER_SLINKY_RUN_TIMEOUT", "3600"))
@@ -2028,8 +2036,15 @@ class SlinkyAdapter(ProviderAdapter):
         tmp = f"{sqsh}.{job_id}.tmp"
         uri = slinky_image_ref(image)
         temp = shlex.quote(SLINKY_ENROOT_TEMP)
+        mount = ""
+        if SLINKY_ENROOT_TEMP_IMAGE:
+            img = shlex.quote(SLINKY_ENROOT_TEMP_IMAGE)
+            mount = (f"exec 9>{img}.lock; flock 9; "
+                     f"[ -e {img} ] || {{ truncate -s {SLINKY_ENROOT_TEMP_SIZE} {img} && "
+                     f"mkfs.ext4 -q -F {img}; }}; "
+                     f"mountpoint -q {temp} || mount -o loop {img} {temp}; flock -u 9; ")
         script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
-                  f"mkdir -p {images}/.cache {temp}; "
+                  f"mkdir -p {images}/.cache {temp}; {mount}"
                   f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "
                   f"rm -f {tmp}; enroot import -o {tmp} {shlex.quote(uri)} && mv -f {tmp} {sqsh}")
         self.log(f"[slinky] staging {uri} -> {sqsh}")
