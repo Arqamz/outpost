@@ -6,6 +6,7 @@ Run: `make dashboard` then open the URL.
   /                -> the dashboard page (viz/cluster.html)
   /api/stats.json  -> node stats (CPU% computed from cpu.time deltas)
   /api/jobs.json   -> the job queue (reads the same store cluster does)
+  /api/slinky.json -> per Slinky cluster: its slots, Slurm nodes and queue
   /api/logs?job=<job_id>        -> that job's full replay transcript
   /api/logs?job=__reconciler__  -> the cross-job chronological narration log
   POST /api/clear[?force=1]     -> wipe job history for a blank-slate demo view
@@ -21,8 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.environ.get("CLUSTER_ROOT") or os.path.dirname(HERE)
 sys.path.insert(0, REPO_ROOT)  # viz/ is a sibling of reconciler/, not a package under it
 
-from reconciler.adapter import job_log_path, ssh_base, node_ssh_id  # noqa: E402
+from reconciler.adapter import (job_log_path, ssh_base, node_ssh_id,  # noqa: E402
+                                SLINKY_NAMESPACE, SLINKY_LOGIN_SELECTOR, SLINKY_LOGIN_CONTAINER)
 from reconciler.reconciler import GLOBAL_LOG, clear_jobs  # noqa: E402
+from reconciler.models import BACKEND_PROVIDERS        # noqa: E402
 from reconciler.store import open_store                 # noqa: E402
 
 STATE_PATH = os.path.join(REPO_ROOT, ".var", "reconciler", "state.json")
@@ -248,11 +251,82 @@ def _k8s_gangs() -> dict:
     return result
 
 
+_slinky_cache: dict = {"ts": 0.0, "data": None}
+SLINKY_TTL = float(os.environ.get("CLUSTER_DASH_SLINKY_TTL", "10"))
+_SLURM_SNAPSHOT = ("sinfo -N -h -o '%N|%T|%G|%C|%P'; echo @@; "
+                   "squeue -h -o '%i|%j|%T|%D|%N|%M|%b|%r'")
+
+
+def _slinky_cluster(ctx: str) -> dict:
+    """One kubectl exec into the cluster's login pod for `sinfo -N` + `squeue`.
+    No transport retries here: the adapter's would stall the poll."""
+    base = ["kubectl"] + (["--context", ctx] if ctx else [])
+    out = {"reachable": False, "nodes": [], "queue": [], "error": ""}
+    try:
+        r = subprocess.run(base + ["get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
+                                   "--field-selector=status.phase=Running", "-o", "name"],
+                           capture_output=True, text=True, timeout=8)
+        pods = sorted(p.split("/", 1)[-1] for p in r.stdout.split())
+        if r.returncode != 0 or not pods:
+            out["error"] = (r.stderr.strip() or "no Running login pod")[:200]
+            return out
+        r = subprocess.run(base + ["exec", "-n", SLINKY_NAMESPACE, pods[0], "-c", SLINKY_LOGIN_CONTAINER,
+                                   "--", "bash", "-lc", _SLURM_SNAPSHOT],
+                           capture_output=True, text=True, timeout=12)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+        return out
+    if r.returncode != 0:
+        out["error"] = r.stderr.strip()[:200]
+        return out
+    out["reachable"] = True
+    nodes_txt, _, queue_txt = r.stdout.partition("@@")
+    for ln in nodes_txt.split():
+        f = ln.split("|")
+        if len(f) >= 5:
+            cpus = f[3].split("/")  # allocated/idle/other/total
+            out["nodes"].append({"name": f[0], "state": f[1], "gres": f[2],
+                                 "cpus_alloc": cpus[0], "cpus_total": cpus[-1], "partition": f[4]})
+    for ln in queue_txt.strip().splitlines():
+        f = ln.split("|")
+        if len(f) >= 8:
+            out["queue"].append({"id": f[0], "name": f[1], "state": f[2], "nodes": f[3],
+                                 "nodelist": f[4], "time": f[5], "gres": f[6], "reason": f[7]})
+    return out
+
+
+def _slinky() -> dict:
+    """Slinky slots from the registry, grouped by cluster (kube-context), each
+    with a live Slurm snapshot from its login pod. {enabled:false} when the
+    registry has no slinky slots."""
+    now = time.time()
+    if _slinky_cache["data"] is not None and now - _slinky_cache["ts"] < SLINKY_TTL:
+        return _slinky_cache["data"]
+    try:
+        slots = [n for n in open_store(STATE_PATH).list_nodes() if n.provider == "slinky"]
+    except Exception:
+        slots = []
+    by_ctx: dict[str, list] = {}
+    for n in slots:
+        by_ctx.setdefault(n.kube_context or _K8S_CTX, []).append(n)
+    clusters = []
+    for ctx, ns in sorted(by_ctx.items()):
+        c = {"context": ctx or "(current)", "gpu": any(n.gpu for n in ns),
+             "slots": [{"name": n.name, "state": n.state, "owner_job": n.owner_job}
+                       for n in sorted(ns, key=lambda n: n.name)]}
+        c.update(_slinky_cluster(ctx))
+        clusters.append(c)
+    result = {"enabled": bool(clusters), "clusters": clusters}
+    _slinky_cache.update(ts=now, data=result)
+    return result
+
+
 def _jobs() -> list[dict]:
     """The job queue, straight from the same store `cluster list/status`
     reads — the dashboard has no state of its own, so it can never drift from
     what the reconciler actually sees."""
     store = open_store(STATE_PATH)
+    slots = {n.name for n in store.list_nodes() if n.provider in BACKEND_PROVIDERS}
     out = []
     for j in store.list_jobs():
         spec = j.spec or {}
@@ -264,6 +338,7 @@ def _jobs() -> list[dict]:
             "gpu": bool(spec.get("gpu", False)),
             "node_count": spec.get("node_count", 0),
             "assigned_nodes": j.assigned_nodes,
+            "backend_slot": next((n for n in j.assigned_nodes or [] if n in slots), ""),
             "image": spec.get("image", "") or "(dry-run)",
             "run": j.run,
             "drop_path": j.drop_path,
@@ -312,6 +387,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_jobs())
         elif path.startswith("/api/k8s"):
             self._json(_k8s_gangs())
+        elif path.startswith("/api/slinky"):
+            self._json(_slinky())
         elif path.startswith("/api/logs"):
             job_id = (parse_qs(urlparse(self.path).query).get("job") or [""])[0]
             # job_id lands in a filesystem path (job_log_path) and this server

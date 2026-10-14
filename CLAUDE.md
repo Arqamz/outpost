@@ -75,7 +75,7 @@ reconciler/                 the control plane (Python package)
   reconciler.py             the driver: submit, concurrent tick, phases, wait/timeout, failure
   cli.py                    cluster commands (incl. logs / reconciler-log)
 demo/                       mpi_demo.c/.def/.sif, run-mpi-demo.sh (bare), run-scheduling-demo.sh
-viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer + k8s gangs panel
+viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer + k8s gangs + Slinky panels
 docs/                       01-architecture … 07-ubuntu-setup, 08-kubernetes-backend,
                             09-multi-machine-cluster (one control plane, many fabrics)
 bin/cluster             CLI launcher (python -m reconciler)

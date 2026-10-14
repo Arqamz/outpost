@@ -105,6 +105,13 @@
     <div class="grid" id="gangs"></div>
   </div>
 
+  <div class="section" id="slinkysection" style="display:none">
+    <h2>Slinky · Slurm on Kubernetes <span class="badge" id="slinkycount">0</span>
+      <span class="sub" style="margin-left:8px">outpost slots → Slurm nodes + queue, via the login pod</span>
+    </h2>
+    <div class="grid" id="slinky" style="grid-template-columns:repeat(auto-fill,minmax(520px,1fr))"></div>
+  </div>
+
   <div class="section">
     <h2>Jobs <span class="badge" id="jobcount">0</span>
       <button class="btn" id="clearJobs" style="margin-left:auto" title="wipe job history + logs, reset nodes to available">clear jobs</button>
@@ -213,6 +220,45 @@ async function renderK8s(){
   }catch(e){ /* leave last render; k8s panel is best-effort */ }
 }
 
+// ── Slinky clusters ─────────────────────────────────────────────────────────
+const SLURM_PHASE = s => /^(alloc|mix)/i.test(s) ? "Running" : /^idle/i.test(s) ? "Succeeded" :
+                         /^(down|drain|fail|unk)/i.test(s) ? "Failed" : "Pending";
+const JOB_PHASE = s => s==="RUNNING" ? "Running" : s==="PENDING" ? "Pending" :
+                       s==="COMPLETED" ? "Succeeded" : "Failed";
+
+function slinkyCard(c){
+  const slots = c.slots.map(s =>
+    `<span class="pod ph-${s.owner_job?'Running':'Succeeded'}"><span class="pdot"></span>${esc(s.name)}`+
+    (s.owner_job?` <span class="cap">${shortId(s.owner_job)}</span>`:``)+`</span>`).join("");
+  const nodes = c.nodes.map(n =>
+    `<span class="pod ph-${SLURM_PHASE(n.state)}" title="${esc(n.partition)} · cpus ${n.cpus_alloc}/${n.cpus_total}">`+
+    `<span class="pdot"></span>${esc(n.name)} <span class="cap">${esc(n.state)} · ${esc(n.gres)}</span></span>`).join("");
+  const queue = c.queue.length ? c.queue.map(q =>
+    `<span class="pod ph-${JOB_PHASE(q.state)}" title="${esc(q.reason)}"><span class="pdot"></span>`+
+    `${esc(q.id)} ${esc(q.name)} <span class="cap">${esc(q.state)} · ${esc(q.nodes)}n · ${esc(q.time)}`+
+    (q.state==="PENDING"?` · ${esc(q.reason)}`:` · ${esc(q.nodelist)}`)+`</span></span>`).join("")
+    : `<span class="cap" style="color:var(--dim)">queue empty</span>`;
+  const err = c.reachable ? "" : `<div class="err">unreachable: ${esc(c.error)}</div>`;
+  return `<div class="gang ${c.gpu?'gpu-edge':''}">
+    <h3>${esc(c.context)} ${c.gpu?'<span class="badge gpu">gpu</span>':''}</h3>
+    <div class="gmeta">${c.slots.length} slot(s) · ${c.nodes.length} Slurm node(s) · ${c.queue.length} queued/running</div>${err}
+    <div class="gmeta">slots</div><div class="pods">${slots}</div>
+    <div class="gmeta" style="margin-top:8px">nodes</div><div class="pods">${nodes}</div>
+    <div class="gmeta" style="margin-top:8px">queue</div><div class="pods">${queue}</div>
+  </div>`;
+}
+
+async function renderSlinky(){
+  try{
+    const d = await (await fetch("/api/slinky.json",{cache:"no-store"})).json();
+    const sec = document.getElementById("slinkysection");
+    if(!d.enabled){ sec.style.display = "none"; return; }
+    sec.style.display = "block";
+    document.getElementById("slinkycount").textContent = d.clusters.length;
+    document.getElementById("slinky").innerHTML = d.clusters.map(slinkyCard).join("");
+  }catch(e){ /* best-effort, like the k8s panel */ }
+}
+
 // ── job queue + log viewer ─────────────────────────────────────────────────
 let selectedJob = null;
 
@@ -240,7 +286,8 @@ function esc(s){ return (s??"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",
 
 function jobRow(j){
   const got = j.assigned_nodes ? j.assigned_nodes.length : 0;
-  const nodes = `${got}/${j.node_count}`;
+  const nodes = j.backend_slot ? `<span title="slot ${esc(j.backend_slot)}">${j.node_count} · ${esc(j.backend_slot.split("-")[0])}</span>`
+                               : `${got}/${j.node_count}`;
   const err = j.error ? `<div class="err">${esc(j.error)}</div>` : "";
   const explain = esc(STATE_EXPLAIN[j.state] || "");
   return `<tr data-job="${j.job_id}" class="${selectedJob===j.job_id?'sel':''}">
@@ -306,10 +353,11 @@ document.getElementById("clearJobs").onclick = async () => {
   renderJobs();
 };
 
-tick(); renderJobs(); renderK8s();
+tick(); renderJobs(); renderK8s(); renderSlinky();
 setInterval(tick, 2000);
 setInterval(renderJobs, 2000);
 setInterval(renderK8s, 2000);
+setInterval(renderSlinky, 5000);
 setInterval(() => { if(selectedJob === "__reconciler__") loadLog("__reconciler__", document.getElementById("logtitle").textContent); }, 2000);
 </script>
 </body>
