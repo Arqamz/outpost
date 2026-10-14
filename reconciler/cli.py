@@ -14,6 +14,7 @@ the nodes. Commands:
     nodes                      the NodeRegistry (with gpu/local capabilities)
     seed-nodes                 populate nodes from config (VMs + host GPU node)
     add-node --spec node.yaml  join a pre-provisioned ssh host (e.g. EC2) as a worker
+    add-slinky --name N --context C   register a Slinky cluster as backend slot(s)
     remove-node <name>         deregister a node (does not touch the machine)
     fail-node <name> [--inject]   quarantine a node + fail its job (failure-injection test)
     clear-jobs [--force]       wipe job history + audit + replay logs (demo reset)
@@ -228,6 +229,28 @@ def cmd_nodes(args):
               f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}{extra}")
 
 
+def cmd_add_slinky(args):
+    """Register a Slinky (Slurm-on-Kubernetes) cluster as `--slots` backend
+    slots reached through `--context`. A slot is a concurrency bound, not a
+    machine: a job claims one and asks Slurm for node_count nodes. One slot is
+    named `slinky-<name>`; several are `slinky-<name>-<i>`."""
+    if args.slots < 1:
+        sys.exit("--slots must be at least 1")
+    store = _store()
+    names = ([f"slinky-{args.name}"] if args.slots == 1
+             else [f"slinky-{args.name}-{i}" for i in range(args.slots)])
+    taken = [n for n in names if store.get_node(n)]
+    if taken:
+        sys.exit(f"already registered: {', '.join(taken)} (remove-node them first)")
+    for name in names:
+        store.put_node(NodeRecord(node_id=name, name=name, index=-1, ip="",
+                                  state=NodeState.AVAILABLE.value, gpu=args.gpu, local=False,
+                                  runtime="slinky", provider="slinky",
+                                  kube_context=args.context))
+    print(f"added {len(names)} slinky slot(s) {names[0]}..{names[-1]} "
+          f"(context {args.context or '<current>'})")
+
+
 def cmd_add_node(args):
     """Register a pre-provisioned, already-running ssh host (e.g. an EC2
     instance) as a worker, from a YAML manifest (see node.ec2.example.yaml).
@@ -368,6 +391,12 @@ def main(argv=None):
     s = sub.add_parser("add-node", help="join a pre-provisioned ssh host (e.g. EC2) as a worker")
     s.add_argument("--spec", required=True, help="node manifest YAML (see node.ec2.example.yaml)")
     s.set_defaults(fn=cmd_add_node)
+    s = sub.add_parser("add-slinky", help="register a Slinky cluster as backend slot(s)")
+    s.add_argument("--name", required=True, help="short cluster name; slots are slinky-<name>[-i]")
+    s.add_argument("--context", default="", help="kube-context of the cluster ('' = current)")
+    s.add_argument("--slots", type=int, default=1, help="concurrent jobs handed to this cluster")
+    s.add_argument("--gpu", action="store_true", help="the cluster's nodes carry GPUs (display only)")
+    s.set_defaults(fn=cmd_add_slinky)
     s = sub.add_parser("remove-node", help="deregister a node from the registry (leaves the machine alone)")
     s.add_argument("name")
     s.add_argument("--force", action="store_true", help="remove even if a job currently owns it")

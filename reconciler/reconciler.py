@@ -24,9 +24,9 @@ from datetime import datetime, timezone
 from . import launch_models, placement
 from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
                       LocalHostAdapter, StaticSshAdapter, KubernetesAdapter,
-                      REPO_ROOT, LOGS_DIR, append_job_log)
+                      SlinkyAdapter, REPO_ROOT, LOGS_DIR, append_job_log)
 from .audit import Audit
-from .models import JobRecord, JobSpec, NodeRecord
+from .models import BACKEND_PROVIDERS, JobRecord, JobSpec, NodeRecord
 from .registry import NodeRegistry, NoCapacity  # NoCapacity: a submitted job waits, it doesn't fail
 from .states import JobState, NodeState, JOB_TERMINAL, assert_job
 from .store import Store, now_iso
@@ -51,7 +51,7 @@ class ApprovalPending(Exception):
     tick() retries next time, exactly like NoCapacity."""
 
 
-def _launch_plannable(spec: JobSpec) -> tuple[bool, str]:
+def _launch_plannable(spec: JobSpec, backend: str = "") -> tuple[bool, str]:
     """Can this backend resolve+compile+verify a launch plan for this job shape?
 
     launcher: mpi -> any node_count (one rank per node/container, the shape
@@ -61,10 +61,17 @@ def _launch_plannable(spec: JobSpec) -> tuple[bool, str]:
     resolved against >1 claimed node has no launch path that spans it.
     backend: k8s -> never: KubernetesAdapter.run() never consumes `plan` — the
     kubelet, not this resolver, owns in-pod CPU/GPU assignment.
+    backend: slinky -> never: slurmd, not this resolver, binds the tasks.
+    `backend` is the job's effective backend when it differs from spec.backend
+    (a node_name pin onto a backend slot).
     """
-    if spec.backend == "k8s":
+    backend = backend or spec.backend
+    if backend == "k8s":
         return False, ("backend: k8s does not consume a resolved launch plan — "
                         "in-pod CPU/GPU assignment is the kubelet's job, not this resolver's")
+    if backend == "slinky":
+        return False, ("backend: slinky does not consume a resolved launch plan — "
+                        "Slurm binds the tasks inside its allocation")
     if spec.launcher == "mpi":
         return True, ""
     if spec.launcher == "single" and spec.node_count == 1:
@@ -117,11 +124,27 @@ class Reconciler:
                 # Real adapters, chosen per node by its provider (NodeRecord.adapter_key):
                 # the control-plane host, a libvirt VM, or a static/EC2 ssh box.
                 adapters = {"local": LocalHostAdapter(log), "libvirt": LibvirtAdapter(log),
-                            "static-ssh": StaticSshAdapter(log), "k8s": KubernetesAdapter(log)}
+                            "static-ssh": StaticSshAdapter(log), "k8s": KubernetesAdapter(log),
+                            "slinky": SlinkyAdapter(log)}
             else:
                 null = NullAdapter(log)          # dry-run: everything no-ops
-                adapters = {"local": null, "libvirt": null, "static-ssh": null, "k8s": null}
+                adapters = {"local": null, "libvirt": null, "static-ssh": null, "k8s": null,
+                            "slinky": null}
         self.adapters = adapters
+
+    def _backend_of(self, spec: JobSpec) -> str:
+        """The backend a job runs on: spec.backend, or the provider of the
+        backend slot its node_name pin names. A pin onto a slot is how a caller
+        that only knows node names (GTL's deployment targets) reaches a whole
+        cluster backend."""
+        if spec.backend:
+            return spec.backend
+        target = spec.params.get("node_name")
+        if isinstance(target, str) and target and "," not in target:
+            for n in self.store.list_nodes():
+                if n.name == target and n.provider in BACKEND_PROVIDERS:
+                    return n.provider
+        return ""
 
     def _adapter_for(self, node: NodeRecord) -> ProviderAdapter:
         """A node's provider (its `adapter_key`) decides which adapter drives it."""
@@ -272,8 +295,9 @@ class Reconciler:
         # backend: k8s is further out still: the kubelet, not this cluster,
         # owns in-pod CPU/GPU assignment. Everything else still refuses loudly
         # rather than run the requested placement silently ignored.
+        backend = self._backend_of(spec)
         if spec.launch is not None:
-            ok, reason = _launch_plannable(spec)
+            ok, reason = _launch_plannable(spec, backend)
             if not ok:
                 raise ValueError(
                     f"spec.launch was supplied, but {reason}. Refusing rather than "
@@ -283,7 +307,18 @@ class Reconciler:
         # (NoCapacity), the job must stay untouched in SUBMITTED so tick()'s
         # wait-and-retry path has something to retry — not a half-provisioned
         # job stuck with no assigned_nodes.
-        if spec.backend == "k8s":
+        if backend == "slinky":
+            # Like k8s: ONE slot (a concurrency bound on that cluster), and
+            # node_count is the Slurm node count inside the allocation.
+            # params.node_name pins an exact slot, params.slinky_context a cluster.
+            target_node = spec.params.get("node_name") or None
+            target_ctx = spec.params.get("slinky_context") or None
+            kind = (f"slinky (nodes x{spec.node_count}"
+                    f"{f' @ {target_node or target_ctx}' if target_node or target_ctx else ''})")
+            nodes = self.registry.claim(job.job_id, 1, backend="slinky",
+                                        kube_context=target_ctx, node_name=target_node)
+            claimed_n = 1
+        elif spec.backend == "k8s":
             # A k8s job claims exactly ONE slot (the whole cluster is modelled as
             # a small pool of interchangeable k8s slots); node_count is the gang
             # size, realized as N pods inside the KubernetesAdapter's run().
@@ -358,7 +393,7 @@ class Reconciler:
         exactly the path it always did — _phase_run, unchanged.
         """
         spec = JobSpec.from_dict(job.spec)
-        if spec.launch is None or not _launch_plannable(spec)[0]:
+        if spec.launch is None or not _launch_plannable(spec, self._backend_of(spec))[0]:
             self._phase_run(job)
             return
         self._set_job(job, JobState.PLANNING, "resolving placement against allocated topology")

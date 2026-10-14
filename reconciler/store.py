@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterable
 
-from .models import COL_JOBS, COL_NODES, COL_AUDIT, JobRecord, NodeRecord
+from .models import BACKEND_PROVIDERS, COL_JOBS, COL_NODES, COL_AUDIT, JobRecord, NodeRecord
 from .states import JobState, NodeState
 
 
@@ -214,7 +214,7 @@ class FileStore(Store):
                         if kube_context is not None and nd.get("kube_context", "") != kube_context:
                             continue
                     else:
-                        if np == "k8s":            # backend slot, only via explicit provider
+                        if np in BACKEND_PROVIDERS:   # backend slot, only via explicit provider
                             continue
                         if bool(nd.get("gpu", False)) != bool(require_gpu):
                             continue
@@ -282,10 +282,10 @@ class MongoStore(Store):
             if kube_context is not None:
                 q["kube_context"] = kube_context
         else:
-            # A normal claim never grabs a backend slot (provider "k8s"); "" and
+            # A normal claim never grabs a backend slot (BACKEND_PROVIDERS); "" and
             # unset both mean the VM/host/static pool, so $nin covers them.
             q = {"state": NodeState.AVAILABLE.value, "gpu": bool(require_gpu),
-                 "provider": {"$nin": ["k8s"]}}
+                 "provider": {"$nin": list(BACKEND_PROVIDERS)}}
         d = self.nodes.find_one_and_update(
             q,
             {"$set": {"state": NodeState.CLAIMED.value, "owner_job": job_id, "updated_at": now_iso()}},

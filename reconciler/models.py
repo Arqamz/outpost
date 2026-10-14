@@ -17,6 +17,12 @@ COL_NODES = "nodes"
 COL_AUDIT = "audit"
 
 
+# Providers whose registry nodes are slots on a whole cluster backend rather
+# than machines. A plain pool claim never takes one; only a job routed to that
+# backend (spec.backend, or a node_name pin naming the slot) does.
+BACKEND_PROVIDERS = ("k8s", "slinky")
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
@@ -40,6 +46,7 @@ class JobSpec:
     # pool routed by gpu/hybrid below; "k8s" = the KubernetesAdapter (KAI + HAMi),
     # where the job claims ONE k8s slot and node_count is reinterpreted as the
     # gang size (N pods on the shared GPU). See docs/08-kubernetes-backend.md.
+    # "slinky" = the SlinkyAdapter: one slot, node_count = Slurm nodes (docs/11).
     backend: str = ""
     # scheduling constraints
     node_count: int = 1

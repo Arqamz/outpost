@@ -158,6 +158,39 @@ K8S_DEFAULT_ENV = {"NCCL_P2P_DISABLE": "1"}
 K8S_FATAL_WAIT_REASONS = {"ImagePullBackOff", "ErrImagePull", "InvalidImageName",
                           "CreateContainerConfigError", "CreateContainerError"}
 
+# ── Slinky (Slurm on Kubernetes) backend params ─────────────────────────────
+# Outpost reaches a Slinky cluster only through `kubectl exec` into one of its
+# login pods (sbatch/squeue/sacct/scancel). It needs no network path to
+# slurmctld or slurmrestd. Job workdirs live on a filesystem that the login pod
+# and every slurmd pod mount at the same path. Defaults match the tashkil
+# platform's install (namespace `slurm`, LoginSet `main`, /scratch).
+SLINKY_NAMESPACE = os.environ.get("CLUSTER_SLINKY_NAMESPACE", "slurm")
+SLINKY_LOGIN_SELECTOR = os.environ.get("CLUSTER_SLINKY_LOGIN_SELECTOR",
+                                       "app.kubernetes.io/name=login")
+SLINKY_LOGIN_CONTAINER = os.environ.get("CLUSTER_SLINKY_LOGIN_CONTAINER", "login")
+SLINKY_WORKDIR_ROOT = os.environ.get("CLUSTER_SLINKY_WORKDIR_ROOT", "/scratch/outpost")
+# Where enroot unpacks layers while building a squashfs. Must NOT be the shared
+# filesystem: enroot overlay-mounts the unpacked layers, and Lustre cannot back
+# an overlay ("failed to mount overlay: Invalid argument", seen on FSx).
+SLINKY_ENROOT_TEMP = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP", "/var/tmp/outpost-enroot")
+SLINKY_PARTITION = os.environ.get("CLUSTER_SLINKY_PARTITION", "")   # "" = the cluster's default
+SLINKY_MPI = os.environ.get("CLUSTER_SLINKY_MPI", "pmix")           # srun --mpi for launcher: mpi
+SLINKY_RUN_TIMEOUT_S = float(os.environ.get("CLUSTER_SLINKY_RUN_TIMEOUT", "3600"))
+SLINKY_POLL_INTERVAL_S = float(os.environ.get("CLUSTER_SLINKY_POLL_INTERVAL", "10"))
+SLINKY_KEEP_WORKDIR = os.environ.get("CLUSTER_SLINKY_KEEP_WORKDIR", "0") == "1"
+SLINKY_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
+                          "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
+# enroot's nvidia hook injects the driver only when the container environment
+# names the GPUs; NGC images set these, plain images do not. Slurm's own GRES
+# binding still decides which GPU the task gets.
+SLINKY_GPU_ENV = {"NVIDIA_VISIBLE_DEVICES": "all",
+                  "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"}
+# Pending reasons that will never clear by waiting.
+SLINKY_FATAL_PENDING_REASONS = {"BadConstraints", "PartitionConfig", "PartitionNodeLimit",
+                                "InvalidAccount", "InvalidQOS", "JobHeldAdmin", "JobHeldUser",
+                                "ReqNodeNotAvail, UnavailableNodes", "PartitionDown",
+                                "PartitionInactive"}
+
 
 def job_log_path(job_id: str) -> str:
     return os.path.join(LOGS_DIR, f"{job_id}.log")
@@ -1797,4 +1830,294 @@ class KubernetesAdapter(ProviderAdapter):
                     shutil.copytree(src, dst, dirs_exist_ok=True)
                 else:
                     shutil.copy2(src, dst)
+        return dest
+
+
+def slinky_image_ref(image: str) -> str:
+    """A JobSpec image as an enroot/pyxis URI: `docker://reg/repo...` becomes
+    `docker://reg#repo...` (enroot separates the registry with `#`). A path is
+    an already-imported squashfs and passes through unchanged."""
+    if image.startswith("/"):
+        return image
+    ref = image[len("docker://"):] if image.startswith("docker://") else image
+    if "://" in ref or ref.endswith(".sif"):
+        raise RuntimeError(
+            f"slinky backend needs an OCI image ref or a squashfs path, got {image!r} "
+            "(pyxis/enroot cannot run a SIF)")
+    head, slash, rest = ref.partition("/")
+    if slash and ("." in head or ":" in head or head == "localhost"):
+        ref = f"{head}#{rest}"
+    return f"docker://{ref}"
+
+
+def slinky_squashfs_name(image: str) -> str:
+    """Content-addressed cache name for an imported image: the digest when the
+    ref pins one, else a hash of the whole ref."""
+    m = re.search(r"@sha256:([0-9a-f]{64})", image)
+    key = m.group(1) if m else hashlib.sha256(image.encode()).hexdigest()
+    return f"{key}.sqsh"
+
+
+def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
+                  partition: str = "", mpi: str = "pmix") -> str:
+    """The sbatch script for one job. Pure, so it is unit-testable.
+
+    The workdir (on the shared filesystem) is bound at spec.output_dir and
+    receives stdout.log, matching what every other adapter puts in a drop-zone.
+    node_count is the Slurm node count. launcher: mpi starts one task per node
+    under `srun --mpi`; launcher: single runs one task on the first node."""
+    n = max(1, spec.node_count)
+    lines = ["#!/bin/bash",
+             f"#SBATCH --job-name=outpost-{job_id}",
+             f"#SBATCH --nodes={n}",
+             "#SBATCH --ntasks-per-node=1",
+             f"#SBATCH --chdir={workdir}",
+             f"#SBATCH --output={workdir}/stdout.log",
+             "#SBATCH --open-mode=append"]
+    if partition:
+        lines.append(f"#SBATCH --partition={partition}")
+    if spec.gpu:
+        lines.append(f"#SBATCH --gres=gpu:{int(spec.params.get('gpu_count', 1))}")
+    if spec.params.get("time_limit"):
+        lines.append(f"#SBATCH --time={spec.params['time_limit']}")
+    lines += ["set -o pipefail",
+              'MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
+              "export MASTER_ADDR",
+              f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
+              f"export WORLD_SIZE={n}"]
+    env = {**(SLINKY_GPU_ENV if spec.gpu else {}), **spec.env}
+    for k, v in env.items():
+        lines.append(f"export {k}={shlex.quote(str(v))}")
+    srun = ["srun", f"--ntasks={n if spec.launcher == 'mpi' else 1}"]
+    if spec.launcher == "mpi":
+        srun.append(f"--mpi={mpi}")
+    srun += [f"--container-image={image}",
+             f"--container-mounts={workdir}:{spec.output_dir}",
+             "--no-container-mount-home",
+             f"--container-workdir={spec.output_dir}"]
+    lines.append(" ".join(shlex.quote(a) for a in srun + list(spec.command)))
+    return "\n".join(lines) + "\n"
+
+
+def parse_slurm_job(text: str) -> tuple[str, str, int | None]:
+    """(state, reason, exit_code) from `scontrol show job -o` output. The exit
+    code is the first half of ExitCode=<code>:<signal>; a non-zero signal with
+    a zero code is reported as 128+signal so it can never read as success."""
+    fields = dict(m.groups() for m in re.finditer(r"(\w+)=(\S*)", text))
+    state = fields.get("JobState", "")
+    reason = fields.get("Reason", "")
+    code = None
+    if "ExitCode" in fields and ":" in fields["ExitCode"]:
+        rc, sig = (int(x) for x in fields["ExitCode"].split(":", 1))
+        code = rc or (128 + sig if sig else 0)
+    return state, reason, code
+
+
+class SlinkyAdapter(ProviderAdapter):
+    """Run a job as a Slurm batch job on a Slinky (Slurm-on-Kubernetes) cluster.
+
+    A slot is a concurrency bound on one cluster, the same as a k8s slot: the
+    job claims one, and node_count becomes the Slurm node count. Everything goes
+    through `kubectl exec` into a running login pod. The container runs under
+    pyxis/enroot from a squashfs imported once per image digest onto the shared
+    filesystem. Nothing here installs anything: provision/bootstrap only verify
+    the cluster is there. See docs/11-slinky-backend.md."""
+    name = "slinky"
+
+    def __init__(self, log=_log_stderr):
+        self.log = log
+
+    @staticmethod
+    def _context_of(node: NodeRecord) -> str:
+        return node.kube_context or K8S_CONTEXT
+
+    @staticmethod
+    def _workdir(job_id: str) -> str:
+        return f"{SLINKY_WORKDIR_ROOT}/{job_id}"
+
+    def _kubectl_base(self, context: str) -> list[str]:
+        return ["kubectl"] + (["--context", context] if context else [])
+
+    def _login_pod(self, context: str) -> str:
+        proc = subprocess.run(
+            self._kubectl_base(context) + [
+                "get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
+                "--field-selector=status.phase=Running", "-o", "name"],
+            capture_output=True, text=True)
+        pods = [p.split("/", 1)[-1] for p in proc.stdout.split() if p]
+        if proc.returncode != 0 or not pods:
+            raise RuntimeError(
+                f"no Running Slinky login pod (namespace {SLINKY_NAMESPACE!r}, selector "
+                f"{SLINKY_LOGIN_SELECTOR!r}{f', context {context}' if context else ''}): "
+                f"{proc.stderr.strip() or 'none found'}. The cluster needs a LoginSet; set "
+                "CLUSTER_SLINKY_NAMESPACE / CLUSTER_SLINKY_LOGIN_SELECTOR if it is installed "
+                "elsewhere.")
+        return sorted(pods)[0]
+
+    def _exec_argv(self, context: str, pod: str, script: str, stdin: bool = False) -> list[str]:
+        return self._kubectl_base(context) + (
+            ["exec"] + (["-i"] if stdin else []) +
+            ["-n", SLINKY_NAMESPACE, pod, "-c", SLINKY_LOGIN_CONTAINER, "--",
+             "bash", "-lc", script])
+
+    def _login(self, context: str, script: str, job_id: str, pod: str | None = None,
+               check: bool = True) -> int:
+        """Run a shell snippet in the login pod, streamed into the replay log."""
+        pod = pod or self._login_pod(context)
+        return run_logged(self._exec_argv(context, pod, script), job_id, check=check)
+
+    def _login_out(self, context: str, pod: str, script: str,
+                   input: str | None = None) -> tuple[int, str, str]:
+        proc = subprocess.run(self._exec_argv(context, pod, script, stdin=input is not None),
+                              input=input, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    # ── node lifecycle (verify only) ─────────────────────────────────────
+    def provision(self, node, job_id):
+        ctx = self._context_of(node)
+        pod = self._login_pod(ctx)
+        self.log(f"[slinky] slot {node.name}: login pod {pod}"
+                 f"{f' (context {ctx})' if ctx else ''}; checking slurmctld")
+        if self._login(ctx, "scontrol ping && sinfo", job_id, pod=pod, check=False) != 0:
+            raise RuntimeError(
+                f"slurmctld does not answer from {pod} (`scontrol ping` failed) — check the "
+                f"Controller pod in namespace {SLINKY_NAMESPACE!r}")
+
+    def bootstrap(self, nodes, job_id):
+        ctx = self._context_of(nodes[0])
+        pod = self._login_pod(ctx)
+        checks = [
+            (f"mkdir -p {shlex.quote(SLINKY_WORKDIR_ROOT)}/.images && "
+             f"test -w {shlex.quote(SLINKY_WORKDIR_ROOT)}",
+             f"{SLINKY_WORKDIR_ROOT} is not writable from the login pod — it must be on a "
+             "filesystem every slurmd pod also mounts (set CLUSTER_SLINKY_WORKDIR_ROOT)"),
+            ("srun --help | grep -q -- --container-image",
+             "srun has no --container-image: pyxis is not loaded (plugstack.conf must "
+             "include /usr/share/pyxis/*, and the slurmd/login images must be the pyxis "
+             "variants)"),
+        ]
+        if SLINKY_PARTITION:
+            checks.append((f"sinfo -h -p {shlex.quote(SLINKY_PARTITION)} -o %P | grep -q .",
+                           f"partition {SLINKY_PARTITION!r} does not exist"))
+        for script, why in checks:
+            if self._login(ctx, script, job_id, pod=pod, check=False) != 0:
+                raise RuntimeError(why)
+
+    def deprovision(self, node, job_id):
+        ctx = self._context_of(node)
+        try:
+            pod = self._login_pod(ctx)
+        except RuntimeError as e:
+            self.log(f"[slinky] deprovision {job_id}: {e}")
+            return
+        script = f"scancel --name=outpost-{job_id} || true"
+        if not SLINKY_KEEP_WORKDIR:
+            script += f"; rm -rf {shlex.quote(self._workdir(job_id))}"
+        self._login(ctx, script, job_id, pod=pod, check=False)
+
+    # ── workload lifecycle ────────────────────────────────────────────────
+    def _stage_image(self, ctx: str, pod: str, image: str, job_id: str) -> str:
+        """Import the image once per digest onto the shared filesystem and
+        return the squashfs path. Done from the login pod (enroot runs there),
+        so no slurmd pulls the image and every later job starts from the cache.
+        The layer cache is shared too; only the unpack happens pod-locally."""
+        if image.startswith("/"):
+            return image
+        images = f"{SLINKY_WORKDIR_ROOT}/.images"
+        sqsh = f"{images}/{slinky_squashfs_name(image)}"
+        tmp = f"{sqsh}.{job_id}.tmp"
+        uri = slinky_image_ref(image)
+        temp = shlex.quote(SLINKY_ENROOT_TEMP)
+        script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
+                  f"mkdir -p {images}/.cache {temp}; "
+                  f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "
+                  f"rm -f {tmp}; enroot import -o {tmp} {shlex.quote(uri)} && mv -f {tmp} {sqsh}")
+        self.log(f"[slinky] staging {uri} -> {sqsh}")
+        rc = self._login(ctx, script, job_id, pod=pod, check=False)
+        if rc != 0:
+            raise RuntimeError(f"enroot import of {uri} failed in {pod} (exit {rc}); the "
+                               f"import output is in `cluster logs {job_id}`")
+        return sqsh
+
+    def run(self, nodes, job_id, spec, plan=None):
+        slot = nodes[0]
+        ctx = self._context_of(slot)
+        local = os.path.join(RUNS_DIR, job_id)
+        os.makedirs(local, exist_ok=True)
+        if spec.is_dry_run:
+            return RunResult(job_id, slot.name, None, local, note="no image -> dry-run")
+        pod = self._login_pod(ctx)
+        workdir = self._workdir(job_id)
+        image = self._stage_image(ctx, pod, spec.image, job_id)
+        script = render_sbatch(job_id, spec, workdir, image, SLINKY_PARTITION, SLINKY_MPI)
+        with open(os.path.join(local, "launcher-slinky.sbatch"), "w") as f:
+            f.write(script)
+        append_job_log(job_id, f"{now_iso()} [slinky] sbatch script:\n{script}")
+        rc, out, err = self._login_out(
+            ctx, pod,
+            f"mkdir -p {shlex.quote(workdir)} && cat > {shlex.quote(workdir)}/launcher-slinky.sbatch "
+            f"&& sbatch --parsable {shlex.quote(workdir)}/launcher-slinky.sbatch",
+            input=script)
+        append_job_log(job_id, f"{now_iso()} [slinky] sbatch rc={rc} {out.strip()} {err.strip()}")
+        if rc != 0:
+            raise RuntimeError(f"sbatch refused the job on {pod}: {err.strip() or out.strip()}")
+        slurm_id = out.strip().split(";")[0]
+        self.log(f"[slinky] submitted Slurm job {slurm_id} from {pod} (workdir {workdir})")
+        with open(os.path.join(local, "slurm-job-id"), "w") as f:
+            f.write(slurm_id + "\n")
+        state, code = self._await(ctx, pod, slurm_id, job_id)
+        stdout_path = os.path.join(local, "stdout.log")
+        _, log_text, _ = self._login_out(ctx, pod, f"cat {shlex.quote(workdir)}/stdout.log")
+        with open(stdout_path, "w") as f:
+            f.write(log_text)
+        append_job_log(job_id, f"{now_iso()} [slinky] stdout.log:\n{log_text}")
+        if state != "COMPLETED" and not code:
+            code = 1
+        return RunResult(job_id, slot.name, code, workdir, stdout_path,
+                         note=f"slurm job {slurm_id} {state} exit={code}")
+
+    def _await(self, ctx: str, pod: str, slurm_id: str, job_id: str) -> tuple[str, int | None]:
+        deadline = time.monotonic() + SLINKY_RUN_TIMEOUT_S
+        last = None
+        while True:
+            rc, out, err = self._login_out(ctx, pod, f"scontrol show job -o {slurm_id}")
+            if rc != 0:
+                raise RuntimeError(f"Slurm job {slurm_id} is no longer known to slurmctld "
+                                   f"({err.strip()}); its result cannot be read")
+            state, reason, code = parse_slurm_job(out)
+            if (state, reason) != last:
+                msg = f"[slinky] job {slurm_id}: {state} ({reason})"
+                self.log(msg)
+                append_job_log(job_id, f"{now_iso()} {msg}")
+                last = (state, reason)
+            if state in SLINKY_TERMINAL_STATES:
+                return state, code
+            if state == "PENDING" and reason in SLINKY_FATAL_PENDING_REASONS:
+                self._login(ctx, f"scancel {slurm_id}", job_id, pod=pod, check=False)
+                raise RuntimeError(f"Slurm job {slurm_id} can never start: {reason}")
+            if time.monotonic() >= deadline:
+                self._login(ctx, f"scancel {slurm_id}", job_id, pod=pod, check=False)
+                raise RuntimeError(f"Slurm job {slurm_id} did not finish within "
+                                   f"{SLINKY_RUN_TIMEOUT_S:.0f}s (last state {state})")
+            time.sleep(SLINKY_POLL_INTERVAL_S)
+
+    def collect(self, nodes, job_id, spec, dest):
+        """Stream the shared workdir out of the login pod as a tar, keeping
+        stdout.log and output_dir files and dropping staging artifacts."""
+        import tarfile
+        ctx = self._context_of(nodes[0])
+        pod = self._login_pod(ctx)
+        os.makedirs(dest, exist_ok=True)
+        argv = self._exec_argv(ctx, pod, f"tar -C {shlex.quote(self._workdir(job_id))} -cf - .")
+        append_job_log(job_id, f"{now_iso()} $ {' '.join(shlex.quote(a) for a in argv)}")
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+            for member in tar:
+                top = member.name.lstrip("./").split("/", 1)[0]
+                if not top or _is_staging_artifact(top):
+                    continue
+                tar.extract(member, dest, filter="data")
+        err = proc.stderr.read().decode(errors="replace")
+        if proc.wait() != 0:
+            raise RuntimeError(f"collect from {pod} failed: {err.strip()}")
         return dest
