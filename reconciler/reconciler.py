@@ -27,7 +27,7 @@ from .adapter import (ProviderAdapter, NullAdapter, LibvirtAdapter,
                       SlinkyAdapter, REPO_ROOT, LOGS_DIR, append_job_log)
 from .audit import Audit
 from .models import BACKEND_PROVIDERS, JobRecord, JobSpec, NodeRecord
-from .registry import NodeRegistry, NoCapacity  # NoCapacity: a submitted job waits, it doesn't fail
+from .registry import NodeRegistry, NoCapacity, _pinned_names  # NoCapacity: a submitted job waits, it doesn't fail
 from .states import JobState, NodeState, JOB_TERMINAL, assert_job
 from .store import Store, now_iso
 from .topology import normalize as normalize_topology
@@ -139,12 +139,37 @@ class Reconciler:
         cluster backend."""
         if spec.backend:
             return spec.backend
-        target = spec.params.get("node_name")
-        if isinstance(target, str) and target and "," not in target:
-            for n in self.store.list_nodes():
-                if n.name == target and n.provider in BACKEND_PROVIDERS:
-                    return n.provider
+        names = _pinned_names(spec.params.get("node_name"))
+        if names:
+            providers = {n.name: n.provider for n in self.store.list_nodes()}
+            kinds = {providers.get(name, "") for name in names}
+            if len(kinds) == 1 and (kind := kinds.pop()) in BACKEND_PROVIDERS:
+                return kind
         return ""
+
+    def _slinky_claim_count(self, spec: JobSpec, names: list[str], ctx: str | None) -> int:
+        """How many slinky slots a job claims: one cluster-wide slot, or one
+        per-node slot per Slurm node (node_count of them). A pin naming per-node
+        slots must name exactly node_count of them, on one cluster."""
+        slots = {n.name: n for n in self.store.list_nodes() if n.provider == "slinky"}
+        if names:
+            pinned = [slots[x] for x in names if x in slots]
+            if not any(n.slurm_node for n in pinned):
+                if len(names) != 1:
+                    raise ValueError(f"node_name pins {len(names)} cluster-wide slinky slots "
+                                     f"({', '.join(names)}); a cluster-wide slot carries the whole "
+                                     "job, so pin one (or register per-node slots)")
+                return 1
+            if len(names) != spec.node_count:
+                raise ValueError(f"node_name pins {len(names)} per-node slinky slot(s) "
+                                 f"({', '.join(names)}) but node_count is {spec.node_count}")
+            if len({n.kube_context for n in pinned}) > 1:
+                raise ValueError(f"node_name pins slinky slots on different clusters "
+                                 f"({', '.join(names)}); one job runs on one cluster")
+            return len(names)
+        per_node = any(n.slurm_node for n in slots.values()
+                       if ctx is None or n.kube_context == ctx)
+        return spec.node_count if per_node else 1
 
     def _adapter_for(self, node: NodeRecord) -> ProviderAdapter:
         """A node's provider (its `adapter_key`) decides which adapter drives it."""
@@ -308,16 +333,16 @@ class Reconciler:
         # wait-and-retry path has something to retry — not a half-provisioned
         # job stuck with no assigned_nodes.
         if backend == "slinky":
-            # Like k8s: ONE slot (a concurrency bound on that cluster), and
-            # node_count is the Slurm node count inside the allocation.
-            # params.node_name pins an exact slot, params.slinky_context a cluster.
+            # A cluster-wide slot (a concurrency bound, Slurm picks the nodes)
+            # or one per-node slot per Slurm node. params.node_name pins exact
+            # slots, params.slinky_context a cluster.
             target_node = spec.params.get("node_name") or None
             target_ctx = spec.params.get("slinky_context") or None
+            claimed_n = self._slinky_claim_count(spec, _pinned_names(target_node), target_ctx)
             kind = (f"slinky (nodes x{spec.node_count}"
                     f"{f' @ {target_node or target_ctx}' if target_node or target_ctx else ''})")
-            nodes = self.registry.claim(job.job_id, 1, backend="slinky",
+            nodes = self.registry.claim(job.job_id, claimed_n, backend="slinky",
                                         kube_context=target_ctx, node_name=target_node)
-            claimed_n = 1
         elif spec.backend == "k8s":
             # A k8s job claims exactly ONE slot (the whole cluster is modelled as
             # a small pool of interchangeable k8s slots); node_count is the gang

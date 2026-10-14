@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from reconciler.adapter import (SlinkyAdapter, parse_slurm_job, render_sbatch,
+from reconciler.adapter import (SlinkyAdapter, parse_sinfo_nodes, parse_slurm_job, render_sbatch,
                                 slinky_image_ref, slinky_squashfs_name)
 from reconciler.models import JobSpec, NodeRecord
 from reconciler.states import JobState, NodeState
@@ -80,6 +80,40 @@ class TestSbatch:
         assert "#SBATCH --nodes=2" in s and "#SBATCH --time=00:30:00" in s
         assert "export WORLD_SIZE=2" in s
         assert s.strip().splitlines()[-1].startswith("srun --ntasks=2 --mpi=pmi2 ")
+
+    def test_pinned_nodes_are_whole_and_in_rank_order(self):
+        s = render_sbatch("job-abc", spec(launcher="mpi", node_count=2), "/w", "/i.sqsh",
+                          nodelist=("node-b", "node-a"), gpus_per_node=4)
+        assert "#SBATCH --nodelist=node-b,node-a" in s and "#SBATCH --exclusive" in s
+        assert "#SBATCH --gres=gpu:4" in s
+        assert "printf '%s\\n' node-b node-a > /w/hostfile" in s
+        assert "export SLURM_HOSTFILE=/w/hostfile" in s and "export MASTER_ADDR=node-b" in s
+        assert "scontrol show hostnames" not in s
+        assert s.strip().splitlines()[-1].startswith("srun --ntasks=2 --distribution=arbitrary --mpi=pmix ")
+
+    def test_a_single_launch_on_pinned_nodes_runs_on_the_first(self):
+        s = render_sbatch("job-abc", spec(), "/w", "/i.sqsh", nodelist=("node-b",), gpus_per_node=1)
+        assert "printf '%s\\n' node-b > /w/hostfile" in s
+        assert s.strip().splitlines()[-1].startswith("srun --ntasks=1 --distribution=arbitrary ")
+
+
+def test_parse_sinfo_nodes():
+    text = ("w-1|gpu:a10g:1(S:0)\nw-0|gpu:a10g:1\nw-0|gpu:a10g:1\n"
+            "big|gpu:a10g:2,gpu:t4:2,shard:8\ncpu|(null)\n\n")
+    assert parse_sinfo_nodes(text) == [("big", 4), ("cpu", 0), ("w-0", 1), ("w-1", 1)]
+
+
+def test_slots_must_agree_on_kind_and_gpus():
+    a = NodeRecord(node_id="a", name="a", index=-1, ip="", slurm_node="w-0", gpu_count=1)
+    b = NodeRecord(node_id="b", name="b", index=-1, ip="", slurm_node="w-1", gpu_count=1)
+    wide = NodeRecord(node_id="c", name="c", index=-1, ip="")
+    assert SlinkyAdapter._slurm_nodes([b, a]) == (("w-1", "w-0"), 1)
+    assert SlinkyAdapter._slurm_nodes([wide]) == ((), 0)
+    with pytest.raises(RuntimeError, match="mix"):
+        SlinkyAdapter._slurm_nodes([a, wide])
+    b.gpu_count = 4
+    with pytest.raises(RuntimeError, match="different GPU counts"):
+        SlinkyAdapter._slurm_nodes([a, b])
 
 
 class TestParseSlurmJob:
@@ -160,6 +194,57 @@ def test_backend_slinky_claims_by_context(store, slinky_pool, rec):
     drive(r)
     assert store.get_job(job_id).state == JobState.PROMOTED.value
     assert [c[2] for c in slinky.calls if c[0] == "run"] == [("slinky-t4",)]
+
+
+@pytest.fixture()
+def per_node_pool(store, seed):
+    seed(cpu=1, gpu=True)
+    for i in range(2):
+        store.put_node(NodeRecord(node_id=f"slinky-a10g-{i}", name=f"slinky-a10g-{i}", index=-1,
+                                  ip="", state=NodeState.AVAILABLE.value, gpu=True,
+                                  runtime="slinky", provider="slinky", kube_context="a10g",
+                                  slurm_node=f"w-{i}", gpu_count=1))
+
+
+def test_pinning_per_node_slots_claims_each_in_rank_order(store, per_node_pool, rec):
+    r, pool, slinky = rec
+    job_id = r.submit(spec(node_count=2, launcher="mpi",
+                           params={"node_name": "slinky-a10g-1,slinky-a10g-0"}))
+    drive(r)
+    assert store.get_job(job_id).state == JobState.PROMOTED.value
+    assert [c[2] for c in slinky.calls if c[0] == "run"] == [("slinky-a10g-1", "slinky-a10g-0")]
+    assert pool.calls == []
+    assert_pool_returned(store)
+
+
+def test_a_per_node_pin_must_match_node_count(store, per_node_pool, rec):
+    r, _, slinky = rec
+    job_id = r.submit(spec(node_count=2, launcher="mpi", params={"node_name": "slinky-a10g-0"}))
+    drive(r)
+    job = store.get_job(job_id)
+    assert job.state == JobState.FAILED.value and "node_count is 2" in job.error
+    assert slinky.calls == []
+
+
+def test_backend_slinky_takes_node_count_per_node_slots(store, per_node_pool, rec):
+    r, _, slinky = rec
+    job_id = r.submit(spec(backend="slinky", node_count=2, launcher="mpi"))
+    drive(r)
+    assert store.get_job(job_id).state == JobState.PROMOTED.value
+    ran = [c[2] for c in slinky.calls if c[0] == "run"]
+    assert len(ran) == 1 and sorted(ran[0]) == ["slinky-a10g-0", "slinky-a10g-1"]
+
+
+def test_two_cluster_wide_slots_cannot_carry_one_job(store, slinky_pool, rec):
+    r, _, slinky = rec
+    store.put_node(NodeRecord(node_id="slinky-t4b", name="slinky-t4b", index=-1, ip="",
+                              state=NodeState.AVAILABLE.value, gpu=True, runtime="slinky",
+                              provider="slinky", kube_context="t4"))
+    job_id = r.submit(spec(node_count=2, launcher="mpi",
+                           params={"node_name": "slinky-t4,slinky-t4b"}))
+    drive(r)
+    job = store.get_job(job_id)
+    assert job.state == JobState.FAILED.value and "cluster-wide" in job.error
 
 
 def test_a_launch_block_is_refused_on_slinky(store, slinky_pool, rec):

@@ -183,6 +183,11 @@ class NodeRecord:
     # each other over that private IP for free; this field just says which one
     # to use for MPI purposes instead of routing around it with a VPN/bastion.
     cluster_ip: str = ""
+    # for a slinky slot that stands for ONE Slurm node (`add-slinky --per-node`):
+    # that node's Slurm name and GPU count. "" = a cluster-wide slot (a
+    # concurrency bound; Slurm picks the nodes).
+    slurm_node: str = ""
+    gpu_count: int = 0
     updated_at: str | None = None
 
     @property
@@ -204,7 +209,8 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "gpu_binds", "kube_context", "cluster_ip", "updated_at"}
+                "gpu_binds", "kube_context", "cluster_ip", "slurm_node", "gpu_count",
+                "updated_at"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 

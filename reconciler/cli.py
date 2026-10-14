@@ -14,7 +14,7 @@ the nodes. Commands:
     nodes                      the NodeRegistry (with gpu/local capabilities)
     seed-nodes                 populate nodes from config (VMs + host GPU node)
     add-node --spec node.yaml  join a pre-provisioned ssh host (e.g. EC2) as a worker
-    add-slinky --name N --context C   register a Slinky cluster as backend slot(s)
+    add-slinky --name N --context C [--per-node]  register a Slinky cluster as backend slot(s)
     remove-node <name>         deregister a node (does not touch the machine)
     fail-node <name> [--inject]   quarantine a node + fail its job (failure-injection test)
     clear-jobs [--force]       wipe job history + audit + replay logs (demo reset)
@@ -230,25 +230,44 @@ def cmd_nodes(args):
 
 
 def cmd_add_slinky(args):
-    """Register a Slinky (Slurm-on-Kubernetes) cluster as `--slots` backend
-    slots reached through `--context`. A slot is a concurrency bound, not a
-    machine: a job claims one and asks Slurm for node_count nodes. One slot is
-    named `slinky-<name>`; several are `slinky-<name>-<i>`."""
-    if args.slots < 1:
-        sys.exit("--slots must be at least 1")
+    """Register a Slinky (Slurm-on-Kubernetes) cluster reached through
+    `--context`. By default as `--slots` cluster-wide slots: a concurrency
+    bound, not a machine; a job claims one and Slurm picks node_count nodes.
+    One slot is named `slinky-<name>`; several are `slinky-<name>-<i>`.
+
+    `--per-node` instead asks the cluster (`sinfo -N`, through the login pod)
+    and registers one slot per Slurm node, `slinky-<name>-<i>` in sinfo order,
+    each carrying its Slurm node name and GPU count. A job pinning N of them
+    runs on exactly those nodes, whole, rank i on the i-th pin."""
     store = _store()
-    names = ([f"slinky-{args.name}"] if args.slots == 1
-             else [f"slinky-{args.name}-{i}" for i in range(args.slots)])
-    taken = [n for n in names if store.get_node(n)]
+    if args.per_node:
+        from .adapter import SlinkyAdapter, SLINKY_PARTITION, parse_sinfo_nodes
+        ad = SlinkyAdapter()
+        pod = ad._login_pod(args.context)
+        part = f"-p {SLINKY_PARTITION} " if SLINKY_PARTITION else ""
+        rc, out, err = ad._exec(args.context, pod, f"sinfo -h -N {part}-o '%N|%G'")
+        if rc != 0:
+            sys.exit(f"sinfo failed in {pod}: {err.strip()}")
+        found = parse_sinfo_nodes(out)
+        if not found:
+            sys.exit(f"sinfo in {pod} lists no Slurm nodes")
+        slots = [(f"slinky-{args.name}-{i}", node, gpus) for i, (node, gpus) in enumerate(found)]
+    else:
+        if args.slots < 1:
+            sys.exit("--slots must be at least 1")
+        names = ([f"slinky-{args.name}"] if args.slots == 1
+                 else [f"slinky-{args.name}-{i}" for i in range(args.slots)])
+        slots = [(n, "", 0) for n in names]
+    taken = [n for n, _, _ in slots if store.get_node(n)]
     if taken:
         sys.exit(f"already registered: {', '.join(taken)} (remove-node them first)")
-    for name in names:
+    for name, node, gpus in slots:
         store.put_node(NodeRecord(node_id=name, name=name, index=-1, ip="",
-                                  state=NodeState.AVAILABLE.value, gpu=args.gpu, local=False,
-                                  runtime="slinky", provider="slinky",
-                                  kube_context=args.context))
-    print(f"added {len(names)} slinky slot(s) {names[0]}..{names[-1]} "
-          f"(context {args.context or '<current>'})")
+                                  state=NodeState.AVAILABLE.value, gpu=args.gpu or gpus > 0,
+                                  local=False, runtime="slinky", provider="slinky",
+                                  kube_context=args.context, slurm_node=node, gpu_count=gpus))
+        print(f"added {name}" + (f" -> Slurm node {node} ({gpus} GPU)" if node else ""))
+    print(f"context {args.context or '<current>'}")
 
 
 def cmd_add_node(args):
@@ -396,6 +415,8 @@ def main(argv=None):
     s.add_argument("--context", default="", help="kube-context of the cluster ('' = current)")
     s.add_argument("--slots", type=int, default=1, help="concurrent jobs handed to this cluster")
     s.add_argument("--gpu", action="store_true", help="the cluster's nodes carry GPUs (display only)")
+    s.add_argument("--per-node", action="store_true",
+                   help="one slot per Slurm node, discovered with sinfo (pin them for exact nodes)")
     s.set_defaults(fn=cmd_add_slinky)
     s = sub.add_parser("remove-node", help="deregister a node from the registry (leaves the machine alone)")
     s.add_argument("name")

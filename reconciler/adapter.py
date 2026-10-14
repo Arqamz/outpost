@@ -1875,14 +1875,20 @@ def slinky_squashfs_name(image: str) -> str:
 
 
 def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
-                  partition: str = "", mpi: str = "pmix") -> str:
+                  partition: str = "", mpi: str = "pmix",
+                  nodelist: tuple[str, ...] = (), gpus_per_node: int = 0) -> str:
     """The sbatch script for one job. Pure, so it is unit-testable.
 
     The workdir (on the shared filesystem) is bound at spec.output_dir and
     receives stdout.log, matching what every other adapter puts in a drop-zone.
     node_count is the Slurm node count. launcher: mpi starts one task per node
-    under `srun --mpi`; launcher: single runs one task on the first node."""
+    under `srun --mpi`; launcher: single runs one task on the first node.
+
+    With a nodelist (per-node slots), the job gets exactly those nodes, whole
+    (`--exclusive`, every GPU on them), and rank i runs on nodelist[i]: srun's
+    arbitrary distribution follows a hostfile written in that order."""
     n = max(1, spec.node_count)
+    ntasks = n if spec.launcher == "mpi" else 1
     lines = ["#!/bin/bash",
              f"#SBATCH --job-name=outpost-{job_id}",
              f"#SBATCH --nodes={n}",
@@ -1892,19 +1898,30 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
              "#SBATCH --open-mode=append"]
     if partition:
         lines.append(f"#SBATCH --partition={partition}")
+    if nodelist:
+        lines += [f"#SBATCH --nodelist={','.join(nodelist)}", "#SBATCH --exclusive"]
     if spec.gpu:
-        lines.append(f"#SBATCH --gres=gpu:{int(spec.params.get('gpu_count', 1))}")
+        gpus = gpus_per_node if nodelist and gpus_per_node else int(spec.params.get("gpu_count", 1))
+        lines.append(f"#SBATCH --gres=gpu:{gpus}")
     if spec.params.get("time_limit"):
         lines.append(f"#SBATCH --time={spec.params['time_limit']}")
-    lines += ["set -o pipefail",
-              'MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
-              "export MASTER_ADDR",
-              f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
+    lines.append("set -o pipefail")
+    if nodelist:
+        lines += [f"printf '%s\\n' {' '.join(shlex.quote(h) for h in nodelist[:ntasks])}"
+                  f" > {shlex.quote(workdir)}/hostfile",
+                  f"export SLURM_HOSTFILE={shlex.quote(workdir)}/hostfile",
+                  f"export MASTER_ADDR={shlex.quote(nodelist[0])}"]
+    else:
+        lines += ['MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
+                  "export MASTER_ADDR"]
+    lines += [f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
               f"export WORLD_SIZE={n}"]
     env = {**(SLINKY_GPU_ENV if spec.gpu else {}), **spec.env}
     for k, v in env.items():
         lines.append(f"export {k}={shlex.quote(str(v))}")
-    srun = ["srun", f"--ntasks={n if spec.launcher == 'mpi' else 1}"]
+    srun = ["srun", f"--ntasks={ntasks}"]
+    if nodelist:
+        srun.append("--distribution=arbitrary")
     if spec.launcher == "mpi":
         srun.append(f"--mpi={mpi}")
     srun += [f"--container-image={image}",
@@ -1913,6 +1930,24 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
              f"--container-workdir={spec.output_dir}"]
     lines.append(" ".join(shlex.quote(a) for a in srun + list(spec.command)))
     return "\n".join(lines) + "\n"
+
+
+def parse_sinfo_nodes(text: str) -> list[tuple[str, int]]:
+    """[(slurm node, GPUs)] from `sinfo -h -N -o '%N|%G'`, sorted and
+    de-duplicated (a node in two partitions is listed twice). Gres looks like
+    `gpu:a10g:1(S:0)`, `gpu:2`, `gpu:a10g:1,shard:4` or `(null)`."""
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        name, _, gres = line.strip().partition("|")
+        if not name:
+            continue
+        gpus = 0
+        for item in re.sub(r"\([^)]*\)", "", gres).split(","):
+            parts = item.split(":")
+            if parts[0] == "gpu" and parts[-1].isdigit():
+                gpus += int(parts[-1])
+        out[name] = gpus
+    return sorted(out.items())
 
 
 def is_kubectl_transport_error(stderr: str) -> bool:
@@ -2002,6 +2037,24 @@ class SlinkyAdapter(ProviderAdapter):
                 "elsewhere.")
         return sorted(pods)[0]
 
+    @staticmethod
+    def _slurm_nodes(nodes: list[NodeRecord]) -> tuple[tuple[str, ...], int]:
+        """The Slurm nodes a job's per-node slots stand for, in rank order, and
+        the GPUs per node; ((), 0) for a cluster-wide slot. Every slot of one
+        job must be per-node with the same GPU count, or Slurm could not give
+        each rank the same share."""
+        named = [n.slurm_node for n in nodes]
+        if not any(named):
+            return (), 0
+        if not all(named):
+            raise RuntimeError(f"slots {[n.name for n in nodes]} mix per-node and cluster-wide "
+                               "slinky slots; pin one kind")
+        counts = {n.gpu_count for n in nodes}
+        if len(counts) != 1:
+            raise RuntimeError(f"slots {[n.name for n in nodes]} have different GPU counts "
+                               f"{sorted(counts)}; a job's nodes must match")
+        return tuple(named), counts.pop()
+
     def _exec_argv(self, context: str, pod: str, script: str, stdin: bool = False) -> list[str]:
         return self._kubectl_base(context) + (
             ["exec"] + (["-i"] if stdin else []) +
@@ -2036,6 +2089,14 @@ class SlinkyAdapter(ProviderAdapter):
         if SLINKY_PARTITION:
             checks.append((f"sinfo -h -p {shlex.quote(SLINKY_PARTITION)} -o %P | grep -q .",
                            f"partition {SLINKY_PARTITION!r} does not exist"))
+        nodelist, _ = self._slurm_nodes(nodes)
+        if nodelist:
+            want = " ".join(shlex.quote(h) for h in nodelist)
+            checks.append((f"for h in {want}; do st=$(sinfo -h -N -n \"$h\" -o %T | head -n1); "
+                           f"case \"$st\" in ''|down*|drain*|fail*|unk*|not_resp*) "
+                           f"echo \"$h: ${{st:-not a Slurm node}}\" >&2; exit 1;; esac; done",
+                           f"a pinned Slurm node is missing or down ({', '.join(nodelist)}); if the "
+                           "cluster's nodes were replaced, re-register with `add-slinky --per-node`"))
         for script, why in checks:
             rc, _, err = self._exec(ctx, pod, script, job_id)
             if rc != 0:
@@ -2122,7 +2183,9 @@ class SlinkyAdapter(ProviderAdapter):
         pod = self._login_pod(ctx)
         workdir = self._workdir(job_id)
         image = self._stage_image(ctx, pod, spec.image, job_id)
-        script = render_sbatch(job_id, spec, workdir, image, SLINKY_PARTITION, SLINKY_MPI)
+        nodelist, gpus = self._slurm_nodes(nodes)
+        script = render_sbatch(job_id, spec, workdir, image, SLINKY_PARTITION, SLINKY_MPI,
+                               nodelist, gpus)
         with open(os.path.join(local, "launcher-slinky.sbatch"), "w") as f:
             f.write(script)
         append_job_log(job_id, f"{now_iso()} [slinky] sbatch script:\n{script}")
