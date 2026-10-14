@@ -110,6 +110,25 @@ cluster reconcile --execute
 The reconciler needs a kubeconfig that reaches the cluster (`KUBECONFIG` plus the
 slot's kube-context).
 
+## On a tashkil child cluster
+
+A cluster created with `scheduler: slinky` gets everything this backend assumes:
+namespace `slurm`, a pyxis LoginSet `main`, one slurmd per worker, and `/scratch`
+(FSx) mounted in both.
+
+**Register the slot only once the cluster is `Delivered`.** In the platform's
+shared-GPU mode, slurmd uses the node's GPUs without claiming them from the
+device plugin. Nothing stops a Slurm job and a Kubernetes GPU pod from landing
+on the same card. One of those pods is the platform's own GTL acceptance run,
+which executes between `Provisioned` and `Delivered`. Seen 2026-10-14 on an
+A10G: an outpost STREAM job submitted as soon as Slurm answered overlapped
+acceptance's HPL-MxP, acceptance failed on performance, and the platform
+decommissioned the cluster as its policy says.
+
+The reconciler reaches the cluster the way cluster-service does: through the
+management cluster's chisel door, with a kubeconfig whose server is a local
+port-forward.
+
 ## Settings
 
 | Variable | Default | |
@@ -126,14 +145,20 @@ slot's kube-context).
 | `CLUSTER_SLINKY_RUN_TIMEOUT` | `3600` | seconds, submit to terminal |
 | `CLUSTER_SLINKY_POLL_INTERVAL` | `10` | |
 | `CLUSTER_SLINKY_KEEP_WORKDIR` | `0` | `1` keeps the workdir after teardown |
+| `CLUSTER_SLINKY_TRANSPORT_RETRIES` | `6` | attempts for a call cut by a kubectl transport error (not a command failure) |
+| `CLUSTER_SLINKY_TRANSPORT_BACKOFF` | `5` | seconds between those attempts |
 
 ## What was verified, and what was not
 
-Verified live:
+Verified live (T4 cluster unless noted):
 - single-node GPU jobs (`launcher: single`) on a T4, with both a plain image and an NGC image;
 - import → submit → poll → collect → teardown;
 - three back-to-back jobs on one slot;
 - a failure path (an enroot import failure fails the job and cleans up);
+- GTL's STREAM suite on an A10G cluster via `gtl submit --target`: a
+  node_name-pinned slot, the pinned NGC image, Triad 513 GB/s (85.5% of the 600
+  GB/s ceiling). `gtl ingest` wrote candidate fingerprints recording
+  `scheduler: slurm`;
 - a `launcher: mpi`, `node_count: 2` job: one task on each node, each on its own T4.
   `--mpi=pmix` works in the stock slurmd image (`PMIX_RANK` 0/1), and
   `MASTER_ADDR` is the first node.
