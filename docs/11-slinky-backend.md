@@ -174,6 +174,54 @@ port-forward.
 | `CLUSTER_SLINKY_TRANSPORT_RETRIES` | `6` | attempts for a call cut by a kubectl transport error (not a command failure) |
 | `CLUSTER_SLINKY_TRANSPORT_BACKOFF` | `5` | seconds between those attempts |
 
+## Performance: what running through Slinky costs and gains
+
+Measured 2026-10-14 on 2 × g5.xlarge (A10G, 4 vCPU, 16 GiB, "up to 10 Gbps"),
+against the promoted non-Slinky A10G records in GTL staging (same image digest,
+same instance type, same parameters).
+
+| | Slinky | baseline | |
+|---|---|---|---|
+| STREAM Triad | 523.5 GB/s (var 0.65%) | 523.4 GB/s | no loss: GPU-bound kernels are unaffected |
+| HPL-MxP, `n=36864` | 13,406 GFLOPS (var 1.6%) | 14,620 GFLOPS | **−8.3%**, reproducible; cause not isolated (below) |
+| nccl-tests all_reduce, 2 nodes | 0.80 GB/s avg busbw (run 1) | none on g5.xlarge | 1 GiB: 0.88 GB/s on burst, **0.31 GB/s (2.5 Gbit/s) once burst credits run out** |
+
+Fixed overhead per job, from the reconciler's audit timestamps:
+
+- provision + bootstrap: ~12 s (three or four `kubectl exec` round trips through the chisel door);
+- submit + polling: up to `CLUSTER_SLINKY_POLL_INTERVAL` (10 s) after Slurm finishes;
+- container start: pyxis extracts the image's squashfs on the node for every job
+  (`unsquashfs` at about one core for 30–40 s for the 8.5 GB NGC image). It falls
+  inside Slurm's elapsed time, but before the benchmark starts;
+- collect ~3–4 s, teardown ~6 s;
+- once per cluster: the `enroot import` of each image (minutes; parallel jobs
+  wait on its lock).
+
+Where Slinky is better than the bare-metal path:
+
+- multi-node MPI needs nothing on the hosts: `srun --mpi=pmix` starts the
+  ranks inside the NGC image. Bare metal needs a matching OpenMPI 4.1.x on every
+  host and an ssh fabric key on the head;
+- per-node slots run different single-node jobs on different nodes at once.
+
+What the numbers do not yet separate:
+
+- **HPL-MxP's −8%.** HPL-MxP runs at ~290% CPU on the 4-vCPU node outside the
+  GPU solve. The worker also runs slurmctld or slurmdbd/mariadb, plus the
+  platform's operators, and Slurm binds nothing (`TaskPlugin` is unset).
+  Untested: whether binding or a quieter node closes the gap.
+- **Pod network vs host network** for NCCL. Slurm runs slurmd in pods on the
+  Cilium pod network. No same-node host-network NCCL baseline exists yet.
+- **The g5.xlarge network is bursty, on every backend.** "Up to 10 Gbps" is
+  a burst. Sustained traffic drains credits within one ~10-minute nccl run, and
+  later runs measure the 2.5 Gbit/s baseline. Back-to-back nccl runs on this
+  instance cannot be reproducible, and a 10 Gbit/s ceiling overstates what a
+  sustained run can reach.
+
+Also seen, outside the backend itself: the reconciler advances a tick only
+when every job's phase has returned, so a short job finishing next to a long
+one waits for it (STREAM waited ~80 s for HPL to finish its run).
+
 ## What was verified, and what was not
 
 Verified live, on T4 (2 × g4dn.xlarge) and A10G (1 and 2 × g5.xlarge) clusters:
