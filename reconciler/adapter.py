@@ -2042,7 +2042,7 @@ class SlinkyAdapter(ProviderAdapter):
             mount = (f"exec 9>{img}.lock; flock 9; "
                      f"[ -e {img} ] || {{ truncate -s {SLINKY_ENROOT_TEMP_SIZE} {img} && "
                      f"mkfs.ext4 -q -F {img}; }}; "
-                     f"mountpoint -q {temp} || mount -o loop {img} {temp}; flock -u 9; ")
+                     f"mountpoint -q {temp} || mount -o loop,noinit_itable {img} {temp}; flock -u 9; ")
         script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
                   f"mkdir -p {images}/.cache {temp}; {mount}"
                   f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "

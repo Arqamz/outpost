@@ -129,16 +129,19 @@ slot's kube-context).
 
 ## What was verified, and what was not
 
-Verified live: single-node GPU jobs (`launcher: single`) on a T4, a plain image
-and an NGC image, import → submit → poll → collect → teardown, three
-back-to-back jobs on one slot, failure paths (an enroot import failure fails the
-job and cleans up).
+Verified live:
+- single-node GPU jobs (`launcher: single`) on a T4, with both a plain image and an NGC image;
+- import → submit → poll → collect → teardown;
+- three back-to-back jobs on one slot;
+- a failure path (an enroot import failure fails the job and cleans up);
+- a `launcher: mpi`, `node_count: 2` job: one task on each node, each on its own T4.
+  `--mpi=pmix` works in the stock slurmd image (`PMIX_RANK` 0/1), and
+  `MASTER_ADDR` is the first node.
 
 Not yet exercised live:
 
-- **`launcher: mpi` across nodes:** the batch script is unit-tested, but
-  whether `--mpi=pmix` works in the stock slurmd image is unconfirmed;
-  `pmi2` is the fallback (`CLUSTER_SLINKY_MPI`).
+- **Real MPI/NCCL traffic between slurmd pods.** The 2-node launch above ran
+  no MPI library.
 - **Multi-GPU nodes:** with `NVIDIA_VISIBLE_DEVICES=all`, it's unconfirmed
   that a task requesting fewer GPUs than the node has sees only its own.
 - **Private registries (ECR):** `enroot import` needs credentials
