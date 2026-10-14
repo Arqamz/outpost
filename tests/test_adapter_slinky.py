@@ -318,3 +318,44 @@ def test_sbatch_refusing_is_not_retried(quick, monkeypatch):
     _script(monkeypatch, [_Proc(1, "", "sbatch: error: Invalid generic resource (gres) specification")])
     with pytest.raises(RuntimeError, match="sbatch refused"):
         quick._submit("ctx", "login-0", "job-abc", "/w", "#!/bin/bash\n")
+
+
+# ── slurmctld briefly unreachable ───────────────────────────────────────────
+TIMEOUT = "slurm_load_jobs error: Socket timed out on send/recv operation"
+
+
+def test_polling_rides_out_a_controller_outage(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "", TIMEOUT), _Proc(1, "", TIMEOUT),
+                                 _Proc(0, "JobId=7 JobState=COMPLETED Reason=None ExitCode=0:0", "")])
+    assert quick._await("ctx", "login-0", "7", "job-abc") == ("COMPLETED", 0)
+    assert len(seen) == 3
+
+
+def test_polling_gives_up_after_the_grace(quick, monkeypatch):
+    import reconciler.adapter as ad
+    monkeypatch.setattr(ad, "SLINKY_CTLD_GRACE_S", 0)
+    _script(monkeypatch, [_Proc(1, "", TIMEOUT)])
+    with pytest.raises(RuntimeError, match="cannot read Slurm job 7"):
+        quick._await("ctx", "login-0", "7", "job-abc")
+
+
+def test_provision_waits_for_the_controller(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "Slurmctld(primary) at c-0 is DOWN", ""), _Proc(0, "UP", "")])
+    quick.provision(NodeRecord(node_id="s", name="s", index=-1, ip=""), "job-abc")
+    assert seen == ["scontrol ping", "scontrol ping"]
+
+
+def test_teardown_waits_until_slurm_drops_the_job(quick, monkeypatch):
+    seen = _script(monkeypatch, [_Proc(1, "", TIMEOUT), _Proc(0, "3\n", ""), _Proc(0, "", ""),
+                                 _Proc(0, "", "")])
+    quick.deprovision(NodeRecord(node_id="s", name="s", index=-1, ip=""), "job-abc")
+    assert [s.startswith("scancel") for s in seen] == [True, True, True, False]
+    assert seen[-1].startswith("rm -rf /scratch/outpost/job-abc")
+
+
+def test_teardown_refuses_to_release_over_a_live_job(quick, monkeypatch):
+    import reconciler.adapter as ad
+    monkeypatch.setattr(ad, "SLINKY_CTLD_GRACE_S", 0)
+    _script(monkeypatch, [_Proc(0, "3\n", "")])
+    with pytest.raises(RuntimeError, match="Slurm still has outpost-job-abc"):
+        quick.deprovision(NodeRecord(node_id="s", name="s", index=-1, ip=""), "job-abc")

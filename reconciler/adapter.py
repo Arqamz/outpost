@@ -186,6 +186,10 @@ SLINKY_MPI = os.environ.get("CLUSTER_SLINKY_MPI", "pmix")           # srun --mpi
 SLINKY_RUN_TIMEOUT_S = float(os.environ.get("CLUSTER_SLINKY_RUN_TIMEOUT", "3600"))
 SLINKY_POLL_INTERVAL_S = float(os.environ.get("CLUSTER_SLINKY_POLL_INTERVAL", "10"))
 SLINKY_KEEP_WORKDIR = os.environ.get("CLUSTER_SLINKY_KEEP_WORKDIR", "0") == "1"
+# How long slurmctld may be unreachable before a phase gives up. The controller
+# can restart (seen 2026-10-14: its node went NotReady under a job's memory
+# pressure) while slurmd keeps running the job.
+SLINKY_CTLD_GRACE_S = float(os.environ.get("CLUSTER_SLINKY_CTLD_GRACE", "600"))
 SLINKY_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
                           "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
 # kubectl-side failures that say nothing about the command being run, so a
@@ -2067,11 +2071,22 @@ class SlinkyAdapter(ProviderAdapter):
         pod = self._login_pod(ctx)
         self.log(f"[slinky] slot {node.name}: login pod {pod}"
                  f"{f' (context {ctx})' if ctx else ''}; checking slurmctld")
-        rc, _, err = self._exec(ctx, pod, "scontrol ping && sinfo", job_id)
-        if rc != 0:
-            raise RuntimeError(
-                f"slurmctld does not answer from {pod} (`scontrol ping` failed: {err.strip()}) "
-                f"— check the Controller pod in namespace {SLINKY_NAMESPACE!r}")
+        self._wait_for_ctld(ctx, pod, job_id)
+
+    def _wait_for_ctld(self, ctx: str, pod: str, job_id: str) -> None:
+        """Return once slurmctld answers; give up after SLINKY_CTLD_GRACE_S."""
+        deadline = time.monotonic() + SLINKY_CTLD_GRACE_S
+        while True:
+            rc, out, err = self._exec(ctx, pod, "scontrol ping", job_id)
+            if rc == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"slurmctld has not answered from {pod} for {SLINKY_CTLD_GRACE_S:.0f}s "
+                    f"(`scontrol ping`: {(out + err).strip()[-200:]}) — check the Controller pod "
+                    f"in namespace {SLINKY_NAMESPACE!r}")
+            self.log(f"[slinky] slurmctld not answering from {pod}; waiting")
+            time.sleep(SLINKY_POLL_INTERVAL_S)
 
     def bootstrap(self, nodes, job_id):
         ctx = self._context_of(nodes[0])
@@ -2109,10 +2124,21 @@ class SlinkyAdapter(ProviderAdapter):
         except RuntimeError as e:
             self.log(f"[slinky] deprovision {job_id}: {e}")
             return
-        script = f"scancel --name=outpost-{job_id} || true"
+        # Release the slot only once Slurm has no job by this name: an scancel
+        # sent while slurmctld is down is lost, and the job would keep the node.
+        name = f"outpost-{job_id}"
+        deadline = time.monotonic() + SLINKY_CTLD_GRACE_S
+        while True:
+            rc, out, err = self._exec(ctx, pod, f"scancel --name={name}; squeue -h -n {name} -o %i",
+                                      job_id)
+            if rc == 0 and not out.strip():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Slurm still has {name} (job {out.strip() or '?'}) after "
+                                   f"{SLINKY_CTLD_GRACE_S:.0f}s of scancel: {err.strip()[-200:]}")
+            time.sleep(SLINKY_POLL_INTERVAL_S)
         if not SLINKY_KEEP_WORKDIR:
-            script += f"; rm -rf {shlex.quote(self._workdir(job_id))}"
-        self._exec(ctx, pod, script, job_id)
+            self._exec(ctx, pod, f"rm -rf {shlex.quote(self._workdir(job_id))}", job_id)
 
     # ── workload lifecycle ────────────────────────────────────────────────
     def _stage_image(self, ctx: str, pod: str, image: str, job_id: str) -> str:
@@ -2207,11 +2233,23 @@ class SlinkyAdapter(ProviderAdapter):
     def _await(self, ctx: str, pod: str, slurm_id: str, job_id: str) -> tuple[str, int | None]:
         deadline = time.monotonic() + SLINKY_RUN_TIMEOUT_S
         last = None
+        unreadable_since = None
         while True:
             rc, out, err = self._exec(ctx, pod, f"scontrol show job -o {slurm_id}")
             if rc != 0:
-                raise RuntimeError(f"cannot read Slurm job {slurm_id} from {pod}: "
-                                   f"{err.strip()}")
+                # slurmctld down or restarting: the job keeps running under slurmd.
+                # A job slurmctld no longer knows is answered, not an error here.
+                now = time.monotonic()
+                unreadable_since = unreadable_since or now
+                if "Invalid job id" in err or now - unreadable_since >= SLINKY_CTLD_GRACE_S:
+                    raise RuntimeError(f"cannot read Slurm job {slurm_id} from {pod}: "
+                                       f"{err.strip()}")
+                if now == unreadable_since:
+                    self.log(f"[slinky] job {slurm_id}: slurmctld unreadable ({err.strip()[:120]}); "
+                             "still polling")
+                time.sleep(SLINKY_POLL_INTERVAL_S)
+                continue
+            unreadable_since = None
             state, reason, code = parse_slurm_job(out)
             if (state, reason) != last:
                 msg = f"[slinky] job {slurm_id}: {state} ({reason})"
