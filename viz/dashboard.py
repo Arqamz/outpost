@@ -12,7 +12,7 @@ Run: `make dashboard` then open the URL.
   POST /api/clear[?force=1]     -> wipe job history for a blank-slate demo view
 """
 from __future__ import annotations
-import json, os, re, subprocess, sys, time
+import json, os, re, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -252,71 +252,219 @@ def _k8s_gangs() -> dict:
 
 
 _slinky_cache: dict = {"ts": 0.0, "data": None}
+_slinky_lock = threading.Lock()  # one snapshot at a time; other requests get the last one
 SLINKY_TTL = float(os.environ.get("CLUSTER_DASH_SLINKY_TTL", "10"))
-_SLURM_SNAPSHOT = ("sinfo -N -h -o '%N|%T|%G|%C|%P'; echo @@; "
-                   "squeue -h -o '%i|%j|%T|%D|%N|%M|%b|%r'")
+SLINKY_HISTORY = os.environ.get("CLUSTER_DASH_SLINKY_HISTORY", "now-12hours")
+_SLURM_CONFIG_KEYS = ("SLURM_VERSION", "SelectType", "SelectTypeParameters", "TaskPlugin",
+                      "TaskPluginParam", "ProctrackType", "CgroupPlugin", "JobAcctGatherType",
+                      "GresTypes", "MpiDefault", "SchedulerType", "PriorityType",
+                      "AccountingStorageType", "MinJobAge", "SlurmctldHost[0]")
+# One exec, one JSON document per section. `|| true` so one failing command
+# (slurmctld down) still leaves the others.
+_SLURM_SNAPSHOT = "; ".join(
+    f"echo @@{k}; {cmd} 2>&1 || true" for k, cmd in (
+        ("ping", "scontrol ping --json"),
+        ("nodes", "scontrol show node --json"),
+        ("queue", "squeue --json"),
+        ("history", f"sacct -X -S {SLINKY_HISTORY} --json"),
+        ("diag", "sdiag --json"),
+        ("partitions", "scontrol show partition --json"),
+        ("config", "scontrol show config"),
+    ))
 
 
-def _slinky_cluster(ctx: str) -> dict:
-    """One kubectl exec into the cluster's login pod for `sinfo -N` + `squeue`.
-    No transport retries here: the adapter's would stall the poll."""
-    base = ["kubectl"] + (["--context", ctx] if ctx else [])
-    out = {"reachable": False, "nodes": [], "queue": [], "error": ""}
+def _num(v):
+    """Slurm JSON wraps numbers as {set, infinite, number}."""
+    if isinstance(v, dict):
+        if v.get("infinite"):
+            return "inf"
+        return v.get("number") if v.get("set") else None
+    return v
+
+
+def _sections(text: str) -> dict[str, str]:
+    out, key = {}, None
+    for line in text.splitlines(keepends=True):
+        if line.startswith("@@"):
+            key = line[2:].strip()
+            out[key] = ""
+        elif key:
+            out[key] += line
+    return out
+
+
+def _json_or_none(text: str):
     try:
+        return json.loads(text[text.index("{"):]) if "{" in text else None
+    except ValueError:
+        return None
+
+
+def _slurm_view(sec: dict[str, str], job_names: dict[str, str]) -> dict:
+    """The parts of each Slurm section the card shows."""
+    v: dict = {"controller": None, "nodes": [], "queue": [], "history": [], "diag": None,
+               "partitions": [], "config": {}, "version": ""}
+    ping = _json_or_none(sec.get("ping", ""))
+    if ping and ping.get("pings"):
+        p = ping["pings"][0]
+        v["controller"] = {"host": p.get("hostname"), "up": bool(p.get("responding")),
+                           "latency_us": p.get("latency"), "status": p.get("status")}
+        v["version"] = ping.get("meta", {}).get("slurm", {}).get("release", "")
+    elif sec.get("ping"):
+        v["controller"] = {"host": "", "up": False, "status": sec["ping"].strip()[-200:]}
+    nodes = _json_or_none(sec.get("nodes", ""))
+    for n in (nodes or {}).get("nodes", []):
+        try:
+            pod = json.loads(n.get("comment") or "{}")
+        except ValueError:
+            pod = {}
+        v["nodes"].append({
+            "name": n.get("name"), "state": "+".join(n.get("state") or []),
+            "reason": n.get("reason") or "", "address": n.get("address"),
+            "cpus": n.get("cpus"), "alloc_cpus": n.get("alloc_cpus"),
+            "cpu_load": (n.get("cpu_load") or 0) / 100,
+            "sockets": n.get("sockets"), "cores": n.get("cores"), "threads": n.get("threads"),
+            "real_memory_mb": n.get("real_memory"), "alloc_memory_mb": n.get("alloc_memory"),
+            "free_memory_mb": _num(n.get("free_mem")),
+            "gres": n.get("gres") or "", "gres_used": n.get("gres_used") or "",
+            "tres_used": n.get("tres_used") or "",
+            "boot_time": _num(n.get("boot_time")), "slurmd_start": _num(n.get("slurmd_start_time")),
+            "last_busy": _num(n.get("last_busy")), "version": n.get("version"),
+            "pod": pod.get("podName", ""), "k8s_node": pod.get("node", ""),
+        })
+    queue = _json_or_none(sec.get("queue", ""))
+    for j in (queue or {}).get("jobs", []):
+        name = j.get("name") or ""
+        v["queue"].append({
+            "id": j.get("job_id"), "name": name, "outpost": job_names.get(name, ""),
+            "state": "+".join(j.get("job_state") or []), "reason": j.get("state_reason"),
+            "nodes": j.get("nodes") or "", "node_count": _num(j.get("node_count")),
+            "cpus": _num(j.get("cpus")), "tres": j.get("tres_alloc_str") or j.get("tres_req_str") or "",
+            "tres_per_node": j.get("tres_per_node") or "",
+            "submit": _num(j.get("submit_time")), "start": _num(j.get("start_time")),
+            "time_limit": _num(j.get("time_limit")), "priority": _num(j.get("priority")),
+            "workdir": j.get("current_working_directory") or "",
+        })
+    hist = _json_or_none(sec.get("history", ""))
+    for j in reversed((hist or {}).get("jobs", [])[-15:]):
+        name = j.get("name") or ""
+        t = j.get("time") or {}
+        ec = j.get("exit_code") or {}
+        v["history"].append({
+            "id": j.get("job_id"), "name": name, "outpost": job_names.get(name, ""),
+            "state": "+".join((j.get("state") or {}).get("current") or []),
+            "elapsed_s": t.get("elapsed"), "start": t.get("start"), "end": t.get("end"),
+            "nodes": j.get("nodes") or "",
+            "exit": _num(ec.get("return_code")), "signal": (ec.get("signal") or {}).get("name") or "",
+            "tres": ",".join(f"{x['type']}={x['count']}" for x in
+                             ((j.get("tres") or {}).get("allocated") or []) if x.get("count", 0) > 0),
+        })
+    diag = _json_or_none(sec.get("diag", ""))
+    if diag and diag.get("statistics"):
+        s = diag["statistics"]
+        v["diag"] = {k: _num(s.get(k)) for k in (
+            "jobs_submitted", "jobs_started", "jobs_completed", "jobs_canceled", "jobs_failed",
+            "jobs_pending", "jobs_running", "server_thread_count", "agent_queue_size",
+            "schedule_cycle_last", "schedule_cycle_max", "schedule_cycle_mean",
+            "bf_backfilled_jobs", "req_time_start")}
+    parts = _json_or_none(sec.get("partitions", ""))
+    for p in (parts or {}).get("partitions", []):
+        v["partitions"].append({
+            "name": p.get("name"), "nodes": (p.get("nodes") or {}).get("configured", ""),
+            "cpus": (p.get("cpus") or {}).get("total"),
+            "state": "+".join((p.get("partition") or {}).get("state") or []),
+            "default": "DEFAULT" in ((p.get("flags") or []) + ((p.get("partition") or {}).get("flags") or [])),
+            "max_time": _num((p.get("maximums") or {}).get("time")),
+        })
+    for line in sec.get("config", "").splitlines():
+        k, _, val = line.partition("=")
+        if k.strip() in _SLURM_CONFIG_KEYS:
+            v["config"][k.strip()] = val.strip()
+    return v
+
+
+def _slurm_pods(base: list[str]) -> list[dict]:
+    r = subprocess.run(base + ["get", "pods", "-n", SLINKY_NAMESPACE, "-o", "json"],
+                       capture_output=True, text=True, timeout=8)
+    if r.returncode != 0:
+        return []
+    out = []
+    for p in json.loads(r.stdout).get("items", []):
+        cs = (p.get("status") or {}).get("containerStatuses") or []
+        out.append({"name": p["metadata"]["name"],
+                    "phase": (p.get("status") or {}).get("phase", ""),
+                    "ready": f"{sum(1 for c in cs if c.get('ready'))}/{len(cs)}",
+                    "restarts": sum(c.get("restartCount", 0) for c in cs),
+                    "node": (p.get("spec") or {}).get("nodeName", "")})
+    return sorted(out, key=lambda x: x["name"])
+
+
+def _slinky_cluster(ctx: str, job_names: dict[str, str]) -> dict:
+    """One kubectl exec into the login pod for the whole Slurm snapshot, plus the
+    slurm namespace's pods. No transport retries (they would stall the poll)."""
+    base = ["kubectl"] + (["--context", ctx] if ctx else [])
+    out: dict = {"reachable": False, "error": "", "login_pod": "", "pods": []}
+    try:
+        out["pods"] = _slurm_pods(base)
+        logins = sorted(p["name"] for p in out["pods"]
+                        if p["phase"] == "Running" and "login" in p["name"])
         r = subprocess.run(base + ["get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
                                    "--field-selector=status.phase=Running", "-o", "name"],
                            capture_output=True, text=True, timeout=8)
-        pods = sorted(p.split("/", 1)[-1] for p in r.stdout.split())
-        if r.returncode != 0 or not pods:
+        logins = sorted(p.split("/", 1)[-1] for p in r.stdout.split()) or logins
+        if not logins:
             out["error"] = (r.stderr.strip() or "no Running login pod")[:200]
             return out
-        r = subprocess.run(base + ["exec", "-n", SLINKY_NAMESPACE, pods[0], "-c", SLINKY_LOGIN_CONTAINER,
+        out["login_pod"] = logins[0]
+        r = subprocess.run(base + ["exec", "-n", SLINKY_NAMESPACE, logins[0], "-c", SLINKY_LOGIN_CONTAINER,
                                    "--", "bash", "-lc", _SLURM_SNAPSHOT],
-                           capture_output=True, text=True, timeout=12)
+                           capture_output=True, text=True, timeout=20)
     except Exception as e:
         out["error"] = str(e)[:200]
         return out
-    if r.returncode != 0:
+    if r.returncode != 0 and "@@" not in r.stdout:
         out["error"] = r.stderr.strip()[:200]
         return out
     out["reachable"] = True
-    nodes_txt, _, queue_txt = r.stdout.partition("@@")
-    for ln in nodes_txt.split():
-        f = ln.split("|")
-        if len(f) >= 5:
-            cpus = f[3].split("/")  # allocated/idle/other/total
-            out["nodes"].append({"name": f[0], "state": f[1], "gres": f[2],
-                                 "cpus_alloc": cpus[0], "cpus_total": cpus[-1], "partition": f[4]})
-    for ln in queue_txt.strip().splitlines():
-        f = ln.split("|")
-        if len(f) >= 8:
-            out["queue"].append({"id": f[0], "name": f[1], "state": f[2], "nodes": f[3],
-                                 "nodelist": f[4], "time": f[5], "gres": f[6], "reason": f[7]})
+    out.update(_slurm_view(_sections(r.stdout), job_names))
     return out
 
 
 def _slinky() -> dict:
     """Slinky slots from the registry, grouped by cluster (kube-context), each
-    with a live Slurm snapshot from its login pod. {enabled:false} when the
-    registry has no slinky slots."""
+    with a live Slurm + pod snapshot. {enabled:false} with no slinky slots."""
     now = time.time()
     if _slinky_cache["data"] is not None and now - _slinky_cache["ts"] < SLINKY_TTL:
         return _slinky_cache["data"]
+    if not _slinky_lock.acquire(blocking=_slinky_cache["data"] is None):
+        return _slinky_cache["data"]
     try:
-        slots = [n for n in open_store(STATE_PATH).list_nodes() if n.provider == "slinky"]
+        return _slinky_refresh(now)
+    finally:
+        _slinky_lock.release()
+
+
+def _slinky_refresh(now: float) -> dict:
+    try:
+        store = open_store(STATE_PATH)
+        slots = [n for n in store.list_nodes() if n.provider == "slinky"]
+        job_names = {f"outpost-{j.job_id}": f"{j.job_id}|{(j.spec or {}).get('name', '')}"
+                     for j in store.list_jobs()}
     except Exception:
-        slots = []
+        slots, job_names = [], {}
     by_ctx: dict[str, list] = {}
     for n in slots:
         by_ctx.setdefault(n.kube_context or _K8S_CTX, []).append(n)
     clusters = []
     for ctx, ns in sorted(by_ctx.items()):
         c = {"context": ctx or "(current)", "gpu": any(n.gpu for n in ns),
-             "slots": [{"name": n.name, "state": n.state, "owner_job": n.owner_job}
+             "slots": [{"name": n.name, "state": n.state, "owner_job": n.owner_job,
+                        "slurm_node": n.slurm_node, "gpu_count": n.gpu_count,
+                        "owner_name": job_names.get(f"outpost-{n.owner_job}", "").partition("|")[2]}
                        for n in sorted(ns, key=lambda n: n.name)]}
-        c.update(_slinky_cluster(ctx))
+        c.update(_slinky_cluster(ctx, job_names))
         clusters.append(c)
-    result = {"enabled": bool(clusters), "clusters": clusters}
+    result = {"enabled": bool(clusters), "clusters": clusters, "ts": now}
     _slinky_cache.update(ts=now, data=result)
     return result
 
