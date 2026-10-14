@@ -218,6 +218,18 @@ What the numbers do not yet separate:
   instance cannot be reproducible, and a 10 Gbit/s ceiling overstates what a
   sustained run can reach.
 
+**Placement and affinity on a tashkil child cluster: nothing is enforced.**
+The cluster runs Slurm with no `TaskPlugin` and a `cgroup.conf` that
+constrains nothing. A probe job (2026-10-14) found that every `--cpu-bind` mode
+(`none`, `cores`, `threads`, `map_cpu`, `mask_cpu`) leaves each task on all 4
+CPUs. Tasks are not placed in a per-job cgroup (`/proc/self/cgroup` is
+`0::/`), and `--mem=1G` leaves `memory.max` at `max`. GPU isolation is only the
+`CUDA_VISIBLE_DEVICES` Slurm exports. Slinky's slurm-operator can enforce all
+of these (privileged slurmd, Slurm ≥ 25.11), so it is a cluster configuration
+gap: `TaskPlugin=task/cgroup,task/affinity` plus `ConstrainCores`,
+`ConstrainRAMSpace`, `ConstrainDevices`. Until then, outpost refuses GTL's
+`launch` intent here rather than pretend to honour it.
+
 Also seen, outside the backend itself: the reconciler advances a tick only
 when every job's phase has returned, so a short job finishing next to a long
 one waits for it (STREAM waited ~80 s for HPL to finish its run).
