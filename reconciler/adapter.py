@@ -258,6 +258,8 @@ SLINKY_TRANSPORT_BACKOFF_S = float(os.environ.get("CLUSTER_SLINKY_TRANSPORT_BACK
 # enroot's nvidia hook injects the driver only when the container environment
 # names the GPUs; NGC images set these, plain images do not. Slurm's own GRES
 # binding still decides which GPU the task gets.
+SLINKY_RANK_SH = ('export RANK="$SLURM_PROCID" LOCAL_RANK="$SLURM_LOCALID" '
+                  'LOCAL_WORLD_SIZE="${SLURM_NTASKS_PER_NODE:-1}"; exec "$@"')
 SLINKY_GPU_ENV = {"NVIDIA_VISIBLE_DEVICES": "all",
                   "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"}
 # Pending reasons that will never clear by waiting.
@@ -2032,7 +2034,7 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
         lines += ['MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
                   "export MASTER_ADDR"]
     lines += [f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
-              f"export WORLD_SIZE={n}"]
+              f"export WORLD_SIZE={ntasks}"]
     env = {**(SLINKY_GPU_ENV if spec.gpu else {}), **spec.env}
     for k, v in env.items():
         lines.append(f"export {k}={shlex.quote(str(v))}")
@@ -2045,7 +2047,10 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
              f"--container-mounts=" + ",".join([f"{workdir}:{spec.output_dir}", *spec.mounts]),
              "--no-container-mount-home",
              f"--container-workdir={spec.output_dir}"]
-    lines.append(" ".join(shlex.quote(a) for a in srun + list(spec.command)))
+    # Slurm numbers tasks as SLURM_PROCID/SLURM_LOCALID; the torch names, which
+    # frameworks read, are set per task inside the container.
+    rank = (["/bin/sh", "-c", SLINKY_RANK_SH, "outpost-rank"] if spec.launcher == "mpi" else [])
+    lines.append(" ".join(shlex.quote(a) for a in srun + rank + list(spec.command)))
     return "\n".join(lines) + "\n"
 
 

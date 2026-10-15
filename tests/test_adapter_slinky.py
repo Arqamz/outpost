@@ -409,3 +409,29 @@ def test_losing_the_link_past_the_run_timeout_fails(quick, monkeypatch):
     _script(monkeypatch, [_Proc(1, "", DOWN)])
     with pytest.raises(RuntimeError, match="before the run timeout"):
         quick._await("ctx", "login-0", "7", "job-abc")
+
+
+# ── ranks: Slurm's task ids become the names frameworks read ────────────────
+def _srun_tail(script: str) -> list[str]:
+    import shlex as _shlex
+    srun = next(line for line in script.splitlines() if line.startswith("srun "))
+    argv = _shlex.split(srun)
+    return argv[next(i for i, a in enumerate(argv) if a.startswith("--container-workdir")) + 1:]
+
+
+@pytest.mark.parametrize("procid,localid", [("0", "0"), ("1", "0")])
+def test_an_mpi_task_runs_with_its_own_rank(procid, localid):
+    import subprocess as sp
+    s = render_sbatch("job-1", spec(launcher="mpi", node_count=2, command=["env"]), "/w",
+                      "/i.sqsh", nodelist=("a", "b"), gpus_per_node=1)
+    env = {"PATH": "/usr/bin:/bin", "SLURM_PROCID": procid, "SLURM_LOCALID": localid,
+           "SLURM_NTASKS_PER_NODE": "1"}
+    out = sp.run(_srun_tail(s), env=env, capture_output=True, text=True).stdout.splitlines()
+    assert {f"RANK={procid}", f"LOCAL_RANK={localid}", "LOCAL_WORLD_SIZE=1"} <= set(out)
+    assert "export WORLD_SIZE=2" in s
+
+
+def test_a_single_task_job_gets_no_rank_wrapper_and_world_size_one():
+    s = render_sbatch("job-1", spec(command=["python3", "x.py"], node_count=2), "/w", "/i.sqsh")
+    assert _srun_tail(s) == ["python3", "x.py"]
+    assert "export WORLD_SIZE=1" in s
