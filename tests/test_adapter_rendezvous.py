@@ -37,7 +37,7 @@ def captured(monkeypatch):
     monkeypatch.setattr("reconciler.adapter.container_argv", spy)
     monkeypatch.setattr("reconciler.adapter.run_logged", lambda *a, **kw: 0)
     monkeypatch.setattr(LibvirtAdapter, "_ensure_remote_sif",
-                        lambda self, n, image, job_id: "/tmp/cached.sif")
+                        lambda self, n, image, job_id, sif=None: "/tmp/cached.sif")
     monkeypatch.setattr(LibvirtAdapter, "_scp_to", lambda self, *a, **kw: None)
     monkeypatch.setattr(LibvirtAdapter, "_node_iface", lambda self, n: "eth0")
     return seen

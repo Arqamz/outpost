@@ -27,6 +27,7 @@ is intentionally generic — the cluster runs *any* container:
 | `output_dir` | str | in-container path the job writes results to (bound to the host) |
 | `params` | map | opaque passthrough (ignored by the cluster) |
 | `launch` | map, optional | a semantic placement request (`launch-intent/v1`, see [`contract/README.md`](../contract/README.md)) — resolved against real topology for `launcher: mpi` jobs (any `node_count`) or `launcher: single` at `node_count: 1`; see "Placement" below. Absent = today's behavior, unchanged. |
+| `image_sif` | map, optional | `image` prebuilt as a SIF and published next to it: `{ref: oras://<registry>/<repo>@sha256:…, sha256: sha256:<file>}`. Apptainer nodes download it instead of converting `image`, and refuse it unless its sha256 matches. Malformed = the job is refused. |
 
 **The cluster promises:** given a JobSpec, it schedules the right resource
 (waiting for capacity to free up if needed, not failing immediately — see
@@ -137,3 +138,10 @@ Adapters, the apptainer command line, the libvirt scripts, the state-machine
 internals, dry-run vs execute. Those are implementation. Anything driving
 this cluster should depend only on: **the JobSpec schema, the drop-zone
 layout, and the three collections above.**
+
+**Private registry images.** Nodes hold no registry credentials. For an image in a private ECR
+registry outpost mints a pull token on the control plane (`aws ecr get-login-password` with the
+profile in `CLUSTER_ECR_PROFILE`, reused for 11 h) and hands it to the node only for the pull,
+over stdin: as apptainer's docker credentials on a host, and as an enroot credentials file in a
+temporary directory in the Slinky login pod. The token never appears in argv or a replay log. An
+ECR image with no profile set refuses the job, naming the setting.

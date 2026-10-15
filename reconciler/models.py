@@ -6,6 +6,7 @@ the Mongo store and the file store.
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any
+import re
 import uuid
 
 from . import launch_models
@@ -25,6 +26,21 @@ BACKEND_PROVIDERS = ("k8s", "slinky")
 
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+_ORAS_REF_RE = re.compile(r"^oras://[^@\s]+@sha256:[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def parse_image_sif(sif: Any) -> dict[str, str] | None:
+    if sif is None:
+        return None
+    if not (isinstance(sif, dict) and _ORAS_REF_RE.match(str(sif.get("ref") or ""))
+            and _SHA256_RE.match(str(sif.get("sha256") or ""))):
+        raise ValueError(
+            f"image_sif must be {{ref: oras://<registry>/<repo>@sha256:<64 hex>, sha256: "
+            f"sha256:<64 hex>}}, got {sif!r} — fix the image pin that produced this job")
+    return {"ref": sif["ref"], "sha256": sif["sha256"]}
 
 
 @dataclass
@@ -63,6 +79,9 @@ class JobSpec:
     # Unlike `params`, this is NOT opaque passthrough: it is validated on parse and
     # a block we cannot honour refuses the job (see launch_models).
     launch: dict[str, Any] | None = None
+    # `image` prebuilt as a SIF: {"ref": "oras://…@sha256:…", "sha256": "sha256:<file>"}.
+    # Apptainer hosts download it instead of converting `image`; validated on parse.
+    image_sif: dict[str, str] | None = None
     # legacy label (kept so old specs still parse)
     workload: str = ""
 
@@ -93,6 +112,7 @@ class JobSpec:
             output_dir=d.get("output_dir", "/out"),
             params=d.get("params", {}) or {},
             launch=launch,
+            image_sif=parse_image_sif(d.get("image_sif")),
             workload=d.get("workload", "") or "",
         )
 

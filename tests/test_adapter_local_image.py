@@ -44,7 +44,7 @@ def staged(monkeypatch):
         seen["image"] = job_spec.image
         return real(job_spec, bind_src, bind_dst, extra_binds, extra_env)
 
-    def spy_sif(self, n, image, job_id):
+    def spy_sif(self, n, image, job_id, sif=None):
         calls.append(image)
         return "/tmp/outpost-sif-cache/converted.sif"
 

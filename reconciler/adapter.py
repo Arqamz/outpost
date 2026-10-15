@@ -84,6 +84,44 @@ REMOTE_PULL_HEADROOM_MARGIN_BYTES = 2 * 1024 ** 3
 REMOTE_PULL_FLOOR_BYTES = int(os.environ.get(
     "CLUSTER_REMOTE_PULL_FLOOR_BYTES", str(60 * 1024 ** 3)))
 
+# Nodes hold no registry credentials. For a private ECR image the control plane
+# mints a token with this AWS profile and hands it to the node only for the
+# pull, over stdin. ECR tokens last 12 h; a cached one is reused for 11.
+ECR_PROFILE = os.environ.get("CLUSTER_ECR_PROFILE", "")
+ECR_TOKEN_TTL_S = 11 * 3600
+_ECR_HOST_RE = re.compile(r"^\d{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$")
+_ecr_tokens: dict[str, tuple[float, str]] = {}
+
+
+def registry_host(image: str) -> str:
+    ref = image.split("://", 1)[-1]
+    head, slash, _ = ref.partition("/")
+    return head if slash and ("." in head or ":" in head or head == "localhost") else ""
+
+
+def registry_login(image: str) -> tuple[str, str] | None:
+    """(user, password) for pulling `image`, or None when its registry needs none."""
+    host = registry_host(image)
+    m = _ECR_HOST_RE.match(host)
+    if not m:
+        return None
+    if not ECR_PROFILE:
+        raise RuntimeError(
+            f"{image} is in a private ECR registry ({host}) and outpost has no credentials "
+            "for it — set CLUSTER_ECR_PROFILE to an AWS profile that can pull from it")
+    cached = _ecr_tokens.get(host)
+    if cached and time.monotonic() - cached[0] < ECR_TOKEN_TTL_S:
+        return "AWS", cached[1]
+    out = subprocess.run(["aws", "--profile", ECR_PROFILE, "--region", m.group(1),
+                          "ecr", "get-login-password"], capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(
+            f"could not mint an ECR token for {host} with profile {ECR_PROFILE!r}: "
+            f"{out.stderr.strip()[-300:]} — refresh that profile's credentials "
+            "(e.g. `aws sso login`)")
+    _ecr_tokens[host] = (time.monotonic(), out.stdout.strip())
+    return "AWS", _ecr_tokens[host][1]
+
 # SSH params for reaching VMs (match infra/libvirt/config.env defaults).
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
 SSH_KEY = os.environ.get("CLUSTER_SSH_PRIVKEY", os.path.expanduser("~/.ssh/outpost-cluster-ssh"))
@@ -229,18 +267,23 @@ def append_job_log(job_id: str, text: str) -> None:
 
 
 def run_logged(argv: list[str], job_id: str, cwd: str | None = None, check: bool = True,
-               env: dict | None = None) -> int:
+               env: dict | None = None, input: str | None = None) -> int:
     """Run a subprocess, streaming combined stdout+stderr live to THIS process's
     stdout (so a `reconcile` tick is still watchable in real time) while also
     appending every line to the job's replay log. Returns the exit code; raises
     CalledProcessError on failure unless check=False (matches subprocess.run).
     env=None inherits this process's environment (subprocess.Popen's own
-    default); pass a dict to override/extend it."""
+    default); pass a dict to override/extend it. `input` goes to stdin and is
+    never logged, which is how a credential reaches a remote command."""
     header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
     print(header)
     append_job_log(job_id, f"{now_iso()} {header}")
     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            stdin=subprocess.PIPE if input is not None else None)
+    if input is not None:
+        proc.stdin.write(input)
+        proc.stdin.close()
     lines = []
     for line in proc.stdout:
         sys.stdout.write(line)
@@ -321,15 +364,41 @@ def _with_preflight_probe(files: dict[str, str], probe_script: str,
     return out
 
 
-def _sif_cache_name(ref: str) -> str:
-    """A stable per-image SIF filename — the content digest when the ref is
-    digest-pinned (the norm), else a hash of the ref string."""
+def _sif_cache_name(ref: str, sif: dict | None = None) -> str:
+    """A stable per-image SIF filename — a prebuilt SIF's own file digest, else
+    the image's content digest when the ref is digest-pinned (the norm), else a
+    hash of the ref string."""
+    if sif:
+        return f"sha256-{sif['sha256'].removeprefix('sha256:')}.sif"
     m = re.search(r"@sha256:([0-9a-f]{64})", ref)
     key = f"sha256-{m.group(1)}" if m else hashlib.sha256(ref.encode()).hexdigest()[:16]
     return f"{key}.sif"
 
 
-def ensure_local_sif(image: str, job_id: str) -> str:
+def _sif_fetch_script(image: str, sif: dict | None, tmp: str, final: str,
+                      login: tuple[str, str] | None) -> str:
+    """Shell that lands `image` as a SIF at `final` unless it is already there:
+    a prebuilt SIF is downloaded and refused unless its sha256 is the pinned one;
+    otherwise the OCI image is converted. A registry password is read from stdin."""
+    q = shlex.quote
+    if login:
+        creds = (f'read -r APPTAINER_DOCKER_PASSWORD; '
+                 f'export APPTAINER_DOCKER_USERNAME={q(login[0])} APPTAINER_DOCKER_PASSWORD; ')
+    else:
+        creds = ""
+    if sif:
+        want = sif["sha256"].removeprefix("sha256:")
+        refusal = (f"{sif['ref']} is not the pinned SIF sha256:{want} — "
+                   "republish the SIF or fix the image pin")
+        fetch = (f"apptainer pull --force {q(tmp)} {q(sif['ref'])} && "
+                 f"{{ echo {q(want + '  ' + tmp)} | sha256sum -c --quiet - || "
+                 f"{{ echo {q(refusal)} >&2; rm -f {q(tmp)}; exit 1; }}; }}")
+    else:
+        fetch = f"apptainer build --force {q(tmp)} {q(image)}"
+    return f"test -f {q(final)} || {{ {creds}{fetch} && mv {q(tmp)} {q(final)}; }}"
+
+
+def ensure_local_sif(image: str, job_id: str, sif: dict | None = None) -> str:
     """Resolve a job image to a LOCAL .sif path for MPI staging.
 
     Single-node runs hand `image` straight to `apptainer exec`, which consumes a
@@ -350,7 +419,7 @@ def ensure_local_sif(image: str, job_id: str) -> str:
             f"job image {image!r} is neither a local file nor a pullable ref "
             "(expected a .sif path or docker://…@sha256:…)")
     os.makedirs(SIF_CACHE_DIR, exist_ok=True)
-    cached = os.path.join(SIF_CACHE_DIR, _sif_cache_name(image))
+    cached = os.path.join(SIF_CACHE_DIR, _sif_cache_name(image, sif))
     with open(cached + ".lock", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         if not os.path.isfile(cached):
@@ -369,8 +438,9 @@ def ensure_local_sif(image: str, job_id: str) -> str:
             build_env["APPTAINER_TMPDIR"] = os.path.join(SIF_CACHE_DIR, ".apptainer-tmp")
             os.makedirs(build_env["APPTAINER_CACHEDIR"], exist_ok=True)
             os.makedirs(build_env["APPTAINER_TMPDIR"], exist_ok=True)
-            run_logged(["apptainer", "build", "--force", tmp, image], job_id, env=build_env)
-            os.replace(tmp, cached)
+            login = registry_login(sif["ref"] if sif else image)
+            run_logged(["sh", "-c", _sif_fetch_script(image, sif, tmp, cached, login)],
+                       job_id, env=build_env, input=f"{login[1]}\n" if login else None)
     return cached
 
 
@@ -653,7 +723,7 @@ class LocalHostAdapter(ProviderAdapter):
         # happen once per digest, not once per job.
         run_spec = spec
         if spec.runtime != "docker" and "://" in spec.image:
-            run_spec = dataclasses.replace(spec, image=ensure_local_sif(spec.image, job_id))
+            run_spec = dataclasses.replace(spec, image=ensure_local_sif(spec.image, job_id, spec.image_sif))
         argv = container_argv(run_spec, workdir, spec.output_dir, extra_binds, extra_env)
         stdout_path = os.path.join(workdir, "stdout.log")
         header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
@@ -764,7 +834,7 @@ class LocalHostAdapter(ProviderAdapter):
         # docker://…@digest ref into a SIF at that shared path; a local .sif is
         # copied there. Either way `image` is workdir/image.sif everywhere.
         image = f"{workdir}/image.sif"
-        src = ensure_local_sif(spec.image, job_id)
+        src = ensure_local_sif(spec.image, job_id, spec.image_sif)
         if os.path.abspath(src) != os.path.abspath(image):
             shutil.copy2(src, image)
         appfile = f"{workdir}/appfile"
@@ -961,7 +1031,7 @@ class LibvirtAdapter(ProviderAdapter):
         # digest), not once per job.
         run_spec = spec
         if spec.runtime != "docker" and "://" in spec.image:
-            run_spec = dataclasses.replace(spec, image=self._ensure_remote_sif(head, spec.image, job_id))
+            run_spec = dataclasses.replace(spec, image=self._ensure_remote_sif(head, spec.image, job_id, spec.image_sif))
         argv = container_argv(run_spec, remote_workdir, spec.output_dir, extra_binds=extra_binds)
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
@@ -1033,7 +1103,8 @@ class LibvirtAdapter(ProviderAdapter):
         except ValueError:
             return 0  # df failed/unparseable -> treat as no headroom, forces the safe scp fallback
 
-    def _ensure_remote_sif(self, node: NodeRecord, image: str, job_id: str) -> str:
+    def _ensure_remote_sif(self, node: NodeRecord, image: str, job_id: str,
+                           sif: dict | None = None) -> str:
         """Get `image` onto `node`'s own disk as a cached, digest-keyed SIF at
         REMOTE_SIF_CACHE_DIR — shared across every job that node ever runs, not
         just this one. First job to touch a given digest on a given node pays a
@@ -1053,8 +1124,12 @@ class LibvirtAdapter(ProviderAdapter):
         "no space left on device" without this check. Falls back to the
         original scp-from-local-cache path when headroom is insufficient or
         the node's free space can't be read, landing in the shared cache
-        instead of a per-job dir either way."""
-        name = _sif_cache_name(image)
+        instead of a per-job dir either way.
+
+        A prebuilt SIF (`sif`) skips all of that: the node downloads it from the
+        registry, which needs no conversion headroom, and keeps it only if its
+        sha256 is the pinned one."""
+        name = _sif_cache_name(image, sif)
         final = f"{REMOTE_SIF_CACHE_DIR}/{name}"
         lock = f"{REMOTE_SIF_CACHE_DIR}/{name}.lock"
         probe = subprocess.run(self._ssh_base(node) +
@@ -1063,9 +1138,9 @@ class LibvirtAdapter(ProviderAdapter):
             self.log(f"[sif-cache] {node.name}: {name} already cached, reusing (no transfer)")
             return final
 
-        avail = self._remote_free_bytes(node)
         tmp = f"{final}.{job_id}.tmp"
-        if avail >= REMOTE_PULL_FLOOR_BYTES:
+        avail = None if sif else self._remote_free_bytes(node)
+        if sif or avail >= REMOTE_PULL_FLOOR_BYTES:
             # NOTE: deliberately NOT calling ensure_local_sif() here. It used to
             # run unconditionally, above this branch, purely so os.path.getsize()
             # could size a headroom check — meaning the control plane pulled and
@@ -1083,8 +1158,11 @@ class LibvirtAdapter(ProviderAdapter):
             # any image outpost ships, with margin. Below the floor we fall back
             # to the local build + scp, which is when paying for a local SIF is
             # actually justified.
-            self.log(f"[sif-cache] {node.name}: remote-pulling {image} directly "
-                     f"({avail / 1e9:.1f}GB avail >= {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor)")
+            if sif:
+                self.log(f"[sif-cache] {node.name}: pulling the prebuilt SIF {sif['ref']}")
+            else:
+                self.log(f"[sif-cache] {node.name}: remote-pulling {image} directly "
+                         f"({avail / 1e9:.1f}GB avail >= {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor)")
             # apptainer's OWN OCI blob cache + build-time rootfs unpack tmpdir
             # default to $HOME/.apptainer/cache and $TMPDIR/system-/tmp — NOT
             # wherever the final SIF is told to land. Left unredirected, the
@@ -1097,11 +1175,14 @@ class LibvirtAdapter(ProviderAdapter):
             # actually makes the headroom check meaningful.
             oci_cache = f"{REMOTE_SIF_CACHE_DIR}/.apptainer-cache"
             build_tmp = f"{REMOTE_SIF_CACHE_DIR}/.apptainer-tmp"
-            env = f"APPTAINER_CACHEDIR={shlex.quote(oci_cache)} APPTAINER_TMPDIR={shlex.quote(build_tmp)}"
-            build = (f"mkdir -p {oci_cache} {build_tmp} && test -f {final} || "
-                    f"({env} apptainer build --force {tmp} {shlex.quote(image)} && mv {tmp} {final})")
+            env = (f"export APPTAINER_CACHEDIR={shlex.quote(oci_cache)} "
+                   f"APPTAINER_TMPDIR={shlex.quote(build_tmp)}; ")
+            login = registry_login(sif["ref"] if sif else image)
+            build = (f"mkdir -p {oci_cache} {build_tmp} && {env}"
+                     + _sif_fetch_script(image, sif, tmp, final, login))
             cmd = f"mkdir -p {REMOTE_SIF_CACHE_DIR} && flock {shlex.quote(lock)} -c {shlex.quote(build)}"
-            run_logged(self._ssh_base(node) + [cmd], job_id)
+            run_logged(self._ssh_base(node) + [cmd], job_id,
+                       input=f"{login[1]}\n" if login else None)
         else:
             self.log(f"[sif-cache] {node.name}: insufficient remote headroom for a direct pull "
                      f"({avail / 1e9:.1f}GB avail < {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor) — "
@@ -1156,7 +1237,7 @@ class LibvirtAdapter(ProviderAdapter):
         for n in nodes:
             run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
             if stage:
-                remote_image = self._ensure_remote_sif(n, spec.image, job_id)
+                remote_image = self._ensure_remote_sif(n, spec.image, job_id, spec.image_sif)
         head = nodes[0]
 
         if plan is not None:
@@ -2161,12 +2242,25 @@ class SlinkyAdapter(ProviderAdapter):
                      f"[ -e {img} ] || {{ truncate -s {SLINKY_ENROOT_TEMP_SIZE} {img} && "
                      f"mkfs.ext4 -q -F {img}; }}; "
                      f"mountpoint -q {temp} || mount -o loop,noinit_itable {img} {temp}; flock -u 9; ")
+        if self._exec(ctx, pod, f"test -s {sqsh}", job_id)[0] == 0:
+            self.log(f"[slinky] image cached: {sqsh}")
+            return sqsh
+        # enroot reads registry credentials only from $ENROOT_CONFIG_PATH/.credentials,
+        # so the token goes into a private temp dir that is gone when the import ends.
+        login = registry_login(image)
+        creds = ""
+        if login:
+            creds = (f'cfg=$(mktemp -d); trap \'rm -rf "$cfg"\' EXIT; read -r pw; '
+                     f'(umask 077; printf "machine %s login %s password %s\\n" '
+                     f'{shlex.quote(registry_host(image))} {shlex.quote(login[0])} "$pw" '
+                     f'> "$cfg/.credentials"); export ENROOT_CONFIG_PATH="$cfg"; ')
         script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
-                  f"mkdir -p {images}/.cache {temp}; {mount}"
+                  f"{creds}mkdir -p {images}/.cache {temp}; {mount}"
                   f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "
                   f"rm -f {tmp}; enroot import -o {tmp} {shlex.quote(uri)} && mv -f {tmp} {sqsh}")
         self.log(f"[slinky] staging {uri} -> {sqsh}")
-        rc, _, _ = self._exec(ctx, pod, script, job_id)
+        rc, _, _ = self._exec(ctx, pod, script, job_id,
+                              input=f"{login[1]}\n" if login else None)
         if rc != 0:
             raise RuntimeError(f"enroot import of {uri} failed in {pod} (exit {rc}); the "
                                f"import output is in `cluster logs {job_id}`")
