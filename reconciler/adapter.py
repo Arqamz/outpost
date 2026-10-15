@@ -249,7 +249,7 @@ SLINKY_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_F
                           "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
 # kubectl-side failures that say nothing about the command being run, so a
 # safe-to-repeat call is retried (CLUSTER_SLINKY_TRANSPORT_RETRIES attempts).
-KUBECTL_TRANSPORT_ERRORS = ("unexpected EOF", "lost connection", "connection refused",
+KUBECTL_TRANSPORT_ERRORS = ("unexpected EOF", "lost connection", "connection refused", "was refused",
                             "connection reset by peer", "Unable to connect to the server",
                             "i/o timeout", "TLS handshake timeout", "error dialing backend",
                             "http2: client connection lost", "use of closed network connection")
@@ -2364,6 +2364,17 @@ class SlinkyAdapter(ProviderAdapter):
         unreadable_since = None
         while True:
             rc, out, err = self._exec(ctx, pod, f"scontrol show job -o {slurm_id}")
+            if rc != 0 and is_kubectl_transport_error(err):
+                # We cannot see the cluster, which says nothing about the job:
+                # it runs under Slurm regardless, so keep polling until the run
+                # timeout instead of spending the controller's grace on our link.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Slurm job {slurm_id} could not be read before the run "
+                                       f"timeout ({SLINKY_RUN_TIMEOUT_S:.0f}s): {err.strip()}")
+                self.log(f"[slinky] job {slurm_id}: cluster unreachable ({err.strip()[:100]}); "
+                         "still polling")
+                time.sleep(SLINKY_POLL_INTERVAL_S)
+                continue
             if rc != 0:
                 # slurmctld down or restarting: the job keeps running under slurmd.
                 # A job slurmctld no longer knows is answered, not an error here.

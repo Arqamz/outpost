@@ -382,3 +382,30 @@ def test_a_forgotten_job_accounting_cannot_vouch_for_still_fails(quick, monkeypa
     _script(monkeypatch, [_Proc(1, "", GONE), sacct])
     with pytest.raises(RuntimeError, match="cannot read Slurm job 15"):
         quick._await("ctx", "login-0", "15", "job-abc")
+
+
+# ── our link to the cluster drops while the job runs ────────────────────────
+DOWN = "The connection to the server 127.0.0.1:20544 was refused - did you specify the right host or port?"
+
+
+def test_kubectl_refusing_the_connection_is_a_transport_error():
+    from reconciler.adapter import is_kubectl_transport_error
+    assert is_kubectl_transport_error(DOWN)
+
+
+def test_losing_the_link_outlasts_the_controller_grace(quick, monkeypatch):
+    import reconciler.adapter as ad
+    monkeypatch.setattr(ad, "SLINKY_CTLD_GRACE_S", 0)
+    monkeypatch.setattr(ad, "SLINKY_TRANSPORT_RETRIES", 1)
+    _script(monkeypatch, [_Proc(1, "", DOWN), _Proc(1, "", DOWN),
+                          _Proc(0, "JobId=7 JobState=COMPLETED Reason=None ExitCode=0:0", "")])
+    assert quick._await("ctx", "login-0", "7", "job-abc") == ("COMPLETED", 0)
+
+
+def test_losing_the_link_past_the_run_timeout_fails(quick, monkeypatch):
+    import reconciler.adapter as ad
+    monkeypatch.setattr(ad, "SLINKY_RUN_TIMEOUT_S", 0)
+    monkeypatch.setattr(ad, "SLINKY_TRANSPORT_RETRIES", 1)
+    _script(monkeypatch, [_Proc(1, "", DOWN)])
+    with pytest.raises(RuntimeError, match="before the run timeout"):
+        quick._await("ctx", "login-0", "7", "job-abc")
