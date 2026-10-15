@@ -359,3 +359,26 @@ def test_teardown_refuses_to_release_over_a_live_job(quick, monkeypatch):
     _script(monkeypatch, [_Proc(0, "3\n", "")])
     with pytest.raises(RuntimeError, match="Slurm still has outpost-job-abc"):
         quick.deprovision(NodeRecord(node_id="s", name="s", index=-1, ip=""), "job-abc")
+
+
+# ── a finished job slurmctld has already forgotten ──────────────────────────
+GONE = "slurm_load_jobs error: Invalid job id specified"
+
+
+@pytest.mark.parametrize("sacct,expected", [
+    ("COMPLETED|0:0\n", ("COMPLETED", 0)),
+    ("FAILED|2:0\n", ("FAILED", 2)),
+    ("CANCELLED by 0|0:15\n", ("CANCELLED", 143)),
+])
+def test_a_forgotten_job_is_read_from_accounting(quick, monkeypatch, sacct, expected):
+    seen = _script(monkeypatch, [_Proc(1, "", GONE), _Proc(0, sacct, "")])
+    assert quick._await("ctx", "login-0", "15", "job-abc") == expected
+    assert "sacct -j 15" in seen[1]
+
+
+@pytest.mark.parametrize("sacct", [_Proc(0, "", ""), _Proc(0, "RUNNING|0:0\n", ""),
+                                   _Proc(1, "", "sacct: error: slurmdbd unreachable")])
+def test_a_forgotten_job_accounting_cannot_vouch_for_still_fails(quick, monkeypatch, sacct):
+    _script(monkeypatch, [_Proc(1, "", GONE), sacct])
+    with pytest.raises(RuntimeError, match="cannot read Slurm job 15"):
+        quick._await("ctx", "login-0", "15", "job-abc")

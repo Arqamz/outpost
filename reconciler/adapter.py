@@ -2369,6 +2369,13 @@ class SlinkyAdapter(ProviderAdapter):
                 # A job slurmctld no longer knows is answered, not an error here.
                 now = time.monotonic()
                 unreadable_since = unreadable_since or now
+                if "Invalid job id" in err:
+                    # slurmctld drops a finished job after MinJobAge; a poll that
+                    # was cut off (say, by a dead tunnel) asks accounting instead.
+                    finished = self._accounted(ctx, pod, slurm_id)
+                    if finished:
+                        self.log(f"[slinky] job {slurm_id}: {finished[0]} (from sacct)")
+                        return finished
                 if "Invalid job id" in err or now - unreadable_since >= SLINKY_CTLD_GRACE_S:
                     raise RuntimeError(f"cannot read Slurm job {slurm_id} from {pod}: "
                                        f"{err.strip()}")
@@ -2394,6 +2401,20 @@ class SlinkyAdapter(ProviderAdapter):
                 raise RuntimeError(f"Slurm job {slurm_id} did not finish within "
                                    f"{SLINKY_RUN_TIMEOUT_S:.0f}s (last state {state})")
             time.sleep(SLINKY_POLL_INTERVAL_S)
+
+    def _accounted(self, ctx: str, pod: str, slurm_id: str) -> tuple[str, int | None] | None:
+        """(state, exit code) of a finished job from slurmdbd, or None when
+        accounting has no terminal record of it."""
+        rc, out, _ = self._exec(ctx, pod, f"sacct -j {slurm_id} -X -n -P -o State,ExitCode")
+        line = out.strip().splitlines()[0] if rc == 0 and out.strip() else ""
+        if "|" not in line:
+            return None
+        state, exit_code = line.split("|", 1)
+        state = state.split()[0]
+        if state not in SLINKY_TERMINAL_STATES:
+            return None
+        _, _, code = parse_slurm_job(f"JobState={state} ExitCode={exit_code}")
+        return state, code
 
     def collect(self, nodes, job_id, spec, dest):
         """Stream the shared workdir out of the login pod as a tar, keeping
