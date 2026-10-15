@@ -174,6 +174,7 @@ port-forward.
 | `CLUSTER_SLINKY_TRANSPORT_RETRIES` | `6` | attempts for a call cut by a kubectl transport error (not a command failure) |
 | `CLUSTER_SLINKY_TRANSPORT_BACKOFF` | `5` | seconds between those attempts |
 | `CLUSTER_ECR_PROFILE` | `` | AWS profile outpost mints ECR pull tokens with (every backend). A private ECR image with this unset is refused |
+| `CLUSTER_S3_PROFILE` | `` | AWS profile outpost signs job-input downloads with (every backend; see docs/06 "Job inputs") |
 
 ## Performance: what running through Slinky costs and gains
 

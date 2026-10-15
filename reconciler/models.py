@@ -9,6 +9,7 @@ from typing import Any
 import re
 import uuid
 
+from . import inputs as inputs_mod
 from . import launch_models
 from .states import JobState, NodeState
 
@@ -82,6 +83,10 @@ class JobSpec:
     # `image` prebuilt as a SIF: {"ref": "oras://…@sha256:…", "sha256": "sha256:<file>"}.
     # Apptainer hosts download it instead of converting `image`; validated on parse.
     image_sif: dict[str, str] | None = None
+    # files outpost downloads, verifies and mounts read-only (reconciler/inputs.py)
+    inputs: list[dict[str, Any]] = field(default_factory=list)
+    # set by an adapter, never by a caller: `src:dst[:ro]` binds for the container
+    mounts: list[str] = field(default_factory=list)
     # legacy label (kept so old specs still parse)
     workload: str = ""
 
@@ -113,6 +118,7 @@ class JobSpec:
             params=d.get("params", {}) or {},
             launch=launch,
             image_sif=parse_image_sif(d.get("image_sif")),
+            inputs=inputs_mod.parse_inputs(d.get("inputs")),
             workload=d.get("workload", "") or "",
         )
 

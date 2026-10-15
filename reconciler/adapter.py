@@ -24,6 +24,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from . import inputs as inputs_mod
 from .models import NodeRecord, JobSpec, RunResult
 from .store import now_iso
 from .topology import PROBE_PATH
@@ -91,6 +92,22 @@ ECR_PROFILE = os.environ.get("CLUSTER_ECR_PROFILE", "")
 ECR_TOKEN_TTL_S = 11 * 3600
 _ECR_HOST_RE = re.compile(r"^\d{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$")
 _ecr_tokens: dict[str, tuple[float, str]] = {}
+
+
+# Where job inputs (reconciler/inputs.py) are cached, keyed by manifest digest.
+LOCAL_INPUTS_DIR = os.environ.get("CLUSTER_INPUTS_DIR", os.path.join(REPO_ROOT, ".var", "inputs"))
+REMOTE_INPUTS_DIR = os.environ.get("CLUSTER_REMOTE_INPUTS_DIR", "/tmp/outpost-inputs")
+
+
+def _staged(spec: JobSpec, root: str, run_sh, log) -> JobSpec:
+    if not spec.inputs:
+        return spec
+    return dataclasses.replace(spec, mounts=inputs_mod.stage(spec.inputs, root, run_sh, log))
+
+
+def _local_sh(job_id: str):
+    return lambda script, stdin: run_logged(["sh", "-c", script], job_id, check=False,
+                                            input=stdin)
 
 
 def registry_host(image: str) -> str:
@@ -477,6 +494,8 @@ def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
         argv += ["-v", f"{bind_src}:{bind_dst}"]
         for b in extra_binds:
             argv += ["-v", f"{b}:{b}"]
+        for m in spec.mounts:
+            argv += ["-v", m]
         for k, v in env.items():
             argv += ["-e", f"{k}={v}"]
         return argv + [spec.image] + list(spec.command)
@@ -485,7 +504,7 @@ def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
     if spec.gpu:
         argv += ["--nv"]                       # bind host NVIDIA driver/devices into the container
     argv += ["--bind", f"{bind_src}:{bind_dst}"]
-    for b in extra_binds:
+    for b in [*extra_binds, *spec.mounts]:
         argv += ["--bind", b]
     for k, v in env.items():
         argv += ["--env", f"{k}={v}"]
@@ -709,6 +728,7 @@ class LocalHostAdapter(ProviderAdapter):
         os.makedirs(workdir, exist_ok=True)
         if spec.is_dry_run:
             return RunResult(job_id, node.name, None, workdir, note="no image -> dry-run")
+        spec = _staged(spec, LOCAL_INPUTS_DIR, _local_sh(job_id), self.log)
         if spec.launcher == "mpi" and len(nodes) > 1:
             return self._run_mpi(nodes, job_id, spec)
         if plan is not None:
@@ -849,7 +869,12 @@ class LocalHostAdapter(ProviderAdapter):
         host_argv = container_argv(dataclasses.replace(rank_spec, gpu=True),
                                    workdir, spec.output_dir, extra_binds=gpu_binds)
         # VM ranks: no GPU on the guest -> plain launch (no --nv, no host binds).
-        vm_argv = container_argv(dataclasses.replace(rank_spec, gpu=False),
+        # Their inputs are staged on each VM, under the remote cache root.
+        vm_mounts = []
+        for n in nodes[1:]:
+            vm_mounts = _staged(spec, REMOTE_INPUTS_DIR, lambda s, i, n=n: run_logged(
+                ssh_base(n.ip) + [s], job_id, check=False, input=i), self.log).mounts
+        vm_argv = container_argv(dataclasses.replace(rank_spec, gpu=False, mounts=vm_mounts),
                                  workdir, spec.output_dir)
         # mpi_ip, not ip — the appfile line is what a PEER rank connects to,
         # not the orchestrator's ssh target (see NodeRecord.mpi_ip).
@@ -1002,6 +1027,10 @@ class LibvirtAdapter(ProviderAdapter):
         remote_workdir = f"/tmp/cluster/{job_id}"
         if spec.is_dry_run:
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
+        for n in nodes:
+            staged = _staged(spec, REMOTE_INPUTS_DIR, lambda s, i, n=n: run_logged(
+                self._ssh_base(n) + [s], job_id, check=False, input=i), self.log)
+        spec = staged
         # A resolved plan always takes the planned path, regardless of node
         # count or launcher: intra-node multi-rank placement (e.g. one_per_rank
         # across every GPU on one 8-GPU box, launcher: mpi) has exactly one
@@ -1696,6 +1725,9 @@ class KubernetesAdapter(ProviderAdapter):
         os.makedirs(workdir, exist_ok=True)
         if spec.is_dry_run:
             return RunResult(job_id, slot.name, None, workdir, note="no image -> dry-run")
+        if spec.inputs:
+            raise RuntimeError("backend k8s cannot stage job inputs yet — run this job on an "
+                               "apptainer host or a slinky cluster")
         n = max(1, spec.node_count)                    # node_count == gang size here
         ns = self._namespace(job_id)
         mode = self._gpu_mode(spec)
@@ -2010,7 +2042,7 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
     if spec.launcher == "mpi":
         srun.append(f"--mpi={mpi}")
     srun += [f"--container-image={image}",
-             f"--container-mounts={workdir}:{spec.output_dir}",
+             f"--container-mounts=" + ",".join([f"{workdir}:{spec.output_dir}", *spec.mounts]),
              "--no-container-mount-home",
              f"--container-workdir={spec.output_dir}"]
     lines.append(" ".join(shlex.quote(a) for a in srun + list(spec.command)))
@@ -2303,6 +2335,8 @@ class SlinkyAdapter(ProviderAdapter):
         pod = self._login_pod(ctx)
         workdir = self._workdir(job_id)
         image = self._stage_image(ctx, pod, spec.image, job_id)
+        spec = _staged(spec, f"{SLINKY_WORKDIR_ROOT}/.inputs",
+                       lambda s, i: self._exec(ctx, pod, s, job_id, input=i)[0], self.log)
         nodelist, gpus = self._slurm_nodes(nodes)
         script = render_sbatch(job_id, spec, workdir, image, SLINKY_PARTITION, SLINKY_MPI,
                                nodelist, gpus)
