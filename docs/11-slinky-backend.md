@@ -188,6 +188,8 @@ same instance type, same parameters).
 | HPL-MxP, `n=36864` | 13,406 GFLOPS (var 1.6%) | 14,620 GFLOPS | **−8.3%**, reproducible; cause not isolated (below) |
 | nccl-tests all_reduce, 2 nodes | 0.80 GB/s avg busbw (run 1) | none on g5.xlarge | 1 GiB: 0.88 GB/s on burst, **0.31 GB/s (2.5 Gbit/s) once burst credits run out** |
 | Qwen2.5-0.5B full SFT fp16, 1 GPU (2026-10-15) | 5,577 tok/s (var 0.03%), micro-batch 9, 98.7% GPU util, 244.7 W | none comparable | the staging A10G Qwen records are benchmark 1.1.0/1.2.0 (pre step-timer fix, micro-batch 1), so no like-for-like baseline exists yet; no resource signature, because the worker runs no `nv-hostengine` (DCGM) |
+| Qwen2.5-0.5B full SFT fp16, 2 nodes x 1 GPU | 7,433 tok/s (var 0.07%) | 5,577 tok/s on 1 node (same run, same image) | 1.33x, **66.7% parallel efficiency** (GTL, weak scaling): the full-parameter all-reduce on g5.xlarge's 2.5 Gbit/s sustained link; ranks from SLURM_PROCID, rendezvous at the rank-0 node name |
+| Qwen2.5-0.5B Instruct / 3B LoRA Base / 3B LoRA Instruct, 1 GPU | 5,622 / 1,505 / 1,517 tok/s (var 0.02 / 0.03 / 0.02%) | none comparable | all reproducible |
 
 Fixed overhead per job, from the reconciler's audit timestamps:
 
