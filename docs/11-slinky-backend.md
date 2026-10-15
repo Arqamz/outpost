@@ -187,6 +187,7 @@ same instance type, same parameters).
 | STREAM Triad | 523.5 GB/s (var 0.65%) | 523.4 GB/s | no loss: GPU-bound kernels are unaffected |
 | HPL-MxP, `n=36864` | 13,406 GFLOPS (var 1.6%) | 14,620 GFLOPS | **−8.3%**, reproducible; cause not isolated (below) |
 | nccl-tests all_reduce, 2 nodes | 0.80 GB/s avg busbw (run 1) | none on g5.xlarge | 1 GiB: 0.88 GB/s on burst, **0.31 GB/s (2.5 Gbit/s) once burst credits run out** |
+| Qwen2.5-0.5B full SFT fp16, 1 GPU (2026-10-15) | 5,577 tok/s (var 0.03%), micro-batch 9, 98.7% GPU util, 244.7 W | none comparable | the staging A10G Qwen records are benchmark 1.1.0/1.2.0 (pre step-timer fix, micro-batch 1), so no like-for-like baseline exists yet; no resource signature, because the worker runs no `nv-hostengine` (DCGM) |
 
 Fixed overhead per job, from the reconciler's audit timestamps:
 
@@ -198,6 +199,8 @@ Fixed overhead per job, from the reconciler's audit timestamps:
 - collect ~3–4 s, teardown ~6 s;
 - once per cluster: the `enroot import` of each image (minutes; parallel jobs
   wait on its lock).
+- once per cluster: staging a job input (the 3.8 GB Qwen 0.5B subset of 53 files took
+  about 90 s from S3 into `/scratch`); a warm cache is one `test -f`.
 
 Where Slinky is better than the bare-metal path:
 
