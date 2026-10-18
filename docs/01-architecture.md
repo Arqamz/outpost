@@ -21,10 +21,10 @@ are scheduled — is private implementation, free to change.
 > interface — one possible caller among any number of others, not a
 > privileged one.
 
-Apptainer on libvirt VMs (plus the host itself for GPU work) is the only
-execution backend today. KinD, Slinky/Slurm, and distributing jobs across
-multiple nodes are planned for later — see "the key invariant" below for how
-another backend slots in without touching the reconciler.
+Apptainer on libvirt VMs (plus the host itself for GPU work) is the primary
+execution backend; Kubernetes (doc 8) and Slinky/Slurm (doc 11) are optional
+backends — see "the key invariant" below for how a backend slots in without
+touching the reconciler.
 
 ## Three layers
 
@@ -59,6 +59,6 @@ JobSpec** (`launcher: single | mpi` included), not from swappable executors.
 
 The **reconciler never knows which adapter it is driving**. It calls
 `adapter.provision / bootstrap / run / collect / deprovision`; the adapter is
-chosen per node by a single flag (`node.local`). Add another backend later —
+chosen per node by its provider (`NodeRecord.adapter_key`). Add another backend —
 real cloud VMs, KinD, Slinky, whatever — by adding a class implementing the
 same five methods. Nothing in the state machine changes.

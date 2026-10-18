@@ -21,7 +21,9 @@ JobSpec in, same drop-zone out — in one of two GPU modes
 a gang of N pods sharing the one GPU via **KAI + HAMi** (HAMi-capped VRAM per
 rank); **dedicated** (a real multi-node cluster) gives every rank its own
 whole GPU via a plain `nvidia.com/gpu` request, no KAI/HAMi involved. Off by
-default; see `docs/08-kubernetes-backend.md`. Slinky/Slurm is still planned.
+default; see `docs/08-kubernetes-backend.md`. A third, `backend: slinky`, runs a
+job as a Slurm batch job on a Slinky (Slurm-on-Kubernetes) cluster through its
+login pod (pyxis/enroot, shared workdir); see `docs/11-slinky-backend.md`.
 
 Runs on any Linux host with libvirt/KVM (`/dev/kvm`, nested/hardware
 virtualization enabled) and, optionally, an NVIDIA GPU + driver for GPU jobs
@@ -73,7 +75,7 @@ reconciler/                 the control plane (Python package)
   reconciler.py             the driver: submit, concurrent tick, phases, wait/timeout, failure
   cli.py                    cluster commands (incl. logs / reconciler-log)
 demo/                       mpi_demo.c/.def/.sif, run-mpi-demo.sh (bare), run-scheduling-demo.sh
-viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer + k8s gangs panel
+viz/                        dashboard.py + cluster.html — node stats + job queue + log viewer + k8s gangs + Slinky panels
 docs/                       01-architecture … 07-ubuntu-setup, 08-kubernetes-backend,
                             09-multi-machine-cluster (one control plane, many fabrics)
 bin/cluster             CLI launcher (python -m reconciler)

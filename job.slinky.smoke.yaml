@@ -1,0 +1,9 @@
+# Smoke test for the Slinky backend: one GPU, one Slurm node, writes a file to
+# output_dir. Needs a slot from `cluster add-slinky` (see docs/11).
+name: slinky-gpu-smoke
+image: docker://ubuntu:24.04
+command: ["bash", "-c", "nvidia-smi -L && hostname > /out/hostname.txt && echo ok > /out/result.txt"]
+backend: slinky
+node_count: 1
+gpu: true
+output_dir: /out

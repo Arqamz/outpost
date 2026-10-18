@@ -27,6 +27,8 @@ is intentionally generic — the cluster runs *any* container:
 | `output_dir` | str | in-container path the job writes results to (bound to the host) |
 | `params` | map | opaque passthrough (ignored by the cluster) |
 | `launch` | map, optional | a semantic placement request (`launch-intent/v1`, see [`contract/README.md`](../contract/README.md)) — resolved against real topology for `launcher: mpi` jobs (any `node_count`) or `launcher: single` at `node_count: 1`; see "Placement" below. Absent = today's behavior, unchanged. |
+| `image_sif` | map, optional | `image` prebuilt as a SIF and published next to it: `{ref: oras://<registry>/<repo>@sha256:…, sha256: sha256:<file>}`. Apptainer nodes download it instead of converting `image`, and refuse it unless its sha256 matches. Malformed = the job is refused. |
+| `inputs` | list, optional | files the job reads, staged by the cluster: `[{source: s3://<bucket>/<prefix>/, manifest: <file of "<sha256>  <path>" lines>, manifest_sha256: sha256:…, path: <container path>, only: [<path prefixes>]}]`. See "Job inputs" below. Malformed = the job is refused. |
 
 **The cluster promises:** given a JobSpec, it schedules the right resource
 (waiting for capacity to free up if needed, not failing immediately — see
@@ -137,3 +139,25 @@ Adapters, the apptainer command line, the libvirt scripts, the state-machine
 internals, dry-run vs execute. Those are implementation. Anything driving
 this cluster should depend only on: **the JobSpec schema, the drop-zone
 layout, and the three collections above.**
+
+**Private registry images.** Nodes hold no registry credentials. For an image in a private ECR
+registry outpost mints a pull token on the control plane (`aws ecr get-login-password` with the
+profile in `CLUSTER_ECR_PROFILE`, reused for 11 h) and hands it to the node only for the pull,
+over stdin: as apptainer's docker credentials on a host, and as an enroot credentials file in a
+temporary directory in the Slinky login pod. The token never appears in argv or a replay log. An
+ECR image with no profile set refuses the job, naming the setting.
+
+**Job inputs.** A job can declare the files it reads instead of relying on a prepared node. For
+each input the control plane fetches the manifest from S3 and refuses the job unless its sha256 is
+`manifest_sha256`, then signs a one-hour URL for the manifest and every file under `only` (all
+files when `only` is empty), using the AWS profile in `CLUSTER_S3_PROFILE`. The target downloads
+each file, keeps it only if its sha256 matches the manifest, and caches it under the manifest
+digest; the container sees the cache read-only at `path`. A complete subset leaves a marker, so a
+warm cache costs one `test -f` and no network. The URLs travel over stdin.
+
+| Backend | Cache | Staged |
+|---|---|---|
+| local host | `$CLUSTER_INPUTS_DIR` (`.var/inputs`) | once per host |
+| libvirt / static-ssh | `$CLUSTER_REMOTE_INPUTS_DIR` (`/tmp/outpost-inputs`) | on every claimed node |
+| slinky | `$CLUSTER_SLINKY_WORKDIR_ROOT/.inputs` (shared filesystem) | once per cluster, from the login pod |
+| k8s | — | refused: not supported yet |

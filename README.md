@@ -13,8 +13,9 @@ can be the caller: a shell script, a CI pipeline, a bigger scheduler you build
 later, or just you poking at the CLI. Nothing here assumes or waits on one
 specific consumer.
 
-Apptainer on VMs is the only backend today. Slurm/Slinky, KinD, and
-distributing jobs across multiple nodes are planned for later.
+Apptainer on VMs is the primary backend. Kubernetes ([doc 8](docs/08-kubernetes-backend.md))
+and Slinky/Slurm ([doc 11](docs/11-slinky-backend.md)) are optional backends behind
+the same JobSpec.
 
 **📚 Full walkthrough: [`docs/`](docs/README.md).** Command reference:
 [`CLAUDE.md`](CLAUDE.md).

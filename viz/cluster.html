@@ -87,6 +87,24 @@
   .ph-Succeeded .pdot{background:var(--ok)}
   .ph-Pending .pdot{background:var(--warn)}
   .ph-Failed .pdot{background:var(--hot)}
+
+  /* Slinky cards */
+  .slcard{margin-bottom:14px}
+  .slcard .gmeta{margin:10px 0 4px}
+  .slgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:14px}
+  table.sltable{width:100%;border-collapse:collapse;font-size:11.5px}
+  table.sltable th{text-align:left;color:var(--dim);font-weight:600;padding:4px 8px;border-bottom:1px solid var(--line)}
+  table.sltable td{padding:4px 8px;border-bottom:1px solid #1a212c;vertical-align:top}
+  table.sltable .cap,.slcard .cap{color:var(--dim);font-size:11px}
+  .kvs{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+  .kv{font-size:11px;padding:2px 8px;border-radius:6px;background:#0e141c;border:1px solid #1f2937}
+  .kv b{color:var(--dim);font-weight:600}
+  .kv.bad,td.bad{color:var(--hot)}
+  .warn{color:var(--warn);font-size:11px}
+  .sdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:middle}
+  .sdot.ph-Running{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .sdot.ph-Succeeded{background:var(--ok)} .sdot.ph-Pending{background:var(--warn)} .sdot.ph-Failed{background:var(--hot)}
+  table.sltable td{white-space:nowrap}
 </style>
 </head>
 <body>
@@ -103,6 +121,13 @@
       <span class="sub" style="margin-left:8px">gangs sharing the one GPU (HAMi VRAM-capped per rank)</span>
     </h2>
     <div class="grid" id="gangs"></div>
+  </div>
+
+  <div class="section" id="slinkysection" style="display:none">
+    <h2>Slinky · Slurm on Kubernetes <span class="badge" id="slinkycount">0</span>
+      <span class="sub" style="margin-left:8px">outpost slots → Slurm nodes + queue, via the login pod</span>
+    </h2>
+    <div id="slinky"></div>
   </div>
 
   <div class="section">
@@ -213,6 +238,96 @@ async function renderK8s(){
   }catch(e){ /* leave last render; k8s panel is best-effort */ }
 }
 
+// ── Slinky clusters ─────────────────────────────────────────────────────────
+const SLURM_PHASE = s => /^(ALLOC|MIX)/i.test(s) ? "Running" : /^IDLE/i.test(s) ? "Succeeded" :
+                         /(DOWN|DRAIN|FAIL|UNK|NOT_RESP)/i.test(s) ? "Failed" : "Pending";
+const JOB_PHASE = s => /^RUNNING/.test(s) ? "Running" : /^PENDING/.test(s) ? "Pending" :
+                       /^COMPLETED/.test(s) ? "Succeeded" : "Failed";
+const dot = ph => `<span class="sdot ph-${ph}"></span>`;
+const gib = mb => mb == null ? "—" : (mb / 1024).toFixed(1);
+const ago = t => { if(!t) return "—"; const s = Math.max(0, Date.now()/1000 - t);
+  return s < 90 ? `${s|0}s` : s < 5400 ? `${(s/60)|0}m` : `${(s/3600).toFixed(1)}h`; };
+const dur = s => s == null ? "—" : s < 90 ? `${s|0}s` : s < 5400 ? `${(s/60).toFixed(1)}m` : `${(s/3600).toFixed(1)}h`;
+const outp = o => { if(!o) return ""; const [id, name] = o.split("|");
+  return `<span class="mono">${shortId(id)}</span> <span class="cap">${esc(name)}</span>`; };
+const tbl = (head, rows, empty) => `<table class="sltable"><thead><tr>${head.map(h=>`<th>${h}</th>`).join("")}</tr></thead>
+  <tbody>${rows.length ? rows.join("") : `<tr><td colspan="${head.length}" class="cap">${empty}</td></tr>`}</tbody></table>`;
+const kv = (k, v, cls="") => `<span class="kv ${cls}"><b>${esc(k)}</b> ${esc(String(v ?? "—"))}</span>`;
+
+function slinkyCard(c){
+  const ctl = c.controller || {};
+  const ctlPod = (c.pods||[]).find(p => p.name.startsWith("slurm-controller"));
+  const workerNodes = new Set((c.nodes||[]).map(n => n.k8s_node));
+  const ctlOnWorker = ctlPod && workerNodes.has(ctlPod.node);
+  const conf = c.config || {}, d = c.diag || {};
+  const noTask = /null/.test(conf.TaskPlugin || "");
+  const head = `<h3>${esc(c.context)} ${c.gpu?'<span class="badge gpu">gpu</span>':''}
+      <span class="badge ${ctl.up?'state-promoted':'state-failed'}">slurmctld ${ctl.up?'UP':'DOWN'}</span>
+      <span class="cap">Slurm ${esc(c.version||"?")}</span></h3>
+    <div class="gmeta">controller ${esc(ctl.host||"?")}${ctl.latency_us?` · ping ${(ctl.latency_us/1000).toFixed(1)}ms`:""}
+      ${ctlPod?` · pod on <span class="mono">${esc(ctlPod.node)}</span> · ${ctlPod.restarts} restart(s)`:""}
+      ${ctlOnWorker?` <span class="warn">⚠ shares a GPU worker with jobs</span>`:""}
+      · login <span class="mono">${esc(c.login_pod||"—")}</span>
+      ${(c.partitions||[]).map(p=>` · partition <b>${esc(p.name)}</b>${p.default?"*":""} ${esc(p.state)} ${p.cpus} cpus, max ${p.max_time==="inf"?"∞":p.max_time}`).join("")}
+      ${ctl.up ? "" : `<div class="err">${esc(ctl.status||"")}</div>`}</div>`;
+  const err = c.reachable ? "" : `<div class="err">unreachable: ${esc(c.error)}</div>`;
+  const stats = `<div class="kvs">
+      ${kv("submitted", d.jobs_submitted)}${kv("started", d.jobs_started)}${kv("completed", d.jobs_completed)}
+      ${kv("failed", d.jobs_failed, d.jobs_failed?"bad":"")}${kv("canceled", d.jobs_canceled)}
+      ${kv("running", d.jobs_running)}${kv("pending", d.jobs_pending)}
+      ${kv("sched cycle", d.schedule_cycle_mean!=null?`${d.schedule_cycle_mean}µs mean / ${d.schedule_cycle_max}µs max`:null)}
+      ${kv("ctld up", d.req_time_start?ago(d.req_time_start):null)}</div>
+    <div class="kvs">
+      ${kv("select", `${conf.SelectType||"?"} ${conf.SelectTypeParameters||""}`)}
+      ${kv("task", conf.TaskPlugin, noTask?"bad":"")}${kv("proctrack", conf.ProctrackType)}
+      ${kv("cgroup", conf.CgroupPlugin)}${kv("mpi default", conf.MpiDefault)}${kv("gres", conf.GresTypes)}
+      ${kv("acct gather", conf.JobAcctGatherType)}${kv("sched", conf.SchedulerType)}
+      ${noTask?`<span class="warn">no task plugin: no CPU binding, no memory/GPU confinement per job</span>`:""}</div>`;
+  const slots = tbl(["slot","Slurm node","GPUs","state","held by"], (c.slots||[]).map(s =>
+    `<tr><td class="mono">${esc(s.name)}</td><td class="mono">${esc(s.slurm_node||"(cluster-wide)")}</td>
+     <td>${s.gpu_count||"—"}</td><td>${dot(s.owner_job?"Running":"Succeeded")} ${esc(s.state)}</td>
+     <td>${s.owner_job?`<span class="mono">${shortId(s.owner_job)}</span> <span class="cap">${esc(s.owner_name)}</span>`:""}</td></tr>`), "no slots");
+  const nodes = tbl(["node","state","CPUs alloc/total","load","mem alloc · free / total GiB","GPUs (used)","pod → k8s node","slurmd up","reason"],
+    (c.nodes||[]).map(n => `<tr><td class="mono">${esc(n.name)}<div class="cap">${esc(n.address||"")} · ${n.sockets}s×${n.cores}c×${n.threads}t</div></td>
+     <td>${dot(SLURM_PHASE(n.state))} ${esc(n.state)}</td><td>${n.alloc_cpus}/${n.cpus}</td><td>${n.cpu_load.toFixed(2)}</td>
+     <td>${gib(n.alloc_memory_mb)} · ${gib(n.free_memory_mb)} / ${gib(n.real_memory_mb)}</td>
+     <td class="mono">${esc(n.gres)}<div class="cap">${esc(n.gres_used)}</div></td>
+     <td class="mono">${esc(n.pod)}<div class="cap">${esc(n.k8s_node)}</div></td>
+     <td>${ago(n.slurmd_start)}</td><td class="cap">${esc(n.reason)}</td></tr>`), "no Slurm nodes");
+  const now = Date.now()/1000;
+  const queue = tbl(["id","outpost job","state","nodes","CPUs","TRES","per node","elapsed","limit"],
+    (c.queue||[]).map(q => `<tr><td class="mono">${q.id}</td><td>${outp(q.outpost) || esc(q.name)}</td>
+     <td>${dot(JOB_PHASE(q.state))} ${esc(q.state)}${q.state==="PENDING"?` <span class="cap">${esc(q.reason)}</span>`:""}</td>
+     <td class="mono">${q.node_count} · ${esc(q.nodes)}</td><td>${q.cpus??"—"}</td><td class="mono cap">${esc(q.tres)}</td>
+     <td class="mono">${esc(q.tres_per_node)}</td><td>${q.start&&q.start<=now?dur(now-q.start):"—"}</td>
+     <td>${q.time_limit==="inf"?"∞":q.time_limit??"—"}</td></tr>`), "queue empty");
+  const hist = tbl(["id","outpost job","state","elapsed","nodes","exit","TRES"],
+    (c.history||[]).map(h => `<tr><td class="mono">${h.id}</td><td>${outp(h.outpost) || esc(h.name)}</td>
+     <td>${dot(JOB_PHASE(h.state))} ${esc(h.state)}</td><td>${dur(h.elapsed_s)}</td><td class="mono">${esc(h.nodes)}</td>
+     <td>${h.exit??"—"}${h.signal?` <span class="cap">${esc(h.signal)}</span>`:""}</td><td class="mono cap">${esc(h.tres)}</td></tr>`), "no recent jobs");
+  const pods = tbl(["pod","phase","ready","restarts","k8s node"],
+    (c.pods||[]).map(p => `<tr><td class="mono">${esc(p.name)}</td><td>${dot(p.phase==="Running"?"Running":p.phase==="Succeeded"?"Succeeded":"Failed")} ${esc(p.phase)}</td>
+     <td>${p.ready}</td><td class="${p.restarts?"bad":""}">${p.restarts}</td><td class="mono">${esc(p.node)}</td></tr>`), "no pods");
+  return `<div class="gang slcard ${c.gpu?'gpu-edge':''}">${head}${err}${stats}
+    <div class="slgrid"><div><div class="gmeta">outpost slots</div>${slots}</div>
+      <div><div class="gmeta">Kubernetes pods (namespace slurm)</div>${pods}</div></div>
+    <div class="gmeta">Slurm nodes</div>${nodes}
+    <div class="gmeta">queue</div>${queue}
+    <div class="gmeta">history (sacct, newest first)</div>${hist}
+  </div>`;
+}
+
+async function renderSlinky(){
+  try{
+    const d = await (await fetch("/api/slinky.json",{cache:"no-store"})).json();
+    const sec = document.getElementById("slinkysection");
+    if(!d.enabled){ sec.style.display = "none"; return; }
+    sec.style.display = "block";
+    document.getElementById("slinkycount").textContent = d.clusters.length;
+    document.getElementById("slinky").innerHTML = d.clusters.map(slinkyCard).join("");
+  }catch(e){ /* best-effort, like the k8s panel */ }
+}
+
 // ── job queue + log viewer ─────────────────────────────────────────────────
 let selectedJob = null;
 
@@ -240,7 +355,8 @@ function esc(s){ return (s??"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",
 
 function jobRow(j){
   const got = j.assigned_nodes ? j.assigned_nodes.length : 0;
-  const nodes = `${got}/${j.node_count}`;
+  const nodes = j.backend_slot ? `<span title="slot ${esc(j.backend_slot)}">${j.node_count} · ${esc(j.backend_slot.split("-")[0])}</span>`
+                               : `${got}/${j.node_count}`;
   const err = j.error ? `<div class="err">${esc(j.error)}</div>` : "";
   const explain = esc(STATE_EXPLAIN[j.state] || "");
   return `<tr data-job="${j.job_id}" class="${selectedJob===j.job_id?'sel':''}">
@@ -306,10 +422,11 @@ document.getElementById("clearJobs").onclick = async () => {
   renderJobs();
 };
 
-tick(); renderJobs(); renderK8s();
+tick(); renderJobs(); renderK8s(); renderSlinky();
 setInterval(tick, 2000);
 setInterval(renderJobs, 2000);
 setInterval(renderK8s, 2000);
+setInterval(renderSlinky, 5000);
 setInterval(() => { if(selectedJob === "__reconciler__") loadLog("__reconciler__", document.getElementById("logtitle").textContent); }, 2000);
 </script>
 </body>

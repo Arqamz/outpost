@@ -7,9 +7,9 @@ drop-zone out — so anything can drive it, not just a single blessed caller.
 
 Two execution backends exist: **apptainer** (on libvirt VMs, the host GPU, or
 static-ssh workers — including remote GPU boxes) and **Kubernetes + KAI/HAMi**
-(GPU sliced into a gang of pods). One control plane can span multiple machines
-and both backends at once (see doc 9). Slinky/Slurm is still planned — the
-reconciler/adapter split means adding one won't touch the JobSpec contract.
+(GPU sliced into a gang of pods), plus **Slinky** (a Slurm batch job on a
+Slurm-on-Kubernetes cluster, doc 11). One control plane can span multiple
+machines and backends at once (see doc 9).
 
 Read in order:
 
@@ -25,6 +25,7 @@ Read in order:
 | 8 | [08-kubernetes-backend.md](08-kubernetes-backend.md) | the Kubernetes backend (HAMi + KAI): `backend: k8s` runs a job as a gang of N pods sharing one GPU, VRAM-capped per rank, with pod-DNS rendezvous — design, honest limits, quick start |
 | 9 | [09-multi-machine-cluster.md](09-multi-machine-cluster.md) | one control plane across two machines + all fabrics: VM control plane, the PC joined as a static-ssh GPU worker AND its own k8s cluster, per-cluster slot targeting |
 | 10 | [10-ssh-gateway.md](10-ssh-gateway.md) | `ssh tashkil` — a forced-command front door that puts the open interface (JobSpec in over stdin, artifacts out over a stdout tar) behind one ssh alias, job-portal only (no admin), with a client wrapper |
+| 11 | [11-slinky-backend.md](11-slinky-backend.md) | the Slinky backend: `backend: slinky` (or a node_name pin on a slinky slot) runs a job as a Slurm batch job through a login pod — pyxis/enroot images, shared-filesystem workdir, slots, settings, what is and is not verified |
 
 Quickstart lives in the top-level [../README.md](../README.md); day-to-day
 command reference lives in [../CLAUDE.md](../CLAUDE.md).

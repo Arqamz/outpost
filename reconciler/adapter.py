@@ -4,9 +4,9 @@ There is deliberately no separate "executor" abstraction: running a container
 is just what an adapter does once it owns a node. Which adapter is used is
 decided by the node itself — a `local` node (the control-plane host,
 GPU-capable) uses LocalHostAdapter (apptainer --nv, run in-process); any other
-node uses LibvirtAdapter (ssh + apptainer into the VM). NullAdapter is the
-dry-run no-op. A future backend (real cloud VMs, KinD, Slinky, whatever) just
-implements the same five methods.
+node uses LibvirtAdapter (ssh + apptainer into the VM); a backend slot uses
+its cluster's adapter (KubernetesAdapter, SlinkyAdapter). NullAdapter is the
+dry-run no-op. Another backend just implements the same five methods.
 """
 from __future__ import annotations
 import dataclasses
@@ -24,6 +24,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from . import inputs as inputs_mod
 from .models import NodeRecord, JobSpec, RunResult
 from .store import now_iso
 from .topology import PROBE_PATH
@@ -83,6 +84,60 @@ REMOTE_PULL_HEADROOM_MARGIN_BYTES = 2 * 1024 ** 3
 # routinely tighter than this.
 REMOTE_PULL_FLOOR_BYTES = int(os.environ.get(
     "CLUSTER_REMOTE_PULL_FLOOR_BYTES", str(60 * 1024 ** 3)))
+
+# Nodes hold no registry credentials. For a private ECR image the control plane
+# mints a token with this AWS profile and hands it to the node only for the
+# pull, over stdin. ECR tokens last 12 h; a cached one is reused for 11.
+ECR_PROFILE = os.environ.get("CLUSTER_ECR_PROFILE", "")
+ECR_TOKEN_TTL_S = 11 * 3600
+_ECR_HOST_RE = re.compile(r"^\d{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$")
+_ecr_tokens: dict[str, tuple[float, str]] = {}
+
+
+# Where job inputs (reconciler/inputs.py) are cached, keyed by manifest digest.
+LOCAL_INPUTS_DIR = os.environ.get("CLUSTER_INPUTS_DIR", os.path.join(REPO_ROOT, ".var", "inputs"))
+REMOTE_INPUTS_DIR = os.environ.get("CLUSTER_REMOTE_INPUTS_DIR", "/tmp/outpost-inputs")
+
+
+def _staged(spec: JobSpec, root: str, run_sh, log) -> JobSpec:
+    if not spec.inputs:
+        return spec
+    return dataclasses.replace(spec, mounts=inputs_mod.stage(spec.inputs, root, run_sh, log))
+
+
+def _local_sh(job_id: str):
+    return lambda script, stdin: run_logged(["sh", "-c", script], job_id, check=False,
+                                            input=stdin)
+
+
+def registry_host(image: str) -> str:
+    ref = image.split("://", 1)[-1]
+    head, slash, _ = ref.partition("/")
+    return head if slash and ("." in head or ":" in head or head == "localhost") else ""
+
+
+def registry_login(image: str) -> tuple[str, str] | None:
+    """(user, password) for pulling `image`, or None when its registry needs none."""
+    host = registry_host(image)
+    m = _ECR_HOST_RE.match(host)
+    if not m:
+        return None
+    if not ECR_PROFILE:
+        raise RuntimeError(
+            f"{image} is in a private ECR registry ({host}) and outpost has no credentials "
+            "for it — set CLUSTER_ECR_PROFILE to an AWS profile that can pull from it")
+    cached = _ecr_tokens.get(host)
+    if cached and time.monotonic() - cached[0] < ECR_TOKEN_TTL_S:
+        return "AWS", cached[1]
+    out = subprocess.run(["aws", "--profile", ECR_PROFILE, "--region", m.group(1),
+                          "ecr", "get-login-password"], capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(
+            f"could not mint an ECR token for {host} with profile {ECR_PROFILE!r}: "
+            f"{out.stderr.strip()[-300:]} — refresh that profile's credentials "
+            "(e.g. `aws sso login`)")
+    _ecr_tokens[host] = (time.monotonic(), out.stdout.strip())
+    return "AWS", _ecr_tokens[host][1]
 
 # SSH params for reaching VMs (match infra/libvirt/config.env defaults).
 SSH_USER = os.environ.get("CLUSTER_SSH_USER", "cluster")
@@ -158,6 +213,61 @@ K8S_DEFAULT_ENV = {"NCCL_P2P_DISABLE": "1"}
 K8S_FATAL_WAIT_REASONS = {"ImagePullBackOff", "ErrImagePull", "InvalidImageName",
                           "CreateContainerConfigError", "CreateContainerError"}
 
+# ── Slinky (Slurm on Kubernetes) backend params ─────────────────────────────
+# Outpost reaches a Slinky cluster only through `kubectl exec` into one of its
+# login pods (sbatch/squeue/sacct/scancel). It needs no network path to
+# slurmctld or slurmrestd. Job workdirs live on a filesystem that the login pod
+# and every slurmd pod mount at the same path. Defaults match the tashkil
+# platform's install (namespace `slurm`, LoginSet `main`, /scratch).
+SLINKY_NAMESPACE = os.environ.get("CLUSTER_SLINKY_NAMESPACE", "slurm")
+SLINKY_LOGIN_SELECTOR = os.environ.get("CLUSTER_SLINKY_LOGIN_SELECTOR",
+                                       "app.kubernetes.io/name=login")
+SLINKY_LOGIN_CONTAINER = os.environ.get("CLUSTER_SLINKY_LOGIN_CONTAINER", "login")
+SLINKY_WORKDIR_ROOT = os.environ.get("CLUSTER_SLINKY_WORKDIR_ROOT", "/scratch/outpost")
+# Where enroot unpacks layers while building a squashfs. It needs a filesystem
+# that takes overlay whiteouts AND can back an overlay mount, which rules out
+# all three a login pod has by default (seen on FSx, 2026-10-14): Lustre fails
+# the overlay mount, the container's own overlay root refuses whiteout device
+# nodes, and /tmp is a RAM tmpfs too small for an NGC image. So by default the
+# temp dir is a sparse ext4 image on the shared filesystem, loop-mounted in the
+# (privileged) login pod. Set CLUSTER_SLINKY_ENROOT_TEMP_IMAGE="" when the
+# temp dir is already a suitable local volume.
+SLINKY_ENROOT_TEMP = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP", "/var/tmp/outpost-enroot")
+SLINKY_ENROOT_TEMP_IMAGE = os.environ.get(
+    "CLUSTER_SLINKY_ENROOT_TEMP_IMAGE", f"{SLINKY_WORKDIR_ROOT}/.images/enroot-temp.ext4")
+SLINKY_ENROOT_TEMP_SIZE = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP_SIZE", "64G")
+SLINKY_PARTITION = os.environ.get("CLUSTER_SLINKY_PARTITION", "")   # "" = the cluster's default
+SLINKY_MPI = os.environ.get("CLUSTER_SLINKY_MPI", "pmix")           # srun --mpi for launcher: mpi
+SLINKY_RUN_TIMEOUT_S = float(os.environ.get("CLUSTER_SLINKY_RUN_TIMEOUT", "3600"))
+SLINKY_POLL_INTERVAL_S = float(os.environ.get("CLUSTER_SLINKY_POLL_INTERVAL", "10"))
+SLINKY_KEEP_WORKDIR = os.environ.get("CLUSTER_SLINKY_KEEP_WORKDIR", "0") == "1"
+# How long slurmctld may be unreachable before a phase gives up. The controller
+# can restart (seen 2026-10-14: its node went NotReady under a job's memory
+# pressure) while slurmd keeps running the job.
+SLINKY_CTLD_GRACE_S = float(os.environ.get("CLUSTER_SLINKY_CTLD_GRACE", "600"))
+SLINKY_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
+                          "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
+# kubectl-side failures that say nothing about the command being run, so a
+# safe-to-repeat call is retried (CLUSTER_SLINKY_TRANSPORT_RETRIES attempts).
+KUBECTL_TRANSPORT_ERRORS = ("unexpected EOF", "lost connection", "connection refused", "was refused",
+                            "connection reset by peer", "Unable to connect to the server",
+                            "i/o timeout", "TLS handshake timeout", "error dialing backend",
+                            "http2: client connection lost", "use of closed network connection")
+SLINKY_TRANSPORT_RETRIES = int(os.environ.get("CLUSTER_SLINKY_TRANSPORT_RETRIES", "6"))
+SLINKY_TRANSPORT_BACKOFF_S = float(os.environ.get("CLUSTER_SLINKY_TRANSPORT_BACKOFF", "5"))
+# enroot's nvidia hook injects the driver only when the container environment
+# names the GPUs; NGC images set these, plain images do not. Slurm's own GRES
+# binding still decides which GPU the task gets.
+SLINKY_RANK_SH = ('export RANK="$SLURM_PROCID" LOCAL_RANK="$SLURM_LOCALID" '
+                  'LOCAL_WORLD_SIZE="${SLURM_NTASKS_PER_NODE:-1}"; exec "$@"')
+SLINKY_GPU_ENV = {"NVIDIA_VISIBLE_DEVICES": "all",
+                  "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"}
+# Pending reasons that will never clear by waiting.
+SLINKY_FATAL_PENDING_REASONS = {"BadConstraints", "PartitionConfig", "PartitionNodeLimit",
+                                "InvalidAccount", "InvalidQOS", "JobHeldAdmin", "JobHeldUser",
+                                "ReqNodeNotAvail, UnavailableNodes", "PartitionDown",
+                                "PartitionInactive"}
+
 
 def job_log_path(job_id: str) -> str:
     return os.path.join(LOGS_DIR, f"{job_id}.log")
@@ -176,18 +286,23 @@ def append_job_log(job_id: str, text: str) -> None:
 
 
 def run_logged(argv: list[str], job_id: str, cwd: str | None = None, check: bool = True,
-               env: dict | None = None) -> int:
+               env: dict | None = None, input: str | None = None) -> int:
     """Run a subprocess, streaming combined stdout+stderr live to THIS process's
     stdout (so a `reconcile` tick is still watchable in real time) while also
     appending every line to the job's replay log. Returns the exit code; raises
     CalledProcessError on failure unless check=False (matches subprocess.run).
     env=None inherits this process's environment (subprocess.Popen's own
-    default); pass a dict to override/extend it."""
+    default); pass a dict to override/extend it. `input` goes to stdin and is
+    never logged, which is how a credential reaches a remote command."""
     header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
     print(header)
     append_job_log(job_id, f"{now_iso()} {header}")
     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            stdin=subprocess.PIPE if input is not None else None)
+    if input is not None:
+        proc.stdin.write(input)
+        proc.stdin.close()
     lines = []
     for line in proc.stdout:
         sys.stdout.write(line)
@@ -268,15 +383,41 @@ def _with_preflight_probe(files: dict[str, str], probe_script: str,
     return out
 
 
-def _sif_cache_name(ref: str) -> str:
-    """A stable per-image SIF filename — the content digest when the ref is
-    digest-pinned (the norm), else a hash of the ref string."""
+def _sif_cache_name(ref: str, sif: dict | None = None) -> str:
+    """A stable per-image SIF filename — a prebuilt SIF's own file digest, else
+    the image's content digest when the ref is digest-pinned (the norm), else a
+    hash of the ref string."""
+    if sif:
+        return f"sha256-{sif['sha256'].removeprefix('sha256:')}.sif"
     m = re.search(r"@sha256:([0-9a-f]{64})", ref)
     key = f"sha256-{m.group(1)}" if m else hashlib.sha256(ref.encode()).hexdigest()[:16]
     return f"{key}.sif"
 
 
-def ensure_local_sif(image: str, job_id: str) -> str:
+def _sif_fetch_script(image: str, sif: dict | None, tmp: str, final: str,
+                      login: tuple[str, str] | None) -> str:
+    """Shell that lands `image` as a SIF at `final` unless it is already there:
+    a prebuilt SIF is downloaded and refused unless its sha256 is the pinned one;
+    otherwise the OCI image is converted. A registry password is read from stdin."""
+    q = shlex.quote
+    if login:
+        creds = (f'read -r APPTAINER_DOCKER_PASSWORD; '
+                 f'export APPTAINER_DOCKER_USERNAME={q(login[0])} APPTAINER_DOCKER_PASSWORD; ')
+    else:
+        creds = ""
+    if sif:
+        want = sif["sha256"].removeprefix("sha256:")
+        refusal = (f"{sif['ref']} is not the pinned SIF sha256:{want} — "
+                   "republish the SIF or fix the image pin")
+        fetch = (f"apptainer pull --force {q(tmp)} {q(sif['ref'])} && "
+                 f"{{ echo {q(want + '  ' + tmp)} | sha256sum -c --quiet - || "
+                 f"{{ echo {q(refusal)} >&2; rm -f {q(tmp)}; exit 1; }}; }}")
+    else:
+        fetch = f"apptainer build --force {q(tmp)} {q(image)}"
+    return f"test -f {q(final)} || {{ {creds}{fetch} && mv {q(tmp)} {q(final)}; }}"
+
+
+def ensure_local_sif(image: str, job_id: str, sif: dict | None = None) -> str:
     """Resolve a job image to a LOCAL .sif path for MPI staging.
 
     Single-node runs hand `image` straight to `apptainer exec`, which consumes a
@@ -297,7 +438,7 @@ def ensure_local_sif(image: str, job_id: str) -> str:
             f"job image {image!r} is neither a local file nor a pullable ref "
             "(expected a .sif path or docker://…@sha256:…)")
     os.makedirs(SIF_CACHE_DIR, exist_ok=True)
-    cached = os.path.join(SIF_CACHE_DIR, _sif_cache_name(image))
+    cached = os.path.join(SIF_CACHE_DIR, _sif_cache_name(image, sif))
     with open(cached + ".lock", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         if not os.path.isfile(cached):
@@ -316,8 +457,9 @@ def ensure_local_sif(image: str, job_id: str) -> str:
             build_env["APPTAINER_TMPDIR"] = os.path.join(SIF_CACHE_DIR, ".apptainer-tmp")
             os.makedirs(build_env["APPTAINER_CACHEDIR"], exist_ok=True)
             os.makedirs(build_env["APPTAINER_TMPDIR"], exist_ok=True)
-            run_logged(["apptainer", "build", "--force", tmp, image], job_id, env=build_env)
-            os.replace(tmp, cached)
+            login = registry_login(sif["ref"] if sif else image)
+            run_logged(["sh", "-c", _sif_fetch_script(image, sif, tmp, cached, login)],
+                       job_id, env=build_env, input=f"{login[1]}\n" if login else None)
     return cached
 
 
@@ -354,6 +496,8 @@ def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
         argv += ["-v", f"{bind_src}:{bind_dst}"]
         for b in extra_binds:
             argv += ["-v", f"{b}:{b}"]
+        for m in spec.mounts:
+            argv += ["-v", m]
         for k, v in env.items():
             argv += ["-e", f"{k}={v}"]
         return argv + [spec.image] + list(spec.command)
@@ -362,7 +506,7 @@ def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
     if spec.gpu:
         argv += ["--nv"]                       # bind host NVIDIA driver/devices into the container
     argv += ["--bind", f"{bind_src}:{bind_dst}"]
-    for b in extra_binds:
+    for b in [*extra_binds, *spec.mounts]:
         argv += ["--bind", b]
     for k, v in env.items():
         argv += ["--env", f"{k}={v}"]
@@ -586,6 +730,7 @@ class LocalHostAdapter(ProviderAdapter):
         os.makedirs(workdir, exist_ok=True)
         if spec.is_dry_run:
             return RunResult(job_id, node.name, None, workdir, note="no image -> dry-run")
+        spec = _staged(spec, LOCAL_INPUTS_DIR, _local_sh(job_id), self.log)
         if spec.launcher == "mpi" and len(nodes) > 1:
             return self._run_mpi(nodes, job_id, spec)
         if plan is not None:
@@ -600,7 +745,7 @@ class LocalHostAdapter(ProviderAdapter):
         # happen once per digest, not once per job.
         run_spec = spec
         if spec.runtime != "docker" and "://" in spec.image:
-            run_spec = dataclasses.replace(spec, image=ensure_local_sif(spec.image, job_id))
+            run_spec = dataclasses.replace(spec, image=ensure_local_sif(spec.image, job_id, spec.image_sif))
         argv = container_argv(run_spec, workdir, spec.output_dir, extra_binds, extra_env)
         stdout_path = os.path.join(workdir, "stdout.log")
         header = f"$ {' '.join(shlex.quote(a) for a in argv)}"
@@ -711,7 +856,7 @@ class LocalHostAdapter(ProviderAdapter):
         # docker://…@digest ref into a SIF at that shared path; a local .sif is
         # copied there. Either way `image` is workdir/image.sif everywhere.
         image = f"{workdir}/image.sif"
-        src = ensure_local_sif(spec.image, job_id)
+        src = ensure_local_sif(spec.image, job_id, spec.image_sif)
         if os.path.abspath(src) != os.path.abspath(image):
             shutil.copy2(src, image)
         appfile = f"{workdir}/appfile"
@@ -726,7 +871,12 @@ class LocalHostAdapter(ProviderAdapter):
         host_argv = container_argv(dataclasses.replace(rank_spec, gpu=True),
                                    workdir, spec.output_dir, extra_binds=gpu_binds)
         # VM ranks: no GPU on the guest -> plain launch (no --nv, no host binds).
-        vm_argv = container_argv(dataclasses.replace(rank_spec, gpu=False),
+        # Their inputs are staged on each VM, under the remote cache root.
+        vm_mounts = []
+        for n in nodes[1:]:
+            vm_mounts = _staged(spec, REMOTE_INPUTS_DIR, lambda s, i, n=n: run_logged(
+                ssh_base(n.ip) + [s], job_id, check=False, input=i), self.log).mounts
+        vm_argv = container_argv(dataclasses.replace(rank_spec, gpu=False, mounts=vm_mounts),
                                  workdir, spec.output_dir)
         # mpi_ip, not ip — the appfile line is what a PEER rank connects to,
         # not the orchestrator's ssh target (see NodeRecord.mpi_ip).
@@ -879,6 +1029,10 @@ class LibvirtAdapter(ProviderAdapter):
         remote_workdir = f"/tmp/cluster/{job_id}"
         if spec.is_dry_run:
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
+        for n in nodes:
+            staged = _staged(spec, REMOTE_INPUTS_DIR, lambda s, i, n=n: run_logged(
+                self._ssh_base(n) + [s], job_id, check=False, input=i), self.log)
+        spec = staged
         # A resolved plan always takes the planned path, regardless of node
         # count or launcher: intra-node multi-rank placement (e.g. one_per_rank
         # across every GPU on one 8-GPU box, launcher: mpi) has exactly one
@@ -908,7 +1062,7 @@ class LibvirtAdapter(ProviderAdapter):
         # digest), not once per job.
         run_spec = spec
         if spec.runtime != "docker" and "://" in spec.image:
-            run_spec = dataclasses.replace(spec, image=self._ensure_remote_sif(head, spec.image, job_id))
+            run_spec = dataclasses.replace(spec, image=self._ensure_remote_sif(head, spec.image, job_id, spec.image_sif))
         argv = container_argv(run_spec, remote_workdir, spec.output_dir, extra_binds=extra_binds)
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
@@ -980,7 +1134,8 @@ class LibvirtAdapter(ProviderAdapter):
         except ValueError:
             return 0  # df failed/unparseable -> treat as no headroom, forces the safe scp fallback
 
-    def _ensure_remote_sif(self, node: NodeRecord, image: str, job_id: str) -> str:
+    def _ensure_remote_sif(self, node: NodeRecord, image: str, job_id: str,
+                           sif: dict | None = None) -> str:
         """Get `image` onto `node`'s own disk as a cached, digest-keyed SIF at
         REMOTE_SIF_CACHE_DIR — shared across every job that node ever runs, not
         just this one. First job to touch a given digest on a given node pays a
@@ -1000,8 +1155,12 @@ class LibvirtAdapter(ProviderAdapter):
         "no space left on device" without this check. Falls back to the
         original scp-from-local-cache path when headroom is insufficient or
         the node's free space can't be read, landing in the shared cache
-        instead of a per-job dir either way."""
-        name = _sif_cache_name(image)
+        instead of a per-job dir either way.
+
+        A prebuilt SIF (`sif`) skips all of that: the node downloads it from the
+        registry, which needs no conversion headroom, and keeps it only if its
+        sha256 is the pinned one."""
+        name = _sif_cache_name(image, sif)
         final = f"{REMOTE_SIF_CACHE_DIR}/{name}"
         lock = f"{REMOTE_SIF_CACHE_DIR}/{name}.lock"
         probe = subprocess.run(self._ssh_base(node) +
@@ -1010,9 +1169,9 @@ class LibvirtAdapter(ProviderAdapter):
             self.log(f"[sif-cache] {node.name}: {name} already cached, reusing (no transfer)")
             return final
 
-        avail = self._remote_free_bytes(node)
         tmp = f"{final}.{job_id}.tmp"
-        if avail >= REMOTE_PULL_FLOOR_BYTES:
+        avail = None if sif else self._remote_free_bytes(node)
+        if sif or avail >= REMOTE_PULL_FLOOR_BYTES:
             # NOTE: deliberately NOT calling ensure_local_sif() here. It used to
             # run unconditionally, above this branch, purely so os.path.getsize()
             # could size a headroom check — meaning the control plane pulled and
@@ -1030,8 +1189,11 @@ class LibvirtAdapter(ProviderAdapter):
             # any image outpost ships, with margin. Below the floor we fall back
             # to the local build + scp, which is when paying for a local SIF is
             # actually justified.
-            self.log(f"[sif-cache] {node.name}: remote-pulling {image} directly "
-                     f"({avail / 1e9:.1f}GB avail >= {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor)")
+            if sif:
+                self.log(f"[sif-cache] {node.name}: pulling the prebuilt SIF {sif['ref']}")
+            else:
+                self.log(f"[sif-cache] {node.name}: remote-pulling {image} directly "
+                         f"({avail / 1e9:.1f}GB avail >= {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor)")
             # apptainer's OWN OCI blob cache + build-time rootfs unpack tmpdir
             # default to $HOME/.apptainer/cache and $TMPDIR/system-/tmp — NOT
             # wherever the final SIF is told to land. Left unredirected, the
@@ -1044,11 +1206,14 @@ class LibvirtAdapter(ProviderAdapter):
             # actually makes the headroom check meaningful.
             oci_cache = f"{REMOTE_SIF_CACHE_DIR}/.apptainer-cache"
             build_tmp = f"{REMOTE_SIF_CACHE_DIR}/.apptainer-tmp"
-            env = f"APPTAINER_CACHEDIR={shlex.quote(oci_cache)} APPTAINER_TMPDIR={shlex.quote(build_tmp)}"
-            build = (f"mkdir -p {oci_cache} {build_tmp} && test -f {final} || "
-                    f"({env} apptainer build --force {tmp} {shlex.quote(image)} && mv {tmp} {final})")
+            env = (f"export APPTAINER_CACHEDIR={shlex.quote(oci_cache)} "
+                   f"APPTAINER_TMPDIR={shlex.quote(build_tmp)}; ")
+            login = registry_login(sif["ref"] if sif else image)
+            build = (f"mkdir -p {oci_cache} {build_tmp} && {env}"
+                     + _sif_fetch_script(image, sif, tmp, final, login))
             cmd = f"mkdir -p {REMOTE_SIF_CACHE_DIR} && flock {shlex.quote(lock)} -c {shlex.quote(build)}"
-            run_logged(self._ssh_base(node) + [cmd], job_id)
+            run_logged(self._ssh_base(node) + [cmd], job_id,
+                       input=f"{login[1]}\n" if login else None)
         else:
             self.log(f"[sif-cache] {node.name}: insufficient remote headroom for a direct pull "
                      f"({avail / 1e9:.1f}GB avail < {REMOTE_PULL_FLOOR_BYTES / 1e9:.1f}GB floor) — "
@@ -1103,7 +1268,7 @@ class LibvirtAdapter(ProviderAdapter):
         for n in nodes:
             run_logged(self._ssh_base(n) + [f"mkdir -p {remote_workdir}"], job_id)
             if stage:
-                remote_image = self._ensure_remote_sif(n, spec.image, job_id)
+                remote_image = self._ensure_remote_sif(n, spec.image, job_id, spec.image_sif)
         head = nodes[0]
 
         if plan is not None:
@@ -1562,6 +1727,9 @@ class KubernetesAdapter(ProviderAdapter):
         os.makedirs(workdir, exist_ok=True)
         if spec.is_dry_run:
             return RunResult(job_id, slot.name, None, workdir, note="no image -> dry-run")
+        if spec.inputs:
+            raise RuntimeError("backend k8s cannot stage job inputs yet — run this job on an "
+                               "apptainer host or a slinky cluster")
         n = max(1, spec.node_count)                    # node_count == gang size here
         ns = self._namespace(job_id)
         mode = self._gpu_mode(spec)
@@ -1797,4 +1965,501 @@ class KubernetesAdapter(ProviderAdapter):
                     shutil.copytree(src, dst, dirs_exist_ok=True)
                 else:
                     shutil.copy2(src, dst)
+        return dest
+
+
+def slinky_image_ref(image: str) -> str:
+    """A JobSpec image as an enroot/pyxis URI: `docker://reg/repo...` becomes
+    `docker://reg#repo...` (enroot separates the registry with `#`). A path is
+    an already-imported squashfs and passes through unchanged."""
+    if image.startswith("/"):
+        return image
+    ref = image[len("docker://"):] if image.startswith("docker://") else image
+    if "://" in ref or ref.endswith(".sif"):
+        raise RuntimeError(
+            f"slinky backend needs an OCI image ref or a squashfs path, got {image!r} "
+            "(pyxis/enroot cannot run a SIF)")
+    head, slash, rest = ref.partition("/")
+    if slash and ("." in head or ":" in head or head == "localhost"):
+        ref = f"{head}#{rest}"
+    return f"docker://{ref}"
+
+
+def slinky_squashfs_name(image: str) -> str:
+    """Content-addressed cache name for an imported image: the digest when the
+    ref pins one, else a hash of the whole ref."""
+    m = re.search(r"@sha256:([0-9a-f]{64})", image)
+    key = m.group(1) if m else hashlib.sha256(image.encode()).hexdigest()
+    return f"{key}.sqsh"
+
+
+def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
+                  partition: str = "", mpi: str = "pmix",
+                  nodelist: tuple[str, ...] = (), gpus_per_node: int = 0) -> str:
+    """The sbatch script for one job. Pure, so it is unit-testable.
+
+    The workdir (on the shared filesystem) is bound at spec.output_dir and
+    receives stdout.log, matching what every other adapter puts in a drop-zone.
+    node_count is the Slurm node count. launcher: mpi starts one task per node
+    under `srun --mpi`; launcher: single runs one task on the first node.
+
+    With a nodelist (per-node slots), the job gets exactly those nodes, whole
+    (`--exclusive`, every GPU on them), and rank i runs on nodelist[i]: srun's
+    arbitrary distribution follows a hostfile written in that order."""
+    n = max(1, spec.node_count)
+    ntasks = n if spec.launcher == "mpi" else 1
+    lines = ["#!/bin/bash",
+             f"#SBATCH --job-name=outpost-{job_id}",
+             f"#SBATCH --nodes={n}",
+             "#SBATCH --ntasks-per-node=1",
+             f"#SBATCH --chdir={workdir}",
+             f"#SBATCH --output={workdir}/stdout.log",
+             "#SBATCH --open-mode=append"]
+    if partition:
+        lines.append(f"#SBATCH --partition={partition}")
+    if nodelist:
+        lines += [f"#SBATCH --nodelist={','.join(nodelist)}", "#SBATCH --exclusive"]
+    if spec.gpu:
+        gpus = gpus_per_node if nodelist and gpus_per_node else int(spec.params.get("gpu_count", 1))
+        lines.append(f"#SBATCH --gres=gpu:{gpus}")
+    if spec.params.get("time_limit"):
+        lines.append(f"#SBATCH --time={spec.params['time_limit']}")
+    lines.append("set -o pipefail")
+    if nodelist:
+        lines += [f"printf '%s\\n' {' '.join(shlex.quote(h) for h in nodelist[:ntasks])}"
+                  f" > {shlex.quote(workdir)}/hostfile",
+                  f"export SLURM_HOSTFILE={shlex.quote(workdir)}/hostfile",
+                  f"export MASTER_ADDR={shlex.quote(nodelist[0])}"]
+    else:
+        lines += ['MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
+                  "export MASTER_ADDR"]
+    lines += [f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
+              f"export WORLD_SIZE={ntasks}"]
+    env = {**(SLINKY_GPU_ENV if spec.gpu else {}), **spec.env}
+    for k, v in env.items():
+        lines.append(f"export {k}={shlex.quote(str(v))}")
+    srun = ["srun", f"--ntasks={ntasks}"]
+    if nodelist:
+        srun.append("--distribution=arbitrary")
+    if spec.launcher == "mpi":
+        srun.append(f"--mpi={mpi}")
+    srun += [f"--container-image={image}",
+             f"--container-mounts=" + ",".join([f"{workdir}:{spec.output_dir}", *spec.mounts]),
+             "--no-container-mount-home",
+             f"--container-workdir={spec.output_dir}"]
+    # Slurm numbers tasks as SLURM_PROCID/SLURM_LOCALID; the torch names, which
+    # frameworks read, are set per task inside the container.
+    rank = (["/bin/sh", "-c", SLINKY_RANK_SH, "outpost-rank"] if spec.launcher == "mpi" else [])
+    lines.append(" ".join(shlex.quote(a) for a in srun + rank + list(spec.command)))
+    return "\n".join(lines) + "\n"
+
+
+def parse_sinfo_nodes(text: str) -> list[tuple[str, int]]:
+    """[(slurm node, GPUs)] from `sinfo -h -N -o '%N|%G'`, sorted and
+    de-duplicated (a node in two partitions is listed twice). Gres looks like
+    `gpu:a10g:1(S:0)`, `gpu:2`, `gpu:a10g:1,shard:4` or `(null)`."""
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        name, _, gres = line.strip().partition("|")
+        if not name:
+            continue
+        gpus = 0
+        for item in re.sub(r"\([^)]*\)", "", gres).split(","):
+            parts = item.split(":")
+            if parts[0] == "gpu" and parts[-1].isdigit():
+                gpus += int(parts[-1])
+        out[name] = gpus
+    return sorted(out.items())
+
+
+def is_kubectl_transport_error(stderr: str) -> bool:
+    """kubectl itself failing to reach the cluster or keep an exec stream
+    open, as opposed to the command in the pod failing. Seen through a
+    port-forwarded API server: "error: unexpected EOF", "lost connection"."""
+    return any(m in stderr for m in KUBECTL_TRANSPORT_ERRORS)
+
+
+def parse_slurm_job(text: str) -> tuple[str, str, int | None]:
+    """(state, reason, exit_code) from `scontrol show job -o` output. The exit
+    code is the first half of ExitCode=<code>:<signal>; a non-zero signal with
+    a zero code is reported as 128+signal so it can never read as success."""
+    fields = dict(m.groups() for m in re.finditer(r"(\w+)=(\S*)", text))
+    state = fields.get("JobState", "")
+    reason = fields.get("Reason", "")
+    code = None
+    if "ExitCode" in fields and ":" in fields["ExitCode"]:
+        rc, sig = (int(x) for x in fields["ExitCode"].split(":", 1))
+        code = rc or (128 + sig if sig else 0)
+    return state, reason, code
+
+
+class SlinkyAdapter(ProviderAdapter):
+    """Run a job as a Slurm batch job on a Slinky (Slurm-on-Kubernetes) cluster.
+
+    A slot is a concurrency bound on one cluster, the same as a k8s slot: the
+    job claims one, and node_count becomes the Slurm node count. Everything goes
+    through `kubectl exec` into a running login pod. The container runs under
+    pyxis/enroot from a squashfs imported once per image digest onto the shared
+    filesystem. Nothing here installs anything: provision/bootstrap only verify
+    the cluster is there. See docs/11-slinky-backend.md."""
+    name = "slinky"
+
+    def __init__(self, log=_log_stderr):
+        self.log = log
+
+    @staticmethod
+    def _context_of(node: NodeRecord) -> str:
+        return node.kube_context or K8S_CONTEXT
+
+    @staticmethod
+    def _workdir(job_id: str) -> str:
+        return f"{SLINKY_WORKDIR_ROOT}/{job_id}"
+
+    def _kubectl_base(self, context: str) -> list[str]:
+        return ["kubectl"] + (["--context", context] if context else [])
+
+    def _exec(self, context: str, pod: str, script: str, job_id: str | None = None,
+              input: str | None = None) -> tuple[int, str, str]:
+        """Run a shell snippet in the login pod. A kubectl transport failure
+        (the API connection or the exec stream dropping) is retried; the
+        snippet itself failing is returned as-is. Only for snippets that are
+        safe to run twice. With job_id, the command and output go to the
+        job's replay log."""
+        argv = self._exec_argv(context, pod, script, stdin=input is not None)
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            proc = subprocess.run(argv, input=input, capture_output=True, text=True)
+            if job_id:
+                append_job_log(job_id, f"{now_iso()} $ {' '.join(shlex.quote(a) for a in argv)}\n"
+                                       f"{proc.stdout}{proc.stderr}")
+            if proc.returncode == 0 or not is_kubectl_transport_error(proc.stderr) \
+                    or attempt == SLINKY_TRANSPORT_RETRIES:
+                return proc.returncode, proc.stdout, proc.stderr
+            self.log(f"[slinky] kubectl transport error ({proc.stderr.strip()[:120]}); "
+                     f"retry {attempt}/{SLINKY_TRANSPORT_RETRIES - 1}")
+            time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
+        raise AssertionError("unreachable")
+
+    def _login_pod(self, context: str) -> str:
+        argv = self._kubectl_base(context) + [
+            "get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
+            "--field-selector=status.phase=Running", "-o", "name"]
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            if proc.returncode == 0 or not is_kubectl_transport_error(proc.stderr):
+                break
+            if attempt < SLINKY_TRANSPORT_RETRIES:
+                time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
+        pods = [p.split("/", 1)[-1] for p in proc.stdout.split() if p]
+        if proc.returncode != 0 or not pods:
+            raise RuntimeError(
+                f"no Running Slinky login pod (namespace {SLINKY_NAMESPACE!r}, selector "
+                f"{SLINKY_LOGIN_SELECTOR!r}{f', context {context}' if context else ''}): "
+                f"{proc.stderr.strip() or 'none found'}. The cluster needs a LoginSet; set "
+                "CLUSTER_SLINKY_NAMESPACE / CLUSTER_SLINKY_LOGIN_SELECTOR if it is installed "
+                "elsewhere.")
+        return sorted(pods)[0]
+
+    @staticmethod
+    def _slurm_nodes(nodes: list[NodeRecord]) -> tuple[tuple[str, ...], int]:
+        """The Slurm nodes a job's per-node slots stand for, in rank order, and
+        the GPUs per node; ((), 0) for a cluster-wide slot. Every slot of one
+        job must be per-node with the same GPU count, or Slurm could not give
+        each rank the same share."""
+        named = [n.slurm_node for n in nodes]
+        if not any(named):
+            return (), 0
+        if not all(named):
+            raise RuntimeError(f"slots {[n.name for n in nodes]} mix per-node and cluster-wide "
+                               "slinky slots; pin one kind")
+        counts = {n.gpu_count for n in nodes}
+        if len(counts) != 1:
+            raise RuntimeError(f"slots {[n.name for n in nodes]} have different GPU counts "
+                               f"{sorted(counts)}; a job's nodes must match")
+        return tuple(named), counts.pop()
+
+    def _exec_argv(self, context: str, pod: str, script: str, stdin: bool = False) -> list[str]:
+        return self._kubectl_base(context) + (
+            ["exec"] + (["-i"] if stdin else []) +
+            ["-n", SLINKY_NAMESPACE, pod, "-c", SLINKY_LOGIN_CONTAINER, "--",
+             "bash", "-lc", script])
+
+    # ── node lifecycle (verify only) ─────────────────────────────────────
+    def provision(self, node, job_id):
+        ctx = self._context_of(node)
+        pod = self._login_pod(ctx)
+        self.log(f"[slinky] slot {node.name}: login pod {pod}"
+                 f"{f' (context {ctx})' if ctx else ''}; checking slurmctld")
+        self._wait_for_ctld(ctx, pod, job_id)
+
+    def _wait_for_ctld(self, ctx: str, pod: str, job_id: str) -> None:
+        """Return once slurmctld answers; give up after SLINKY_CTLD_GRACE_S."""
+        deadline = time.monotonic() + SLINKY_CTLD_GRACE_S
+        while True:
+            rc, out, err = self._exec(ctx, pod, "scontrol ping", job_id)
+            if rc == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"slurmctld has not answered from {pod} for {SLINKY_CTLD_GRACE_S:.0f}s "
+                    f"(`scontrol ping`: {(out + err).strip()[-200:]}) — check the Controller pod "
+                    f"in namespace {SLINKY_NAMESPACE!r}")
+            self.log(f"[slinky] slurmctld not answering from {pod}; waiting")
+            time.sleep(SLINKY_POLL_INTERVAL_S)
+
+    def bootstrap(self, nodes, job_id):
+        ctx = self._context_of(nodes[0])
+        pod = self._login_pod(ctx)
+        checks = [
+            (f"mkdir -p {shlex.quote(SLINKY_WORKDIR_ROOT)}/.images && "
+             f"test -w {shlex.quote(SLINKY_WORKDIR_ROOT)}",
+             f"{SLINKY_WORKDIR_ROOT} is not writable from the login pod — it must be on a "
+             "filesystem every slurmd pod also mounts (set CLUSTER_SLINKY_WORKDIR_ROOT)"),
+            ("srun --help | grep -q -- --container-image",
+             "srun has no --container-image: pyxis is not loaded (plugstack.conf must "
+             "include /usr/share/pyxis/*, and the slurmd/login images must be the pyxis "
+             "variants)"),
+        ]
+        if SLINKY_PARTITION:
+            checks.append((f"sinfo -h -p {shlex.quote(SLINKY_PARTITION)} -o %P | grep -q .",
+                           f"partition {SLINKY_PARTITION!r} does not exist"))
+        nodelist, _ = self._slurm_nodes(nodes)
+        if nodelist:
+            want = " ".join(shlex.quote(h) for h in nodelist)
+            checks.append((f"for h in {want}; do st=$(sinfo -h -N -n \"$h\" -o %T | head -n1); "
+                           f"case \"$st\" in ''|down*|drain*|fail*|unk*|not_resp*) "
+                           f"echo \"$h: ${{st:-not a Slurm node}}\" >&2; exit 1;; esac; done",
+                           f"a pinned Slurm node is missing or down ({', '.join(nodelist)}); if the "
+                           "cluster's nodes were replaced, re-register with `add-slinky --per-node`"))
+        for script, why in checks:
+            rc, _, err = self._exec(ctx, pod, script, job_id)
+            if rc != 0:
+                raise RuntimeError(f"{why} ({err.strip()})" if err.strip() else why)
+
+    def deprovision(self, node, job_id):
+        ctx = self._context_of(node)
+        try:
+            pod = self._login_pod(ctx)
+        except RuntimeError as e:
+            self.log(f"[slinky] deprovision {job_id}: {e}")
+            return
+        # Release the slot only once Slurm has no job by this name: an scancel
+        # sent while slurmctld is down is lost, and the job would keep the node.
+        name = f"outpost-{job_id}"
+        deadline = time.monotonic() + SLINKY_CTLD_GRACE_S
+        while True:
+            rc, out, err = self._exec(ctx, pod, f"scancel --name={name}; squeue -h -n {name} -o %i",
+                                      job_id)
+            if rc == 0 and not out.strip():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Slurm still has {name} (job {out.strip() or '?'}) after "
+                                   f"{SLINKY_CTLD_GRACE_S:.0f}s of scancel: {err.strip()[-200:]}")
+            time.sleep(SLINKY_POLL_INTERVAL_S)
+        if not SLINKY_KEEP_WORKDIR:
+            self._exec(ctx, pod, f"rm -rf {shlex.quote(self._workdir(job_id))}", job_id)
+
+    # ── workload lifecycle ────────────────────────────────────────────────
+    def _stage_image(self, ctx: str, pod: str, image: str, job_id: str) -> str:
+        """Import the image once per digest onto the shared filesystem and
+        return the squashfs path. Done from the login pod (enroot runs there),
+        so no slurmd pulls the image and every later job starts from the cache.
+        The layer cache is shared too; only the unpack happens pod-locally.
+        Safe to repeat: the import writes a per-job temp file and renames it."""
+        if image.startswith("/"):
+            return image
+        images = f"{SLINKY_WORKDIR_ROOT}/.images"
+        sqsh = f"{images}/{slinky_squashfs_name(image)}"
+        tmp = f"{sqsh}.{job_id}.tmp"
+        uri = slinky_image_ref(image)
+        temp = shlex.quote(SLINKY_ENROOT_TEMP)
+        mount = ""
+        if SLINKY_ENROOT_TEMP_IMAGE:
+            img = shlex.quote(SLINKY_ENROOT_TEMP_IMAGE)
+            mount = (f"exec 9>{img}.lock; flock 9; "
+                     f"[ -e {img} ] || {{ truncate -s {SLINKY_ENROOT_TEMP_SIZE} {img} && "
+                     f"mkfs.ext4 -q -F {img}; }}; "
+                     f"mountpoint -q {temp} || mount -o loop,noinit_itable {img} {temp}; flock -u 9; ")
+        if self._exec(ctx, pod, f"test -s {sqsh}", job_id)[0] == 0:
+            self.log(f"[slinky] image cached: {sqsh}")
+            return sqsh
+        # enroot reads registry credentials only from $ENROOT_CONFIG_PATH/.credentials,
+        # so the token goes into a private temp dir that is gone when the import ends.
+        login = registry_login(image)
+        creds = ""
+        if login:
+            creds = (f'cfg=$(mktemp -d); trap \'rm -rf "$cfg"\' EXIT; read -r pw; '
+                     f'(umask 077; printf "machine %s login %s password %s\\n" '
+                     f'{shlex.quote(registry_host(image))} {shlex.quote(login[0])} "$pw" '
+                     f'> "$cfg/.credentials"); export ENROOT_CONFIG_PATH="$cfg"; ')
+        script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
+                  f"{creds}mkdir -p {images}/.cache {temp}; {mount}"
+                  f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "
+                  f"rm -f {tmp}; enroot import -o {tmp} {shlex.quote(uri)} && mv -f {tmp} {sqsh}")
+        self.log(f"[slinky] staging {uri} -> {sqsh}")
+        rc, _, _ = self._exec(ctx, pod, script, job_id,
+                              input=f"{login[1]}\n" if login else None)
+        if rc != 0:
+            raise RuntimeError(f"enroot import of {uri} failed in {pod} (exit {rc}); the "
+                               f"import output is in `cluster logs {job_id}`")
+        return sqsh
+
+    def _submit(self, ctx: str, pod: str, job_id: str, workdir: str, script: str) -> str:
+        """sbatch the script and return the Slurm job id. Submitting is not
+        safe to repeat, so after a transport failure the job is looked up by
+        name first and only resubmitted if Slurm never got it."""
+        q = shlex.quote(workdir)
+        submit = (f"mkdir -p {q} && cat > {q}/launcher-slinky.sbatch "
+                  f"&& sbatch --parsable {q}/launcher-slinky.sbatch")
+        lookup = f"squeue -h -n outpost-{job_id} -o %i; sacct -n -X -P --name=outpost-{job_id} -o JobID"
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            if attempt > 1:
+                _, out, _ = self._exec(ctx, pod, lookup, job_id)
+                found = [x for x in out.split() if x.isdigit()]
+                if found:
+                    self.log(f"[slinky] Slurm already has outpost-{job_id} as job {found[0]}")
+                    return found[0]
+            argv = self._exec_argv(ctx, pod, submit, stdin=True)
+            proc = subprocess.run(argv, input=script, capture_output=True, text=True)
+            append_job_log(job_id, f"{now_iso()} [slinky] sbatch rc={proc.returncode} "
+                                   f"{proc.stdout.strip()} {proc.stderr.strip()}")
+            if proc.returncode == 0:
+                return proc.stdout.strip().split(";")[0]
+            if not is_kubectl_transport_error(proc.stderr):
+                raise RuntimeError(f"sbatch refused the job on {pod}: "
+                                   f"{proc.stderr.strip() or proc.stdout.strip()}")
+            time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
+        raise RuntimeError(f"could not reach {pod} to submit the job: {proc.stderr.strip()}")
+
+    def run(self, nodes, job_id, spec, plan=None):
+        slot = nodes[0]
+        ctx = self._context_of(slot)
+        local = os.path.join(RUNS_DIR, job_id)
+        os.makedirs(local, exist_ok=True)
+        if spec.is_dry_run:
+            return RunResult(job_id, slot.name, None, local, note="no image -> dry-run")
+        pod = self._login_pod(ctx)
+        workdir = self._workdir(job_id)
+        image = self._stage_image(ctx, pod, spec.image, job_id)
+        spec = _staged(spec, f"{SLINKY_WORKDIR_ROOT}/.inputs",
+                       lambda s, i: self._exec(ctx, pod, s, job_id, input=i)[0], self.log)
+        nodelist, gpus = self._slurm_nodes(nodes)
+        script = render_sbatch(job_id, spec, workdir, image, SLINKY_PARTITION, SLINKY_MPI,
+                               nodelist, gpus)
+        with open(os.path.join(local, "launcher-slinky.sbatch"), "w") as f:
+            f.write(script)
+        append_job_log(job_id, f"{now_iso()} [slinky] sbatch script:\n{script}")
+        slurm_id = self._submit(ctx, pod, job_id, workdir, script)
+        self.log(f"[slinky] submitted Slurm job {slurm_id} from {pod} (workdir {workdir})")
+        with open(os.path.join(local, "slurm-job-id"), "w") as f:
+            f.write(slurm_id + "\n")
+        state, code = self._await(ctx, pod, slurm_id, job_id)
+        stdout_path = os.path.join(local, "stdout.log")
+        _, log_text, _ = self._exec(ctx, pod, f"cat {shlex.quote(workdir)}/stdout.log")
+        with open(stdout_path, "w") as f:
+            f.write(log_text)
+        append_job_log(job_id, f"{now_iso()} [slinky] stdout.log:\n{log_text}")
+        if state != "COMPLETED" and not code:
+            code = 1
+        return RunResult(job_id, slot.name, code, workdir, stdout_path,
+                         note=f"slurm job {slurm_id} {state} exit={code}")
+
+    def _await(self, ctx: str, pod: str, slurm_id: str, job_id: str) -> tuple[str, int | None]:
+        deadline = time.monotonic() + SLINKY_RUN_TIMEOUT_S
+        last = None
+        unreadable_since = None
+        while True:
+            rc, out, err = self._exec(ctx, pod, f"scontrol show job -o {slurm_id}")
+            if rc != 0 and is_kubectl_transport_error(err):
+                # We cannot see the cluster, which says nothing about the job:
+                # it runs under Slurm regardless, so keep polling until the run
+                # timeout instead of spending the controller's grace on our link.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Slurm job {slurm_id} could not be read before the run "
+                                       f"timeout ({SLINKY_RUN_TIMEOUT_S:.0f}s): {err.strip()}")
+                self.log(f"[slinky] job {slurm_id}: cluster unreachable ({err.strip()[:100]}); "
+                         "still polling")
+                time.sleep(SLINKY_POLL_INTERVAL_S)
+                continue
+            if rc != 0:
+                # slurmctld down or restarting: the job keeps running under slurmd.
+                # A job slurmctld no longer knows is answered, not an error here.
+                now = time.monotonic()
+                unreadable_since = unreadable_since or now
+                if "Invalid job id" in err:
+                    # slurmctld drops a finished job after MinJobAge; a poll that
+                    # was cut off (say, by a dead tunnel) asks accounting instead.
+                    finished = self._accounted(ctx, pod, slurm_id)
+                    if finished:
+                        self.log(f"[slinky] job {slurm_id}: {finished[0]} (from sacct)")
+                        return finished
+                if "Invalid job id" in err or now - unreadable_since >= SLINKY_CTLD_GRACE_S:
+                    raise RuntimeError(f"cannot read Slurm job {slurm_id} from {pod}: "
+                                       f"{err.strip()}")
+                if now == unreadable_since:
+                    self.log(f"[slinky] job {slurm_id}: slurmctld unreadable ({err.strip()[:120]}); "
+                             "still polling")
+                time.sleep(SLINKY_POLL_INTERVAL_S)
+                continue
+            unreadable_since = None
+            state, reason, code = parse_slurm_job(out)
+            if (state, reason) != last:
+                msg = f"[slinky] job {slurm_id}: {state} ({reason})"
+                self.log(msg)
+                append_job_log(job_id, f"{now_iso()} {msg}")
+                last = (state, reason)
+            if state in SLINKY_TERMINAL_STATES:
+                return state, code
+            if state == "PENDING" and reason in SLINKY_FATAL_PENDING_REASONS:
+                self._exec(ctx, pod, f"scancel {slurm_id}", job_id)
+                raise RuntimeError(f"Slurm job {slurm_id} can never start: {reason}")
+            if time.monotonic() >= deadline:
+                self._exec(ctx, pod, f"scancel {slurm_id}", job_id)
+                raise RuntimeError(f"Slurm job {slurm_id} did not finish within "
+                                   f"{SLINKY_RUN_TIMEOUT_S:.0f}s (last state {state})")
+            time.sleep(SLINKY_POLL_INTERVAL_S)
+
+    def _accounted(self, ctx: str, pod: str, slurm_id: str) -> tuple[str, int | None] | None:
+        """(state, exit code) of a finished job from slurmdbd, or None when
+        accounting has no terminal record of it."""
+        rc, out, _ = self._exec(ctx, pod, f"sacct -j {slurm_id} -X -n -P -o State,ExitCode")
+        line = out.strip().splitlines()[0] if rc == 0 and out.strip() else ""
+        if "|" not in line:
+            return None
+        state, exit_code = line.split("|", 1)
+        state = state.split()[0]
+        if state not in SLINKY_TERMINAL_STATES:
+            return None
+        _, _, code = parse_slurm_job(f"JobState={state} ExitCode={exit_code}")
+        return state, code
+
+    def collect(self, nodes, job_id, spec, dest):
+        """Stream the shared workdir out of the login pod as a tar, keeping
+        stdout.log and output_dir files and dropping staging artifacts. A
+        stream cut by a transport failure is fetched again from the start."""
+        import tarfile
+        ctx = self._context_of(nodes[0])
+        pod = self._login_pod(ctx)
+        os.makedirs(dest, exist_ok=True)
+        argv = self._exec_argv(ctx, pod, f"tar -C {shlex.quote(self._workdir(job_id))} -cf - .")
+        for attempt in range(1, SLINKY_TRANSPORT_RETRIES + 1):
+            append_job_log(job_id, f"{now_iso()} $ {' '.join(shlex.quote(a) for a in argv)}")
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                    for member in tar:
+                        top = member.name.lstrip("./").split("/", 1)[0]
+                        if not top or _is_staging_artifact(top):
+                            continue
+                        tar.extract(member, dest, filter="data")
+            except tarfile.TarError as e:
+                tar_error = str(e)
+            else:
+                tar_error = ""
+            err = proc.stderr.read().decode(errors="replace")
+            if proc.wait() == 0 and not tar_error:
+                return dest
+            if not is_kubectl_transport_error(err) or attempt == SLINKY_TRANSPORT_RETRIES:
+                raise RuntimeError(f"collect from {pod} failed: {err.strip() or tar_error}")
+            self.log(f"[slinky] collect cut off ({err.strip()[:120]}); retry {attempt}")
+            time.sleep(SLINKY_TRANSPORT_BACKOFF_S)
         return dest

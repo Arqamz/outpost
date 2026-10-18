@@ -6,8 +6,10 @@ the Mongo store and the file store.
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any
+import re
 import uuid
 
+from . import inputs as inputs_mod
 from . import launch_models
 from .states import JobState, NodeState
 
@@ -17,8 +19,29 @@ COL_NODES = "nodes"
 COL_AUDIT = "audit"
 
 
+# Providers whose registry nodes are slots on a whole cluster backend rather
+# than machines. A plain pool claim never takes one; only a job routed to that
+# backend (spec.backend, or a node_name pin naming the slot) does.
+BACKEND_PROVIDERS = ("k8s", "slinky")
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+_ORAS_REF_RE = re.compile(r"^oras://[^@\s]+@sha256:[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def parse_image_sif(sif: Any) -> dict[str, str] | None:
+    if sif is None:
+        return None
+    if not (isinstance(sif, dict) and _ORAS_REF_RE.match(str(sif.get("ref") or ""))
+            and _SHA256_RE.match(str(sif.get("sha256") or ""))):
+        raise ValueError(
+            f"image_sif must be {{ref: oras://<registry>/<repo>@sha256:<64 hex>, sha256: "
+            f"sha256:<64 hex>}}, got {sif!r} — fix the image pin that produced this job")
+    return {"ref": sif["ref"], "sha256": sif["sha256"]}
 
 
 @dataclass
@@ -40,6 +63,7 @@ class JobSpec:
     # pool routed by gpu/hybrid below; "k8s" = the KubernetesAdapter (KAI + HAMi),
     # where the job claims ONE k8s slot and node_count is reinterpreted as the
     # gang size (N pods on the shared GPU). See docs/08-kubernetes-backend.md.
+    # "slinky" = the SlinkyAdapter: one slot, node_count = Slurm nodes (docs/11).
     backend: str = ""
     # scheduling constraints
     node_count: int = 1
@@ -56,6 +80,13 @@ class JobSpec:
     # Unlike `params`, this is NOT opaque passthrough: it is validated on parse and
     # a block we cannot honour refuses the job (see launch_models).
     launch: dict[str, Any] | None = None
+    # `image` prebuilt as a SIF: {"ref": "oras://…@sha256:…", "sha256": "sha256:<file>"}.
+    # Apptainer hosts download it instead of converting `image`; validated on parse.
+    image_sif: dict[str, str] | None = None
+    # files outpost downloads, verifies and mounts read-only (reconciler/inputs.py)
+    inputs: list[dict[str, Any]] = field(default_factory=list)
+    # set by an adapter, never by a caller: `src:dst[:ro]` binds for the container
+    mounts: list[str] = field(default_factory=list)
     # legacy label (kept so old specs still parse)
     workload: str = ""
 
@@ -86,6 +117,8 @@ class JobSpec:
             output_dir=d.get("output_dir", "/out"),
             params=d.get("params", {}) or {},
             launch=launch,
+            image_sif=parse_image_sif(d.get("image_sif")),
+            inputs=inputs_mod.parse_inputs(d.get("inputs")),
             workload=d.get("workload", "") or "",
         )
 
@@ -176,6 +209,11 @@ class NodeRecord:
     # each other over that private IP for free; this field just says which one
     # to use for MPI purposes instead of routing around it with a VPN/bastion.
     cluster_ip: str = ""
+    # for a slinky slot that stands for ONE Slurm node (`add-slinky --per-node`):
+    # that node's Slurm name and GPU count. "" = a cluster-wide slot (a
+    # concurrency bound; Slurm picks the nodes).
+    slurm_node: str = ""
+    gpu_count: int = 0
     updated_at: str | None = None
 
     @property
@@ -197,7 +235,8 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "gpu_binds", "kube_context", "cluster_ip", "updated_at"}
+                "gpu_binds", "kube_context", "cluster_ip", "slurm_node", "gpu_count",
+                "updated_at"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 
 
