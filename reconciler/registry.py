@@ -12,7 +12,17 @@ from .audit import Audit
 
 
 class NoCapacity(Exception):
-    pass
+    """Transient: the pool is busy. The job waits and retries."""
+
+
+class Unsatisfiable(Exception):
+    """Permanent: no node in the pool can EVER serve this job as specified.
+
+    Separate from NoCapacity because the remedies are opposite. Waiting fixes
+    contention; it does not grow a node's RAM. A host-memory requirement no node
+    meets would otherwise sit retrying until the capacity timeout -- hours of a
+    claimed GPU box doing nothing, ending in a message about capacity, which is
+    not what went wrong."""
 
 
 def _pinned_names(node_name) -> list[str]:
@@ -46,7 +56,8 @@ class NodeRegistry:
     def claim(self, job_id: str, count: int, require_gpu: bool = False,
               hybrid: bool = False, backend: str | None = None,
               kube_context: str | None = None,
-              node_name: str | None = None) -> list[NodeRecord]:
+              node_name: str | None = None,
+              min_host_memory: int = 0) -> list[NodeRecord]:
         """Exclusively lock `count` matching nodes for job_id. All-or-nothing.
 
         backend set (e.g. "k8s") claims from that backend's pool of slots by
@@ -80,6 +91,25 @@ class NodeRegistry:
             raise NoCapacity(
                 f"node_name pins {len(names)} node(s) ({', '.join(names)}) but the job "
                 f"needs {count} — a pin must name exactly the nodes the job runs on")
+        # ADMISSION BEFORE CLAIMING, against every node the pool has rather than
+        # only the free ones, so the answer does not depend on who happens to be
+        # busy: if no node could serve this requirement even when idle, the job is
+        # wrong about the cluster and should be told now -- not after a solve is
+        # OOM-killed, and not after hours of retrying for capacity that would not
+        # have helped. A node registered before memory was probed reports 0 and is
+        # not credited with memory it has never been asked about.
+        if min_host_memory:
+            pool = [n for n in self.store.list_nodes()
+                    if not names or n.name in names]
+            if not any(getattr(n, "host_memory_bytes", 0) >= min_host_memory for n in pool):
+                detail = ", ".join(
+                    (f"{n.name}={(getattr(n, 'host_memory_bytes', 0) / 2**30):.1f}GiB"
+                     if getattr(n, "host_memory_bytes", 0) else f"{n.name}=unprobed")
+                    for n in pool) or "no matching nodes registered"
+                raise Unsatisfiable(
+                    f"job needs {min_host_memory / 2**30:.1f} GiB of host memory; no node "
+                    f"offers it ({detail}). 'unprobed' means the node was registered before "
+                    f"host memory was recorded -- remove-node then add-node it to probe it")
         claimed: list[NodeRecord] = []
         for i, need_gpu in enumerate(needs):
             # backend claims match by provider (+ optional cluster context);
@@ -87,7 +117,8 @@ class NodeRegistry:
             n = self.store.claim_node(job_id, require_gpu=bool(need_gpu),
                                       provider=backend,
                                       kube_context=kube_context,
-                                      node_name=names[i] if names else None)
+                                      node_name=names[i] if names else None,
+                                      min_host_memory=min_host_memory)
             if n is None:
                 for c in claimed:               # roll back partial claim
                     self.release(c.node_id, reason=f"rollback claim for {job_id}")

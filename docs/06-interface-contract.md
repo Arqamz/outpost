@@ -26,9 +26,18 @@ is intentionally generic — the cluster runs *any* container:
 | `env` | map | env vars set inside the container |
 | `output_dir` | str | in-container path the job writes results to (bound to the host) |
 | `params` | map | opaque passthrough (ignored by the cluster) |
+| `host_memory_bytes` | int | host RAM the payload needs. `0` (default) = no requirement. **A scheduling constraint, not passthrough:** a job asking for more than any registered node has is FAILED at admission, not queued — waiting does not grow a node's RAM. A node registered before host memory was recorded reports `0` ("unprobed") and never satisfies a requirement; re-register it to probe it. |
 | `launch` | map, optional | a semantic placement request (`launch-intent/v1`, see [`contract/README.md`](../contract/README.md)) — resolved against real topology for `launcher: mpi` jobs (any `node_count`) or `launcher: single` at `node_count: 1`; see "Placement" below. Absent = today's behavior, unchanged. |
 | `image_sif` | map, optional | `image` prebuilt as a SIF and published next to it: `{ref: oras://<registry>/<repo>@sha256:…, sha256: sha256:<file>}`. Apptainer nodes download it instead of converting `image`, and refuse it unless its sha256 matches. Malformed = the job is refused. |
 | `inputs` | list, optional | files the job reads, staged by the cluster: `[{source: s3://<bucket>/<prefix>/, manifest: <file of "<sha256>  <path>" lines>, manifest_sha256: sha256:…, path: <container path>, only: [<path prefixes>]}]`. See "Job inputs" below. Malformed = the job is refused. |
+
+> **Why this one is a constraint and not a hint.** HPL-MxP keeps an FP64 copy of
+> the matrix on the host, so the same `n` that fits a 32 GiB box is OOM-killed on
+> a 16 GiB one with the same GPU. Before this field the requirement was computed
+> (by the acceptance resolver and the kubernetes runtime) but never reached this
+> interface, so the job was dispatched, claimed a GPU node, and died part-way
+> through a solve — losing the GPU time and the measurement, and reporting itself
+> as a dead process rather than as a job that was always impossible.
 
 **The cluster promises:** given a JobSpec, it schedules the right resource
 (waiting for capacity to free up if needed, not failing immediately — see

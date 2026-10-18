@@ -91,7 +91,13 @@ class TestCrossNodeFabricPinning:
 
         assert len(compile_calls) == 1
         kw = compile_calls[0]
-        assert kw["mca"]["btl_tcp_if_include"] == "172.31.87.0/24"
+        # BOTH /24s. This fixture's two nodes are in DIFFERENT /24s (87 and 94),
+        # which is the ordinary AWS case, and the old expectation here was
+        # "172.31.87.0/24" alone — rank 0's subnet, excluding rank 1 outright.
+        # The test encoded the defect rather than catching it: a real pair at
+        # 172.31.30.182 / 172.31.29.187 failed its first collective with
+        # "lack of common network interfaces".
+        assert kw["mca"]["btl_tcp_if_include"] == "172.31.87.0/24,172.31.94.0/24"
         assert kw["mca"]["oob_tcp_if_include"] == "172.31.87.50/32,172.31.94.28/32"
         assert kw["node_ifaces"] == {"aws-gpu-1": "ens5", "aws-gpu-2": "ens5"}
 
@@ -113,3 +119,37 @@ class TestCrossNodeFabricPinning:
         assert len(compile_calls) == 1
         assert "mca" not in compile_calls[0]
         assert "node_ifaces" not in compile_calls[0]
+
+
+class TestBtlSubnetCoversEveryNode:
+    """The BTL include must contain every rank's subnet, not just rank 0's.
+
+    Regression for a 2-node AWS job that died ~60s in with OpenMPI's generic
+    "lack of common network interfaces" message. The pair was 172.31.30.182 and
+    172.31.29.187 — one subnet group, two different /24s, which is routine on a
+    VPC — and the include was derived from rank 0 alone, so rank 1's address was
+    not in any advertised network.
+    """
+
+    def test_nodes_in_different_24s_yield_both(self):
+        from reconciler.adapter import fabric_if_include
+        btl, oob = fabric_if_include(
+            [node("a", "172.31.30.182"), node("b", "172.31.29.187")])
+        assert btl == "172.31.30.0/24,172.31.29.0/24"
+        assert oob == "172.31.30.182/32,172.31.29.187/32"
+
+    def test_one_subnet_is_unchanged(self):
+        """The libvirt fabric case this was written for must not move."""
+        from reconciler.adapter import fabric_if_include
+        btl, _ = fabric_if_include(
+            [node("a", "192.168.71.1"), node("b", "192.168.71.11")])
+        assert btl == "192.168.71.0/24"
+
+    def test_duplicate_subnets_are_collapsed_in_rank_order(self):
+        """Four nodes over two subnets give two entries, rank 0's first — the
+        list is an include set, so repeats would just be noise forwarded to
+        every orted."""
+        from reconciler.adapter import fabric_if_include
+        btl, _ = fabric_if_include([node("a", "10.0.5.1"), node("b", "10.0.9.2"),
+                                    node("c", "10.0.5.3"), node("d", "10.0.9.4")])
+        assert btl == "10.0.5.0/24,10.0.9.0/24"
