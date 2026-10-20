@@ -262,6 +262,10 @@ _slinky_cache: dict = {"ts": 0.0, "data": None}
 _slinky_lock = threading.Lock()  # one snapshot at a time; other requests get the last one
 SLINKY_TTL = float(os.environ.get("CLUSTER_DASH_SLINKY_TTL", "10"))
 SLINKY_HISTORY = os.environ.get("CLUSTER_DASH_SLINKY_HISTORY", "now-12hours")
+# Per kubectl call. A tashkil child is reached through the management cluster's
+# chisel door, where one call takes 4-6 s (2026-10-20); 8 s marked a healthy
+# cluster unreachable. The snapshot exec runs seven Slurm commands, so it gets twice this.
+SLINKY_TIMEOUT = float(os.environ.get("CLUSTER_DASH_SLINKY_TIMEOUT", "30"))
 _SLURM_CONFIG_KEYS = ("SLURM_VERSION", "SelectType", "SelectTypeParameters", "TaskPlugin",
                       "TaskPluginParam", "ProctrackType", "CgroupPlugin", "JobAcctGatherType",
                       "GresTypes", "MpiDefault", "SchedulerType", "PriorityType",
@@ -392,7 +396,7 @@ def _slurm_view(sec: dict[str, str], job_names: dict[str, str]) -> dict:
 
 def _slurm_pods(base: list[str]) -> list[dict]:
     r = subprocess.run(base + ["get", "pods", "-n", SLINKY_NAMESPACE, "-o", "json"],
-                       capture_output=True, text=True, timeout=8)
+                       capture_output=True, text=True, timeout=SLINKY_TIMEOUT)
     if r.returncode != 0:
         return []
     out = []
@@ -417,7 +421,7 @@ def _slinky_cluster(ctx: str, job_names: dict[str, str]) -> dict:
                         if p["phase"] == "Running" and "login" in p["name"])
         r = subprocess.run(base + ["get", "pods", "-n", SLINKY_NAMESPACE, "-l", SLINKY_LOGIN_SELECTOR,
                                    "--field-selector=status.phase=Running", "-o", "name"],
-                           capture_output=True, text=True, timeout=8)
+                           capture_output=True, text=True, timeout=SLINKY_TIMEOUT)
         logins = sorted(p.split("/", 1)[-1] for p in r.stdout.split()) or logins
         if not logins:
             out["error"] = (r.stderr.strip() or "no Running login pod")[:200]
@@ -425,7 +429,7 @@ def _slinky_cluster(ctx: str, job_names: dict[str, str]) -> dict:
         out["login_pod"] = logins[0]
         r = subprocess.run(base + ["exec", "-n", SLINKY_NAMESPACE, logins[0], "-c", SLINKY_LOGIN_CONTAINER,
                                    "--", "bash", "-lc", _SLURM_SNAPSHOT],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=2 * SLINKY_TIMEOUT)
     except Exception as e:
         out["error"] = str(e)[:200]
         return out
