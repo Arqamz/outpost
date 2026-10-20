@@ -2056,7 +2056,11 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
         lines += ['MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
                   "export MASTER_ADDR"]
     lines += [f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
-              f"export WORLD_SIZE={ntasks}"]
+              f"export WORLD_SIZE={ntasks}",
+              # The container is the job's own image, with no Slurm tools to ask; the
+              # batch script runs beside slurmd, so it names the version for the task.
+              "SLURM_VERSION=\"$(scontrol --version 2>/dev/null | awk '{print $2}')\"",
+              "export SLURM_VERSION"]
     env = {**(SLINKY_GPU_ENV if spec.gpu else {}), **spec.env}
     for k, v in env.items():
         lines.append(f"export {k}={shlex.quote(str(v))}")

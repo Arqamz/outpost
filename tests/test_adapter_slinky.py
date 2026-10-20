@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -90,6 +91,35 @@ class TestSbatch:
         assert "export SLURM_HOSTFILE=/w/hostfile" in s and "export MASTER_ADDR=node-b" in s
         assert "scontrol show hostnames" not in s
         assert s.strip().splitlines()[-1].startswith("srun --ntasks=2 --distribution=arbitrary --mpi=pmix ")
+
+    @staticmethod
+    def _run_batch(tmp_path, script, scontrol_version):
+        """Run the batch script with stand-in scontrol/srun; the fake srun prints the
+        SLURM_VERSION the task (and so the container) would inherit."""
+        bin_ = tmp_path / "bin"
+        bin_.mkdir()
+        (bin_ / "scontrol").write_text(
+            '#!/bin/sh\n[ "$1" = --version ] && { [ -n "%s" ] && echo "slurm %s"; exit 0; }\n'
+            'echo node-a\n' % (scontrol_version, scontrol_version))
+        (bin_ / "srun").write_text('#!/bin/sh\necho "SLURM_VERSION=$SLURM_VERSION"\n')
+        for f in bin_.iterdir():
+            f.chmod(0o755)
+        path = tmp_path / "job.sbatch"
+        path.write_text(script)
+        env = {"PATH": f"{bin_}:/usr/bin:/bin", "SLURM_JOB_NODELIST": "node-a"}
+        return subprocess.run(["bash", str(path)], capture_output=True, text=True, env=env).stdout
+
+    def test_the_task_inherits_the_nodes_slurm_version(self, tmp_path):
+        s = render_sbatch("job-abc", spec(), str(tmp_path), "/i.sqsh")
+        assert self._run_batch(tmp_path, s, "26.05.5").strip() == "SLURM_VERSION=26.05.5"
+
+    def test_no_scontrol_version_leaves_slurm_version_empty(self, tmp_path):
+        s = render_sbatch("job-abc", spec(), str(tmp_path), "/i.sqsh")
+        assert self._run_batch(tmp_path, s, "").strip() == "SLURM_VERSION="
+
+    def test_a_jobs_own_env_overrides_the_slurm_version(self, tmp_path):
+        s = render_sbatch("job-abc", spec(env={"SLURM_VERSION": "pinned"}), str(tmp_path), "/i.sqsh")
+        assert self._run_batch(tmp_path, s, "26.05.5").strip() == "SLURM_VERSION=pinned"
 
     def test_a_single_launch_on_pinned_nodes_runs_on_the_first(self):
         s = render_sbatch("job-abc", spec(), "/w", "/i.sqsh", nodelist=("node-b",), gpus_per_node=1)
