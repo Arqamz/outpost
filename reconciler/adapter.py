@@ -2315,7 +2315,12 @@ class SlinkyAdapter(ProviderAdapter):
                      f'(umask 077; printf "machine %s login %s password %s\\n" '
                      f'{shlex.quote(registry_host(image))} {shlex.quote(login[0])} "$pw" '
                      f'> "$cfg/.credentials"); export ENROOT_CONFIG_PATH="$cfg"; ')
-        script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
+        # One import at a time per cluster: the login pod's memory is limited
+        # (2 GiB on tashkil Slinky), and two concurrent imports of an NGC image
+        # got it OOM-killed (2026-10-20). A job that waited re-checks the cache,
+        # so it reuses the squashfs the first one built.
+        script = (f"set -e; mkdir -p {images}; exec 8>{images}/.import.lock; flock 8; "
+                  f"if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
                   f"{creds}mkdir -p {images}/.cache {temp}; {mount}"
                   f"export ENROOT_CACHE_PATH={images}/.cache"
                   f"{f' ENROOT_TEMP_PATH={temp}' if temp else ''}; "

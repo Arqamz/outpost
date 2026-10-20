@@ -278,6 +278,17 @@ class TestSlinkyStaging:
         script, _ = execs[-1]
         assert "ENROOT_TEMP_PATH=/enroot-tmp;" in script and "mount" not in script
 
+    def test_imports_take_one_cluster_lock_before_checking_the_cache(self, slinky, monkeypatch):
+        """Two concurrent NGC imports OOM-killed a 2 GiB login pod. The second
+        job must wait for the first and then find its squashfs, not start its own."""
+        a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        a._stage_image("c", "login-0", OCI, "job-1")
+        script, _ = execs[-1]
+        lock = script.index("flock 8;")
+        assert "exec 8>/scratch/outpost/.images/.import.lock" in script[:lock]
+        assert lock < script.index("if [ -s ") < script.index("enroot import")
+
     def test_a_failed_import_refuses(self, monkeypatch):
         a = SlinkyAdapter(log=lambda m: None)
         monkeypatch.setattr(A, "ECR_PROFILE", "ecr")
