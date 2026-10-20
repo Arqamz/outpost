@@ -45,18 +45,29 @@ later job on any node starts from that squashfs, and no slurmd pulls anything.
 path is used as a squashfs as-is.
 
 Enroot needs a temp dir that both accepts overlay whiteouts and can back an
-overlay mount. A login pod has no such dir by default. All three of these were
-seen failing on FSx:
+overlay mount. Tashkil Slinky clusters created since 2026-10-19 give the login
+pod a 64 GiB disk-backed `/enroot-tmp` and set `ENROOT_TEMP_PATH` to it, so by
+default outpost uses the pod's own temp dir and only moves the layer cache to
+`$WORKDIR_ROOT/.images/.cache`, which every login pod shares.
+
+An older login pod has no such dir. All three of these were seen failing on FSx
+(2026-10-14):
 
 - **Lustre:** `failed to mount overlay: Invalid argument`
 - **The container's overlay root:** `failed to create ovlfs whiteout: Operation not permitted` (any image with whiteouts, e.g. every NGC image)
 - **`/tmp`:** a RAM tmpfs, too small for an NGC image (8.5 GB squashfs, about 11 GB unpacked)
 
-So by default the temp dir (`CLUSTER_SLINKY_ENROOT_TEMP`,
-`/var/tmp/outpost-enroot`) is a sparse ext4 image on the shared filesystem
-(`CLUSTER_SLINKY_ENROOT_TEMP_IMAGE`, 64G), loop-mounted inside the privileged
-login pod under a `flock`. Set `CLUSTER_SLINKY_ENROOT_TEMP_IMAGE=""` if the temp
-dir is already a suitable local volume, such as an emptyDir on the node disk.
+There, set `CLUSTER_SLINKY_ENROOT_TEMP_IMAGE=$WORKDIR_ROOT/.images/enroot-temp.ext4`:
+a sparse ext4 image on the shared filesystem (`CLUSTER_SLINKY_ENROOT_TEMP_SIZE`,
+64G) is loop-mounted at `CLUSTER_SLINKY_ENROOT_TEMP` inside the privileged
+login pod, under a `flock`.
+
+**Private registries.** With `CLUSTER_ECR_PROFILE` unset, the import uses the
+login pod's own enroot credentials. Tashkil Slinky clusters keep a fresh ECR
+token for `009644552272.dkr.ecr.us-east-1.amazonaws.com` there
+(`ENROOT_CONFIG_PATH=/etc/tashkil/enroot`), so nobody needs to be logged in.
+Set the profile only for a cluster or registry without those credentials:
+outpost then mints a token and hands it to that one import over stdin.
 
 GPU jobs also export `NVIDIA_VISIBLE_DEVICES=all` and
 `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, because enroot's nvidia hook
@@ -164,8 +175,8 @@ port-forward.
 | `CLUSTER_SLINKY_WORKDIR_ROOT` | `/scratch/outpost` | shared by login and slurmd pods |
 | `CLUSTER_SLINKY_PARTITION` | `` | `` = the default partition |
 | `CLUSTER_SLINKY_MPI` | `pmix` | `srun --mpi` for `launcher: mpi` |
-| `CLUSTER_SLINKY_ENROOT_TEMP` | `/var/tmp/outpost-enroot` | enroot unpack dir |
-| `CLUSTER_SLINKY_ENROOT_TEMP_IMAGE` | `<root>/.images/enroot-temp.ext4` | `` = use the temp dir as-is |
+| `CLUSTER_SLINKY_ENROOT_TEMP` | `` (`/var/tmp/outpost-enroot` with an image) | enroot unpack dir; `` = the login pod's `ENROOT_TEMP_PATH` |
+| `CLUSTER_SLINKY_ENROOT_TEMP_IMAGE` | `` | an ext4 image to loop-mount at the temp dir, for login pods without a disk-backed one |
 | `CLUSTER_SLINKY_ENROOT_TEMP_SIZE` | `64G` | sparse; sized for the largest unpacked image |
 | `CLUSTER_SLINKY_RUN_TIMEOUT` | `3600` | seconds, submit to terminal |
 | `CLUSTER_SLINKY_POLL_INTERVAL` | `10` | |
@@ -173,7 +184,7 @@ port-forward.
 | `CLUSTER_SLINKY_CTLD_GRACE` | `600` | seconds slurmctld may be unreachable before poll, provision or teardown give up |
 | `CLUSTER_SLINKY_TRANSPORT_RETRIES` | `6` | attempts for a call cut by a kubectl transport error (not a command failure) |
 | `CLUSTER_SLINKY_TRANSPORT_BACKOFF` | `5` | seconds between those attempts |
-| `CLUSTER_ECR_PROFILE` | `` | AWS profile outpost mints ECR pull tokens with (every backend). A private ECR image with this unset is refused |
+| `CLUSTER_ECR_PROFILE` | `` | AWS profile outpost mints ECR pull tokens with (every backend). Unset: Slinky relies on the login pod's own credentials; other backends refuse a private ECR image |
 | `CLUSTER_S3_PROFILE` | `` | AWS profile outpost signs job-input downloads with (every backend; see docs/06 "Job inputs") |
 
 ## Performance: what running through Slinky costs and gains

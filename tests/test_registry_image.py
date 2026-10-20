@@ -224,6 +224,7 @@ class TestSlinkyStaging:
 
     def test_an_ecr_import_gets_a_private_credentials_file(self, slinky, monkeypatch):
         a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "ecr")
         monkeypatch.setattr(A, "registry_login", lambda image: ("AWS", "s3cret"))
         a._stage_image("c", "login-0", OCI, "job-1")
         script, stdin = execs[-1]
@@ -239,9 +240,76 @@ class TestSlinkyStaging:
         script, stdin = execs[-1]
         assert stdin is None and "ENROOT_CONFIG_PATH" not in script
 
+    def test_an_ecr_import_without_a_profile_uses_the_login_pods_credentials(self, slinky,
+                                                                               monkeypatch):
+        a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "")  # registry_login would raise for ECR
+        a._stage_image("c", "login-0", OCI, "job-1")
+        script, stdin = execs[-1]
+        assert stdin is None and "ENROOT_CONFIG_PATH" not in script
+        assert f"{ECR}#betacodes/tashkil" in script
+
+    def test_by_default_the_import_uses_the_login_pods_enroot_temp(self, slinky, monkeypatch):
+        a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        monkeypatch.setattr(A, "SLINKY_ENROOT_TEMP", "")
+        monkeypatch.setattr(A, "SLINKY_ENROOT_TEMP_IMAGE", "")
+        a._stage_image("c", "login-0", OCI, "job-1")
+        script, _ = execs[-1]
+        assert "ENROOT_TEMP_PATH" not in script and "mount" not in script
+        assert "export ENROOT_CACHE_PATH=/scratch/outpost/.images/.cache;" in script
+
+    def test_a_temp_image_is_loop_mounted_at_the_temp_dir(self, slinky, monkeypatch):
+        a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        monkeypatch.setattr(A, "SLINKY_ENROOT_TEMP", "/var/tmp/e")
+        monkeypatch.setattr(A, "SLINKY_ENROOT_TEMP_IMAGE", "/scratch/outpost/.images/t.ext4")
+        a._stage_image("c", "login-0", OCI, "job-1")
+        script, _ = execs[-1]
+        assert "mount -o loop,noinit_itable /scratch/outpost/.images/t.ext4 /var/tmp/e" in script
+        assert "ENROOT_TEMP_PATH=/var/tmp/e;" in script
+
+    def test_a_temp_dir_without_an_image_is_used_as_is(self, slinky, monkeypatch):
+        a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        monkeypatch.setattr(A, "SLINKY_ENROOT_TEMP", "/enroot-tmp")
+        monkeypatch.setattr(A, "SLINKY_ENROOT_TEMP_IMAGE", "")
+        a._stage_image("c", "login-0", OCI, "job-1")
+        script, _ = execs[-1]
+        assert "ENROOT_TEMP_PATH=/enroot-tmp;" in script and "mount" not in script
+
+    def test_imports_take_one_cluster_lock_before_checking_the_cache(self, slinky, monkeypatch):
+        """Two concurrent NGC imports OOM-killed a 2 GiB login pod. The second
+        job must wait for the first and then find its squashfs, not start its own."""
+        a, execs = slinky
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        a._stage_image("c", "login-0", OCI, "job-1")
+        script, _ = execs[-1]
+        lock = script.index("flock 8;")
+        assert "exec 8>/scratch/outpost/.images/.import.lock" in script[:lock]
+        assert lock < script.index("if [ -s ") < script.index("enroot import")
+
     def test_a_failed_import_refuses(self, monkeypatch):
         a = SlinkyAdapter(log=lambda m: None)
-        monkeypatch.setattr(A, "registry_login", lambda image: None)
+        monkeypatch.setattr(A, "ECR_PROFILE", "ecr")
+        monkeypatch.setattr(A, "registry_login", lambda image: ("AWS", "s3cret"))
         monkeypatch.setattr(a, "_exec", lambda *args, **kw: (1, "", ""))
-        with pytest.raises(RuntimeError, match="enroot import"):
+        with pytest.raises(RuntimeError, match="enroot import") as e:
             a._stage_image("c", "login-0", OCI, "job-1")
+        assert "CLUSTER_ECR_PROFILE" not in str(e.value)
+
+    def test_a_failed_ecr_import_without_a_profile_names_the_setting(self, monkeypatch):
+        a = SlinkyAdapter(log=lambda m: None)
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        monkeypatch.setattr(a, "_exec", lambda *args, **kw: (1, "", ""))
+        with pytest.raises(RuntimeError, match="set CLUSTER_ECR_PROFILE"):
+            a._stage_image("c", "login-0", OCI, "job-1")
+
+    def test_a_failed_public_import_does_not_name_the_ecr_setting(self, monkeypatch):
+        a = SlinkyAdapter(log=lambda m: None)
+        monkeypatch.setattr(A, "ECR_PROFILE", "")
+        monkeypatch.setattr(a, "_exec", lambda *args, **kw: (1, "", ""))
+        with pytest.raises(RuntimeError, match="enroot import") as e:
+            a._stage_image("c", "login-0", "docker://nvcr.io/nvidia/hpc-benchmarks@sha256:"
+                           + "a" * 64, "job-1")
+        assert "CLUSTER_ECR_PROFILE" not in str(e.value)

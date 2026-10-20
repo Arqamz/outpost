@@ -225,16 +225,18 @@ SLINKY_LOGIN_SELECTOR = os.environ.get("CLUSTER_SLINKY_LOGIN_SELECTOR",
 SLINKY_LOGIN_CONTAINER = os.environ.get("CLUSTER_SLINKY_LOGIN_CONTAINER", "login")
 SLINKY_WORKDIR_ROOT = os.environ.get("CLUSTER_SLINKY_WORKDIR_ROOT", "/scratch/outpost")
 # Where enroot unpacks layers while building a squashfs. It needs a filesystem
-# that takes overlay whiteouts AND can back an overlay mount, which rules out
-# all three a login pod has by default (seen on FSx, 2026-10-14): Lustre fails
+# that takes overlay whiteouts AND can back an overlay mount. Tashkil Slinky
+# clusters created since 2026-10-19 give the login pod a disk-backed volume and
+# point ENROOT_TEMP_PATH at it, so by default ("") outpost uses the pod's own.
+# An older login pod has no such dir (seen on FSx, 2026-10-14): Lustre fails
 # the overlay mount, the container's own overlay root refuses whiteout device
-# nodes, and /tmp is a RAM tmpfs too small for an NGC image. So by default the
-# temp dir is a sparse ext4 image on the shared filesystem, loop-mounted in the
-# (privileged) login pod. Set CLUSTER_SLINKY_ENROOT_TEMP_IMAGE="" when the
-# temp dir is already a suitable local volume.
-SLINKY_ENROOT_TEMP = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP", "/var/tmp/outpost-enroot")
-SLINKY_ENROOT_TEMP_IMAGE = os.environ.get(
-    "CLUSTER_SLINKY_ENROOT_TEMP_IMAGE", f"{SLINKY_WORKDIR_ROOT}/.images/enroot-temp.ext4")
+# nodes, and /tmp is a RAM tmpfs too small for an NGC image. There, set
+# CLUSTER_SLINKY_ENROOT_TEMP_IMAGE to a path on the shared filesystem: a sparse
+# ext4 image there is loop-mounted at CLUSTER_SLINKY_ENROOT_TEMP in the
+# (privileged) login pod.
+SLINKY_ENROOT_TEMP_IMAGE = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP_IMAGE", "")
+SLINKY_ENROOT_TEMP = os.environ.get(
+    "CLUSTER_SLINKY_ENROOT_TEMP", "/var/tmp/outpost-enroot" if SLINKY_ENROOT_TEMP_IMAGE else "")
 SLINKY_ENROOT_TEMP_SIZE = os.environ.get("CLUSTER_SLINKY_ENROOT_TEMP_SIZE", "64G")
 SLINKY_PARTITION = os.environ.get("CLUSTER_SLINKY_PARTITION", "")   # "" = the cluster's default
 SLINKY_MPI = os.environ.get("CLUSTER_SLINKY_MPI", "pmix")           # srun --mpi for launcher: mpi
@@ -2054,7 +2056,11 @@ def render_sbatch(job_id: str, spec: JobSpec, workdir: str, image: str,
         lines += ['MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"',
                   "export MASTER_ADDR"]
     lines += [f"export MASTER_PORT={shlex.quote(str(spec.params.get('master_port', K8S_MASTER_PORT)))}",
-              f"export WORLD_SIZE={ntasks}"]
+              f"export WORLD_SIZE={ntasks}",
+              # The container is the job's own image, with no Slurm tools to ask; the
+              # batch script runs beside slurmd, so it names the version for the task.
+              "SLURM_VERSION=\"$(scontrol --version 2>/dev/null | awk '{print $2}')\"",
+              "export SLURM_VERSION"]
     env = {**(SLINKY_GPU_ENV if spec.gpu else {}), **spec.env}
     for k, v in env.items():
         lines.append(f"export {k}={shlex.quote(str(v))}")
@@ -2291,9 +2297,9 @@ class SlinkyAdapter(ProviderAdapter):
         sqsh = f"{images}/{slinky_squashfs_name(image)}"
         tmp = f"{sqsh}.{job_id}.tmp"
         uri = slinky_image_ref(image)
-        temp = shlex.quote(SLINKY_ENROOT_TEMP)
+        temp = shlex.quote(SLINKY_ENROOT_TEMP) if SLINKY_ENROOT_TEMP else ""
         mount = ""
-        if SLINKY_ENROOT_TEMP_IMAGE:
+        if SLINKY_ENROOT_TEMP_IMAGE and temp:
             img = shlex.quote(SLINKY_ENROOT_TEMP_IMAGE)
             mount = (f"exec 9>{img}.lock; flock 9; "
                      f"[ -e {img} ] || {{ truncate -s {SLINKY_ENROOT_TEMP_SIZE} {img} && "
@@ -2304,23 +2310,35 @@ class SlinkyAdapter(ProviderAdapter):
             return sqsh
         # enroot reads registry credentials only from $ENROOT_CONFIG_PATH/.credentials,
         # so the token goes into a private temp dir that is gone when the import ends.
-        login = registry_login(image)
+        # Without CLUSTER_ECR_PROFILE the login pod's own ENROOT_CONFIG_PATH is used:
+        # tashkil Slinky clusters keep a fresh ECR token there since 2026-10-19.
+        login = registry_login(image) if ECR_PROFILE else None
         creds = ""
         if login:
             creds = (f'cfg=$(mktemp -d); trap \'rm -rf "$cfg"\' EXIT; read -r pw; '
                      f'(umask 077; printf "machine %s login %s password %s\\n" '
                      f'{shlex.quote(registry_host(image))} {shlex.quote(login[0])} "$pw" '
                      f'> "$cfg/.credentials"); export ENROOT_CONFIG_PATH="$cfg"; ')
-        script = (f"set -e; if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
+        # One import at a time per cluster: the login pod's memory is limited
+        # (2 GiB on tashkil Slinky), and two concurrent imports of an NGC image
+        # got it OOM-killed (2026-10-20). A job that waited re-checks the cache,
+        # so it reuses the squashfs the first one built.
+        script = (f"set -e; mkdir -p {images}; exec 8>{images}/.import.lock; flock 8; "
+                  f"if [ -s {sqsh} ]; then echo 'image cached: {sqsh}'; exit 0; fi; "
                   f"{creds}mkdir -p {images}/.cache {temp}; {mount}"
-                  f"export ENROOT_CACHE_PATH={images}/.cache ENROOT_TEMP_PATH={temp}; "
+                  f"export ENROOT_CACHE_PATH={images}/.cache"
+                  f"{f' ENROOT_TEMP_PATH={temp}' if temp else ''}; "
                   f"rm -f {tmp}; enroot import -o {tmp} {shlex.quote(uri)} && mv -f {tmp} {sqsh}")
         self.log(f"[slinky] staging {uri} -> {sqsh}")
         rc, _, _ = self._exec(ctx, pod, script, job_id,
                               input=f"{login[1]}\n" if login else None)
         if rc != 0:
+            hint = ""
+            if not login and _ECR_HOST_RE.match(registry_host(image)):
+                hint = ("; it used the login pod's own registry credentials — on a cluster "
+                        "without them, set CLUSTER_ECR_PROFILE")
             raise RuntimeError(f"enroot import of {uri} failed in {pod} (exit {rc}); the "
-                               f"import output is in `cluster logs {job_id}`")
+                               f"import output is in `cluster logs {job_id}`{hint}")
         return sqsh
 
     def _submit(self, ctx: str, pod: str, job_id: str, workdir: str, script: str) -> str:
