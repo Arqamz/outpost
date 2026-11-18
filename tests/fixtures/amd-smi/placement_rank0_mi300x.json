@@ -1,0 +1,1 @@
+{"probe_version":"1","hostname":"fp-mi300x-1","global_rank":0,"local_rank":null,"world_size":null,"pid":7222,"allowed_cpus":"0-19","allowed_mems":"0","current_cpu":3,"online_cpus":"0-19","cuda_visible_devices":null,"driver_gpu_uuids":"GPU-8ac1449593d1d319","driver_gpu_count":1,"gpu_vendor":"amd","rocr_visible_devices":"GPU-8ac1449593d1d319","hip_visible_devices":null}
