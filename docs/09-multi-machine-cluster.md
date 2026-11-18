@@ -17,6 +17,7 @@ plane**, not nested Outposts. A job picks a fabric declaratively:
 | VM CPU | (default) `gpu: false` | a libvirt VM on the control-plane host |
 | host GPU (bare) | `gpu: true` | the control-plane host's own GPU, `apptainer --nv` |
 | **remote GPU (bare)** | `gpu: true` | a **static-ssh** GPU worker, `apptainer --nv` over ssh |
+| **remote AMD GPU (bare)** | `gpu: true` + `params.node_name` | a **static-ssh** node with `gpu_vendor: amd`, `apptainer --rocm` over ssh |
 | **KAI + HAMi** | `backend: k8s` | a gang of N pods on a k8s cluster's GPU (VRAM-sliced) |
 
 The last two are the ones this doc wires up across machines.
@@ -73,6 +74,16 @@ A `gpu: true, launcher: single` job can now land on the PC and run
 plain `gpu: true` job will claim *whichever* GPU node is free — the VM host GPU
 or the PC — so if you want to force the PC, keep it the only bare-GPU node, or
 add a dedicated selector later.)
+
+### An AMD (ROCm) GPU worker
+
+Same path, one extra field: `gpu_vendor: amd` (or leave it out and `add-node`
+detects it with `amd-smi`). Start from
+[`node.amd-mi300x.example.yaml`](../node.amd-mi300x.example.yaml); the node then
+runs `apptainer exec --rocm`, planned launches pin its GPU through
+`ROCR_VISIBLE_DEVICES`, and its topology comes from `amd-smi`. Only static-ssh
+runs AMD nodes — the k8s and slinky fabrics stay NVIDIA-only and refuse one. See
+[05-gpu-and-apptainer.md](05-gpu-and-apptainer.md#amd-instinct-rocm-gpu-nodes).
 
 ## Step 3 — the two k8s+HAMi clusters
 

@@ -167,6 +167,107 @@ an NVIDIA CUDA devel image and compiles the kernel to `compute_70` PTX so the
 driver JITs it forward onto whatever GPU is present (this host's Blackwell
 included), without pinning an arch at build time.
 
+## AMD Instinct (ROCm) GPU nodes
+
+A GPU node has a **vendor**: `NodeRecord.gpu_vendor`, `nvidia` (the default —
+every node registered before the field existed, and every manifest that does not
+mention it) or `amd`. Only the **static-ssh** path runs AMD nodes; the
+local-host, libvirt, k8s and slinky backends implement the NVIDIA path only and
+**refuse** an AMD GPU node with an explicit error (`require_nvidia` in
+`adapter.py`) rather than starting its container with no GPU wired in.
+
+What changes on an AMD node — and nothing changes for an NVIDIA one:
+
+| | NVIDIA (unchanged) | AMD |
+|---|---|---|
+| apptainer GPU flag | `--nv` | `--rocm` (binds `/dev/kfd`, `/dev/dri`, a few host ROCm libs) |
+| per-rank GPU pinning (planned launches) | `CUDA_VISIBLE_DEVICES=<GPU-uuid>` | `ROCR_VISIBLE_DEVICES=<GPU-hex>` (ROCr UUID) |
+| GPU inventory / topology | `nvidia-smi --query-gpu`, `nvidia-smi topo -m` | `amd-smi list/static/topology --json` + sysfs (`numa_node`, `local_cpulist`) |
+| receipt checks | `CUDA_VISIBLE_DEVICES` | `ROCR_VISIBLE_DEVICES` |
+| `runtime: docker` | `--gpus all` | refused (use apptainer) |
+
+**Why `ROCR_VISIBLE_DEVICES`, not `HIP_VISIBLE_DEVICES`.** ROCr filters devices
+underneath HIP, OpenCL and OpenMP offload alike, so every ROCm consumer in the
+container (rocminfo, PyTorch, rccl, plain HSA code) sees the same restricted set;
+`HIP_VISIBLE_DEVICES` narrows only HIP. ROCr also accepts the stable device UUID
+(`GPU-` + the ASIC serial in lower-case hex — what `rocminfo` prints as `Uuid:`),
+so a plan pins a physical device by identity, exactly as the NVIDIA path pins by
+GPU UUID. Outpost sets only this one variable (setting both compounds: HIP
+indexes into what ROCr already filtered). A workload that wants to know how many
+GPUs it was given should count the comma-separated entries of
+`ROCR_VISIBLE_DEVICES` (unset = every GPU on the node). The UUID comes from
+`amd-smi static`'s `asic_serial`, **not** amd-smi's own `uuid` field, whose
+format differs between amd-smi versions (the host and an in-container amd-smi
+on the same MI300X VF print different values). Verified on an MI300X VF:
+`ROCR_VISIBLE_DEVICES=GPU-8ac1449593d1d319` → HIP sees 1 device, a bogus UUID →
+0.
+
+As on NVIDIA, the **unplanned** single-node path (no `launch` block) sets no
+visible-devices variable: the container sees every GPU on the node.
+
+### Preparing an AMD box
+
+The node needs the `amdgpu` kernel driver (so `/dev/kfd` + `/dev/dri` exist),
+`amd-smi` on the host (read by the topology probe and by `add-node`'s vendor
+detection), and apptainer. On Ubuntu 24.04, apptainer from the official PPA
+(this is what the MI300X droplet runs, apptainer 1.5.5-1~noble):
+
+```bash
+add-apt-repository -y ppa:apptainer/ppa
+apt-get update && apt-get install -y apptainer
+apptainer exec --rocm docker://rocm/dev-ubuntu-24.04:10.2.0-full rocminfo | grep -E 'gfx|Uuid: +GPU'
+#   Name:  gfx942
+#   Uuid:  GPU-8ac1449593d1d319
+```
+
+The image brings its own ROCm userspace; pick one recent enough for the host's
+driver/firmware. On the DigitalOcean MI300X VF (amdgpu 7.1.3, host ROCm 10.0)
+`rocm/dev-ubuntu-24.04:10.2.0-full` works end to end, while the 7.2.4 image's
+`rocminfo` fails with `HSA_STATUS_ERROR_INVALID_ARGUMENT` (HIP kernels in that
+image still run).
+
+### Adding an AMD static-ssh node
+
+```bash
+cp node.amd-mi300x.example.yaml node.fp-mi300x-1.yaml   # node.*.yaml is gitignored
+$EDITOR node.fp-mi300x-1.yaml                            # ip, ssh_user, ssh_key
+cluster add-node --spec node.fp-mi300x-1.yaml
+#   added static-ssh node fp-mi300x-1 at … (gpu, …, gpu_vendor=amd, host_memory=235.9GiB)
+cluster nodes
+#   fp-mi300x-1  idx=-1 …  available  gpu  static-ssh  apptainer  owner=- vendor=amd
+```
+
+`gpu_vendor: amd` in the manifest is authoritative. Leave it out and `add-node`
+asks the box (`nvidia-smi -L` first, then `amd-smi list`), falling back to
+`nvidia` when neither answers. Bootstrap then checks `apptainer` and, for an AMD
+node, `/dev/kfd` + `/dev/dri`; and if a launch-planned job's topology probe finds
+a different vendor than the node was registered with, the job fails naming the
+fix (re-register it) instead of pinning the wrong variable.
+
+### Submitting to it
+
+```bash
+jid=$(cluster submit --spec job.gpu.amd.example.yaml)   # gpu: true, params.node_name: fp-mi300x-1
+cluster reconcile --execute --interval 5                 # or run it as the daemon
+cluster status "$jid"                                    # -> promoted
+ls "$(cluster result "$jid")"                            # stdout.log, hip-axpb.txt, launch-receipt.yaml, …
+```
+
+**Live-verified** (2026-11-19, DigitalOcean MI300X VF droplet, local control
+plane, static-ssh): `job.gpu.amd.example.yaml` reached `promoted` with exit 0 —
+`ROCR_VISIBLE_DEVICES=GPU-8ac1449593d1d319` delivered, rocminfo saw the gfx942
+agent, amd-smi ran in the container, the HIP kernel validated
+(`max_abs_err=0`), and `launch-plan.yaml`/`launch-receipt.yaml` recorded the GPU
+by ROCr UUID with the receipt's GPU check passing against
+`ROCR_VISIBLE_DEVICES`. (That receipt read `mismatched` on CPUs only: under
+`launcher: single` the preflight probe runs before `exec taskset`, so it sees
+the unbound shell — a launcher-path issue independent of the GPU vendor.)
+
+Pin AMD nodes with `params.node_name` (what GTL does with `--target`): an
+unpinned `gpu: true` job takes any free GPU node, and there is no vendor
+selector in the claim yet, so on a mixed pool a CUDA image could land on an AMD
+box (it then fails at run time, not silently).
+
 ## Caveats (real, but fine for what this is)
 
 - **Contention:** the host also runs libvirtd, the VMs, and the reconciler —

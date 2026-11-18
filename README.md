@@ -215,7 +215,14 @@ job.mpi.small.example.yaml         multi-node MPI JobSpec (node_count: 2)
 job.gpu.example.yaml               GPU JobSpec (nvidia-smi via apptainer --nv)
 job.hybrid.example.yaml            hybrid JobSpec (host GPU node + VM in ONE mpirun)
 job.hybrid.cuda.example.yaml       hybrid JobSpec (VM CPU rank -> host GPU rank, y=a*x+b)
+job.gpu.amd.example.yaml           AMD GPU JobSpec (rocminfo + HIP kernel via apptainer --rocm)
+node.amd-mi300x.example.yaml       static-ssh AMD Instinct node manifest (gpu_vendor: amd)
 ```
+
+GPU nodes default to NVIDIA (`apptainer --nv`). A static-ssh node registered
+with `gpu_vendor: amd` runs `apptainer --rocm` instead, with GPU pinning via
+`ROCR_VISIBLE_DEVICES` and topology from `amd-smi` — see
+[docs/05-gpu-and-apptainer.md](docs/05-gpu-and-apptainer.md#amd-instinct-rocm-gpu-nodes).
 
 ## Running a real job
 
