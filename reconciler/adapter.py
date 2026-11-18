@@ -25,7 +25,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from . import inputs as inputs_mod
-from .models import NodeRecord, JobSpec, RunResult
+from .models import (APPTAINER_GPU_FLAG, NodeRecord, JobSpec, RunResult,
+                     normalize_gpu_vendor)
 from .store import now_iso
 from .topology import PROBE_PATH
 
@@ -482,16 +483,71 @@ def gpu_launch_extras() -> tuple[list[str], dict]:
     return binds, {}
 
 
+def node_gpu_vendor(node: NodeRecord) -> str:
+    """The node's GPU stack, "nvidia" for any record written before the field
+    existed (or carrying an empty value)."""
+    return normalize_gpu_vendor(getattr(node, "gpu_vendor", "") or "nvidia")
+
+
+def job_gpu_vendor(nodes: list[NodeRecord], spec: JobSpec) -> str:
+    """The one GPU vendor a GPU job's container launch is built for.
+
+    Only GPU nodes count (a CPU node's vendor field is meaningless), and a job
+    whose GPU nodes disagree is refused: one argv carries one flag, and an
+    NVIDIA rank given --rocm (or the reverse) gets no GPU at all."""
+    if not spec.gpu:
+        return "nvidia"
+    vendors = {node_gpu_vendor(n) for n in nodes if n.gpu} or {"nvidia"}
+    if len(vendors) > 1:
+        raise RuntimeError(
+            f"job spans GPU nodes of different vendors ({', '.join(sorted(vendors))}: "
+            f"{', '.join(f'{n.name}={node_gpu_vendor(n)}' for n in nodes if n.gpu)}); "
+            "one launch cannot drive both — pin nodes of one vendor (params.node_name)")
+    return vendors.pop()
+
+
+def require_nvidia(nodes: list[NodeRecord], backend: str) -> None:
+    """Refuse an AMD GPU node on a backend that only knows the NVIDIA path.
+
+    Every backend but static-ssh launches GPU work the NVIDIA way (`--nv`,
+    `nvidia.com/gpu`, pyxis/enroot's NVIDIA hook). Handed an AMD node it would
+    not fail — it would start the container with no GPU wired in, and the job
+    would either fall back to CPU or crash somewhere far from the cause. This
+    makes it fail HERE, naming the cause."""
+    amd = [n.name for n in nodes if n.gpu and node_gpu_vendor(n) == "amd"]
+    if amd:
+        raise RuntimeError(
+            f"{backend} backend cannot run AMD GPU node(s) {', '.join(amd)}: it only "
+            "implements the NVIDIA GPU path. Register the box as a static-ssh node "
+            "(cluster add-node, gpu_vendor: amd) — see docs/05-gpu-and-apptainer.md")
+
+
+def _vendor_kw(vendor: str) -> dict:
+    """container_argv kwargs for `vendor`. Empty for NVIDIA so every NVIDIA call
+    is exactly the call it was before vendors existed (and a caller-supplied
+    container_argv with the old signature keeps working)."""
+    return {} if vendor == "nvidia" else {"gpu_vendor": vendor}
+
+
 def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
                    extra_binds: list[str] | None = None,
-                   extra_env: dict | None = None) -> list[str]:
+                   extra_env: dict | None = None,
+                   gpu_vendor: str = "nvidia") -> list[str]:
     """Build the argv that runs `spec.image` with its command, binding a host
     dir to the job's output_dir. Pure function — the single place that knows how
     apptainer/docker are invoked. `image` may be a SIF path or a docker[://] ref
-    (apptainer runs both). extra_binds/extra_env layer on GPU driver paths."""
+    (apptainer runs both). extra_binds/extra_env layer on GPU driver paths.
+
+    gpu_vendor picks the GPU flag for a gpu job: "nvidia" -> `--nv`, "amd" ->
+    `--rocm` (apptainer binds /dev/kfd + /dev/dri and the host's ROCm libs)."""
     extra_binds = extra_binds or []
     env = {**spec.env, **(extra_env or {})}
+    gpu_vendor = normalize_gpu_vendor(gpu_vendor)
     if spec.runtime == "docker":
+        if spec.gpu and gpu_vendor != "nvidia":
+            raise RuntimeError(
+                f"runtime docker has no {gpu_vendor} GPU path here (only --gpus all, "
+                "which is NVIDIA's); run AMD GPU jobs with runtime: apptainer (--rocm)")
         argv = ["docker", "run", "--rm"]
         if spec.gpu:
             argv += ["--gpus", "all"]
@@ -506,7 +562,9 @@ def container_argv(spec: JobSpec, bind_src: str, bind_dst: str,
     # default: apptainer
     argv = ["apptainer", "exec"]
     if spec.gpu:
-        argv += ["--nv"]                       # bind host NVIDIA driver/devices into the container
+        # bind the host's GPU driver/devices into the container: --nv (NVIDIA)
+        # or --rocm (AMD: /dev/kfd, /dev/dri, host ROCm libs)
+        argv += [APPTAINER_GPU_FLAG[gpu_vendor]]
     argv += ["--bind", f"{bind_src}:{bind_dst}"]
     for b in [*extra_binds, *spec.mounts]:
         argv += ["--bind", b]
@@ -747,6 +805,7 @@ class LocalHostAdapter(ProviderAdapter):
         # `plan` is ignored here: this adapter's launcher: mpi path is the
         # HYBRID one (host GPU + VMs, one appfile), a different shape from
         # the plain multi-VM case LibvirtAdapter's planned path targets.
+        require_nvidia(nodes, "local-host")
         node = nodes[0]
         workdir = os.path.join(RUNS_DIR, job_id)
         os.makedirs(workdir, exist_ok=True)
@@ -1051,6 +1110,11 @@ class LibvirtAdapter(ProviderAdapter):
         remote_workdir = f"/tmp/cluster/{job_id}"
         if spec.is_dry_run:
             return RunResult(job_id, head.name, None, remote_workdir, note="no image -> dry-run")
+        # Only a static-ssh box can be an AMD GPU node: a libvirt VM has no GPU
+        # passed through, so one claiming to be AMD is a registry mistake that
+        # would otherwise run with --rocm and no devices.
+        require_nvidia([n for n in nodes if n.provider != "static-ssh"], "libvirt")
+        vendor = job_gpu_vendor(nodes, spec)
         for n in nodes:
             staged = _staged(spec, REMOTE_INPUTS_DIR, lambda s, i, n=n: run_logged(
                 self._ssh_base(n) + [s], job_id, check=False, input=i), self.log)
@@ -1085,7 +1149,8 @@ class LibvirtAdapter(ProviderAdapter):
         run_spec = spec
         if spec.runtime != "docker" and "://" in spec.image:
             run_spec = dataclasses.replace(spec, image=self._ensure_remote_sif(head, spec.image, job_id, spec.image_sif))
-        argv = container_argv(run_spec, remote_workdir, spec.output_dir, extra_binds=extra_binds)
+        argv = container_argv(run_spec, remote_workdir, spec.output_dir, extra_binds=extra_binds,
+                              **_vendor_kw(vendor))
         inner = " ".join(shlex.quote(a) for a in argv)
         stdout_log = f"{remote_workdir}/stdout.log"
         # tee into the workdir (not just captured by run_logged's replay log):
@@ -1327,7 +1392,8 @@ class LibvirtAdapter(ProviderAdapter):
         # is deliberately not published: it is the payload's choice, and every
         # framework has a sane default.
         per_rank = container_argv(rank_spec, remote_workdir, spec.output_dir,
-                                  extra_env={"MASTER_ADDR": head.mpi_ip})
+                                  extra_env={"MASTER_ADDR": head.mpi_ip},
+                                  **_vendor_kw(job_gpu_vendor(nodes, spec)))
         # Same gap _run_planned already closes for a static-ssh head (see its
         # comment): mpirun runs ON the head here too, and a static-ssh box
         # never gets the libvirt fabric's default-`ssh`-just-works key — it
@@ -1426,6 +1492,12 @@ class LibvirtAdapter(ProviderAdapter):
                        "oob_tcp_if_include": oob_inc})
             compile_kwargs["mca"] = mca
             compile_kwargs["node_ifaces"] = {n.name: self._node_iface(n) for n in nodes}
+        # Which visible-devices variable (and apptainer GPU flag) each rank's
+        # node needs. Passed only when some node is non-NVIDIA, so an all-NVIDIA
+        # plan compiles through exactly the call it always did.
+        gpu_vendors = {n.name: node_gpu_vendor(n) for n in nodes}
+        if set(gpu_vendors.values()) != {"nvidia"}:
+            compile_kwargs["gpu_vendors"] = gpu_vendors
         rendering = launcher_adapter.compile(launch_plan, spec, node_ips=node_ips,
                                              workdir=remote_workdir, image=remote_image,
                                              **compile_kwargs)
@@ -1469,7 +1541,9 @@ class LibvirtAdapter(ProviderAdapter):
         observations = (self._fetch_preflight_observations(nodes, remote_workdir)
                         if require_preflight else [])
         receipt = build_receipt(launch_plan, observations, binding_report=combined,
-                                preflight_ran=require_preflight)
+                                preflight_ran=require_preflight,
+                                **({"gpu_vendors": gpu_vendors}
+                                   if "gpu_vendors" in compile_kwargs else {}))
         self._stage_launch_artifacts(head, job_id, remote_workdir, spec.launch, plan, receipt)
 
         return RunResult(job_id, head.name, rc, remote_workdir, stdout_log,
@@ -1579,6 +1653,17 @@ class StaticSshAdapter(LibvirtAdapter):
                     "apptainer on PATH. Confirm the security group allows ssh from this "
                     "host and the cluster key is authorized, and bake apptainer into the "
                     "image (pinned .deb, docs/07-ubuntu-setup.md) before joining it.")
+            if n.gpu and node_gpu_vendor(n) == "amd":
+                # `apptainer --rocm` binds /dev/kfd + /dev/dri; without the
+                # amdgpu kernel driver loaded there is nothing to bind, and the
+                # job would start with no GPU instead of failing here.
+                rc = run_logged(self._ssh_base(n) + ["test -c /dev/kfd && test -d /dev/dri"],
+                                job_id, check=False)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"static-ssh node {n.name} ({n.ip}) is registered gpu_vendor: amd "
+                        "but has no /dev/kfd + /dev/dri — the amdgpu driver is not loaded, "
+                        "so apptainer --rocm has no GPU to give the job")
 
 
 class KubernetesAdapter(ProviderAdapter):
@@ -1743,6 +1828,7 @@ class KubernetesAdapter(ProviderAdapter):
         # `plan` never applies here: backend: k8s jobs are already refused
         # earlier (reconciler.py _phase_provision) if they carry a launch
         # block — the kubelet, not this cluster, owns in-pod CPU/GPU.
+        require_nvidia(nodes, "k8s")
         slot = nodes[0]
         ctx = self._context_of(slot)
         workdir = os.path.join(RUNS_DIR, job_id)
@@ -2369,6 +2455,7 @@ class SlinkyAdapter(ProviderAdapter):
         raise RuntimeError(f"could not reach {pod} to submit the job: {proc.stderr.strip()}")
 
     def run(self, nodes, job_id, spec, plan=None):
+        require_nvidia(nodes, "slinky")
         slot = nodes[0]
         ctx = self._context_of(slot)
         local = os.path.join(RUNS_DIR, job_id)

@@ -50,11 +50,21 @@ online_cpus="$(head -1 /sys/devices/system/cpu/online 2>/dev/null | tr -d ' \t')
 # questions and both are recorded — see the note in receipt.py about which
 # claims each can and cannot support.
 visible_env="${CUDA_VISIBLE_DEVICES:-}"
-gpu_uuids=""; gpu_count=0
+gpu_uuids=""; gpu_count=0; amd=""
 if command -v nvidia-smi >/dev/null 2>&1; then
   gpu_uuids="$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null \
                | paste -sd, - 2>/dev/null)"
   gpu_count="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)"
+elif command -v amd-smi >/dev/null 2>&1; then
+  # An AMD node. The launcher delivered ROCR_VISIBLE_DEVICES (see
+  # models.GPU_VISIBLE_ENV), set to ROCr device UUIDs: `GPU-` + the ASIC
+  # serial in lower-case hex, the same id rocminfo prints. amd-smi's own
+  # `uuid` field is a different format, so the serial is what is compared.
+  amd=1
+  gpu_uuids="$(amd-smi static --asic --json 2>/dev/null \
+               | sed -n 's/.*"asic_serial": *"0[xX]\([0-9A-Fa-f]*\)".*/GPU-\1/p' \
+               | tr 'A-F' 'a-f' | paste -sd, - 2>/dev/null)"
+  gpu_count="$(amd-smi list --csv 2>/dev/null | grep -c '^[0-9]' || true)"
 fi
 [ -n "$gpu_count" ] || gpu_count=0
 
@@ -73,6 +83,12 @@ printf '{' > "$OUT/rank-$name.json"
   printf '"cuda_visible_devices":%s,' "$(jstr "$visible_env")"
   printf '"driver_gpu_uuids":%s,' "$(jstr "$gpu_uuids")"
   printf '"driver_gpu_count":%s' "$gpu_count"
+  # AMD-only fields, so an NVIDIA observation is byte-for-byte what it was.
+  if [ -n "$amd" ]; then
+    printf ',"gpu_vendor":"amd",'
+    printf '"rocr_visible_devices":%s,' "$(jstr "${ROCR_VISIBLE_DEVICES:-}")"
+    printf '"hip_visible_devices":%s' "$(jstr "${HIP_VISIBLE_DEVICES:-}")"
+  fi
   printf '}\n'
 } >> "$OUT/rank-$name.json"
 

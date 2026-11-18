@@ -174,6 +174,43 @@ class JobRecord:
         return JobRecord(**d)
 
 
+# GPU stacks a node can speak (NodeRecord.gpu_vendor). "nvidia" first: it is
+# the default, so a record or manifest that never mentions a vendor keeps the
+# behaviour it always had.
+GPU_VENDORS = ("nvidia", "amd")
+
+# The variable that restricts which GPUs a process sees, per vendor.
+#
+# AMD: ROCR_VISIBLE_DEVICES, not HIP_VISIBLE_DEVICES. ROCR_VISIBLE_DEVICES is
+# applied by the ROCr runtime underneath HIP, OpenCL and OpenMP offload alike,
+# so every ROCm consumer in the container (rocminfo, PyTorch, rccl, a raw HSA
+# program) sees the same restricted set; HIP_VISIBLE_DEVICES only narrows HIP
+# and would leave rocminfo and non-HIP code seeing every device. It also takes
+# the ROCr device UUID (`GPU-<16 hex>`, the same id rocminfo prints), so a
+# plan can pin a PHYSICAL device by identity, exactly as CUDA_VISIBLE_DEVICES
+# is set to NVIDIA GPU UUIDs, rather than by an enumeration index that can
+# change between boots. Setting both would compound (HIP indexes into what
+# ROCr already filtered), so only one is set.
+GPU_VISIBLE_ENV = {"nvidia": "CUDA_VISIBLE_DEVICES", "amd": "ROCR_VISIBLE_DEVICES"}
+
+# The apptainer flag that binds a vendor's driver/devices into the container.
+APPTAINER_GPU_FLAG = {"nvidia": "--nv", "amd": "--rocm"}
+
+
+def gpu_visible_env(vendor: str | None) -> str:
+    """The visible-devices variable for `vendor` ("" / None -> nvidia)."""
+    return GPU_VISIBLE_ENV[normalize_gpu_vendor(vendor)]
+
+
+def normalize_gpu_vendor(vendor: str | None) -> str:
+    """"" / None -> "nvidia"; anything outside GPU_VENDORS is refused, not
+    guessed at — a typo'd vendor would otherwise silently run as NVIDIA."""
+    v = (vendor or "nvidia").strip().lower()
+    if v not in GPU_VENDORS:
+        raise ValueError(f"unknown gpu_vendor {vendor!r} (expected one of {', '.join(GPU_VENDORS)})")
+    return v
+
+
 @dataclass
 class NodeRecord:
     node_id: str                        # stable id, == name today
@@ -203,6 +240,14 @@ class NodeRecord:
     # which exist on that node), while an Ubuntu worker wants "" (--nv self-
     # detects). Only consulted for gpu runs; empty = plain --nv.
     gpu_binds: str = ""
+    # Which GPU stack this node's GPUs speak: "nvidia" (the default, and every
+    # node registered before this field existed) or "amd" (ROCm / AMD Instinct).
+    # It decides the apptainer GPU flag (--nv vs --rocm), the per-rank
+    # visible-devices variable the planned launcher sets (CUDA_VISIBLE_DEVICES
+    # vs ROCR_VISIBLE_DEVICES), and which variable the launch receipt checks.
+    # Only the static-ssh path runs AMD nodes; every other adapter refuses one
+    # (see adapter.require_nvidia). Ignored for a gpu: false node.
+    gpu_vendor: str = "nvidia"
     # TOTAL host RAM on this node, in bytes, as the node itself reported it at
     # registration (MemTotal). 0 = never probed, which is every node registered
     # before this existed.
@@ -257,7 +302,7 @@ class NodeRecord:
         # tolerate records written before capability fields existed
         keep = {"node_id", "name", "index", "ip", "state", "owner_job",
                 "gpu", "local", "runtime", "provider", "ssh_user", "ssh_key",
-                "gpu_binds", "kube_context", "cluster_ip", "slurm_node", "gpu_count",
+                "gpu_binds", "gpu_vendor", "kube_context", "cluster_ip", "slurm_node", "gpu_count",
                 "updated_at", "host_memory_bytes"}
         return NodeRecord(**{k: v for k, v in d.items() if k in keep})
 

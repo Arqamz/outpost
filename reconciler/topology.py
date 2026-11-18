@@ -186,6 +186,96 @@ def parse_topo_matrix(text: str | None) -> dict[str, dict]:
     return rows
 
 
+def _amd_json(blob) -> object:
+    """One captured amd-smi JSON view (a string from the probe, or already
+    parsed). Unparseable or missing -> None: the probe captured whatever
+    amd-smi printed, which on a broken driver is an error message, not JSON."""
+    if blob is None or isinstance(blob, (list, dict)):
+        return blob
+    try:
+        return json.loads(blob)
+    except (TypeError, ValueError):
+        return None
+
+
+def _amd_gpu_rows(view) -> list[dict]:
+    """amd-smi's per-GPU rows. Newer amd-smi wraps `static` in
+    {"gpu_data": [...]}; `list`/`topology` (and older `static`) are a bare list."""
+    if isinstance(view, dict):
+        view = view.get("gpu_data")
+    return [r for r in view if isinstance(r, dict)] if isinstance(view, list) else []
+
+
+def rocr_uuid(asic_serial: str | None) -> str:
+    """amd-smi's `asic_serial` ("0x8AC1449593D1D319") -> the ROCr device UUID
+    ("GPU-8ac1449593d1d319") — what rocminfo prints and what
+    ROCR_VISIBLE_DEVICES accepts. amd-smi's own `uuid` field is a different,
+    version-dependent format (the host and container amd-smi on the same MI300X
+    VF disagree on it), so it is never used as the identity. "" if absent."""
+    raw = str(asic_serial or "").strip().lower()
+    raw = raw[2:] if raw.startswith("0x") else raw
+    return f"GPU-{raw}" if raw and all(c in "0123456789abcdef" for c in raw) else ""
+
+
+def _mib(size) -> int | None:
+    """amd-smi `{"value": 196288, "unit": "MB"}` -> 196288. amd-smi's "MB" is
+    MiB (196288 is exactly 192 GiB on an MI300X); GB is scaled up."""
+    if not isinstance(size, dict):
+        return None
+    try:
+        value = int(size.get("value"))
+    except (TypeError, ValueError):
+        return None
+    unit = str(size.get("unit") or "MB").upper()
+    return value * 1024 if unit in ("GB", "GIB") else value
+
+
+def amd_gpus(amd_smi: dict | None) -> list[dict]:
+    """The probe's verbatim amd-smi capture -> the same per-GPU dicts the
+    NVIDIA branch of the probe emits (index, uuid, pci_bus_id, memory_mib,
+    name, numa), plus `cpu_affinity` (sysfs local_cpulist) and `links` (from
+    `amd-smi topology`: peer label -> XGMI / PCIE, self -> X).
+
+    Inventory comes from `amd-smi list`; `static` adds identity and size;
+    a GPU `static` has nothing for is kept with what is known rather than
+    dropped, and a GPU with no ROCr UUID has uuid "" (the resolver then cannot
+    pin it, which is the honest outcome)."""
+    if not isinstance(amd_smi, dict):
+        return []
+    listed = _amd_gpu_rows(_amd_json(amd_smi.get("list")))
+    static = {r.get("gpu"): r for r in _amd_gpu_rows(_amd_json(amd_smi.get("static")))}
+    topo = {r.get("gpu"): r for r in _amd_gpu_rows(_amd_json(amd_smi.get("topology")))}
+    pci: dict[str, tuple] = {}
+    for line in str(amd_smi.get("pci") or "").splitlines():
+        parts = line.split()
+        if parts:
+            numa = parts[1] if len(parts) > 1 else ""
+            pci[parts[0].lower()] = (
+                int(numa) if numa.lstrip("-").isdigit() and numa != "-1" else None,
+                expand_cpulist(parts[2]) if len(parts) > 2 else ())
+    gpus = []
+    for row in listed:
+        idx = row.get("gpu")
+        if not isinstance(idx, int):
+            continue
+        st = static.get(idx) or {}
+        asic = st.get("asic") or {}
+        bdf = str(row.get("bdf") or (st.get("bus") or {}).get("bdf") or "")
+        numa, local_cpus = pci.get(bdf.lower(), (None, ()))
+        links = {}
+        for link in (topo.get(idx) or {}).get("links") or []:
+            peer, kind = link.get("gpu"), str(link.get("link_type") or "").upper()
+            if isinstance(peer, int) and kind:
+                links[f"GPU{peer}"] = "X" if kind == "SELF" else kind
+        gpus.append({
+            "index": idx, "uuid": rocr_uuid(asic.get("asic_serial")),
+            "pci_bus_id": bdf, "memory_mib": _mib((st.get("vram") or {}).get("size")),
+            "name": asic.get("market_name") or "", "numa": numa,
+            "cpu_affinity": local_cpus, "links": links,
+        })
+    return sorted(gpus, key=lambda g: g["index"])
+
+
 def _cores_from_cpus(cpus: list[Cpu]) -> tuple[Core, ...]:
     """Group processing units into physical cores.
 
@@ -236,6 +326,19 @@ def normalize(raw: dict, node_name: str) -> NodeTopology:
 
     matrix = parse_topo_matrix(raw.get("topo_matrix"))
     gpus = []
+    if raw.get("gpu_vendor") == "amd" and not raw.get("gpus"):
+        # AMD: no topology matrix; amd-smi + sysfs give the same facts. The
+        # kernel's local_cpulist plays the matrix's "CPU Affinity" role.
+        for g in amd_gpus(raw.get("amd_smi")):
+            gpus.append(Gpu(
+                index=g["index"], uuid=g["uuid"], pci_bus_id=g["pci_bus_id"],
+                memory_mib=g["memory_mib"], name=g["name"], numa=g["numa"],
+                cpu_affinity=tuple(g["cpu_affinity"]), links=g["links"],
+                numa_source="sysfs" if g["numa"] is not None else "unknown",
+            ))
+            if not g["uuid"]:
+                warnings.append(f"AMD GPU{g['index']} has no ASIC serial in amd-smi static; "
+                                "it has no ROCr UUID, so a plan cannot pin it")
     for g in raw.get("gpus") or []:
         label = f"GPU{g.get('index')}"
         from_matrix = matrix.get(label, {})

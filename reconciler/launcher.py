@@ -25,6 +25,7 @@ import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from .models import gpu_visible_env, normalize_gpu_vendor
 from .placement import LaunchPlan, RankPlacement
 
 APPFILE = "launcher-appfile.txt"
@@ -75,6 +76,18 @@ def slot_expression(slots: tuple[tuple[int, int], ...]) -> str:
         by_socket.setdefault(socket, []).append(core)
     return ";".join(f"{socket}:{_compress(cores)}"
                     for socket, cores in sorted(by_socket.items()))
+
+
+def _rank_vendor(gpu_vendors: dict[str, str] | None, rank: RankPlacement) -> str:
+    """The GPU vendor of the node a rank lands on; NVIDIA when the caller said
+    nothing (every caller before vendors existed)."""
+    return normalize_gpu_vendor((gpu_vendors or {}).get(rank.node))
+
+
+def _argv_vendor_kw(vendor: str) -> dict:
+    """Extra container_argv kwargs for a non-NVIDIA rank. Empty for NVIDIA so a
+    caller-supplied container_argv with the original signature still works."""
+    return {} if vendor == "nvidia" else {"gpu_vendor": vendor}
 
 
 class LauncherAdapter(ABC):
@@ -143,7 +156,8 @@ class OpenMPILauncherAdapter(LauncherAdapter):
     def compile(self, plan: LaunchPlan, spec, *, node_ips: dict[str, str],
                 workdir: str, image: str, mca: dict[str, str] | None = None,
                 rsh_agent: str | None = None, no_tree_spawn: bool = False,
-                container_argv=None, node_ifaces: dict[str, str] | None = None) -> LauncherRendering:
+                container_argv=None, node_ifaces: dict[str, str] | None = None,
+                gpu_vendors: dict[str, str] | None = None) -> LauncherRendering:
         from .adapter import container_argv as default_container_argv
         build_argv = container_argv or default_container_argv
         import dataclasses
@@ -172,13 +186,16 @@ class OpenMPILauncherAdapter(LauncherAdapter):
 
         for rank in plan.ranks:
             env = dict(spec.env)
+            vendor = _rank_vendor(gpu_vendors, rank)
             if rank.gpu_uuids:
                 # By UUID, not by index: index order depends on the driver's
                 # enumeration and on CUDA_DEVICE_ORDER, and a plan that promised
                 # specific physical devices must not be re-pointed by either.
                 # Joined in gpu_uuids order — that order IS the container's own
                 # device-index order (visible_gpu_indices), by construction.
-                env["CUDA_VISIBLE_DEVICES"] = ",".join(rank.gpu_uuids)
+                # The variable is the node's vendor's: CUDA_VISIBLE_DEVICES for
+                # NVIDIA, ROCR_VISIBLE_DEVICES (ROCr `GPU-<hex>` UUIDs) for AMD.
+                env[gpu_visible_env(vendor)] = ",".join(rank.gpu_uuids)
             if node_ifaces and rank.node in node_ifaces:
                 # Pin UCX to the interface adapter.py's _node_iface found for
                 # this rank's node — reachable by the caller's SAME reasoning
@@ -192,7 +209,8 @@ class OpenMPILauncherAdapter(LauncherAdapter):
             per_rank_env[rank.global_rank] = env
 
             rank_spec = dataclasses.replace(spec, image=image, gpu=bool(rank.gpu_uuids))
-            argv = build_argv(rank_spec, workdir, spec.output_dir, None, env)
+            argv = build_argv(rank_spec, workdir, spec.output_dir, None, env,
+                              **_argv_vendor_kw(vendor))
 
             script_name = f"launcher-rank-{rank.global_rank}.sh"
             # `exec` so the rank process IS the workload: one less process in the
@@ -288,10 +306,12 @@ class LocalProcessLauncherAdapter(LauncherAdapter):
         rank: RankPlacement = plan.ranks[0]
 
         env = dict(spec.env)
+        vendor = _rank_vendor(kw.get("gpu_vendors"), rank)
         if rank.gpu_uuids:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(rank.gpu_uuids)
+            env[gpu_visible_env(vendor)] = ",".join(rank.gpu_uuids)
         rank_spec = dataclasses.replace(spec, image=image, gpu=bool(rank.gpu_uuids))
-        argv = list(build_argv(rank_spec, workdir, spec.output_dir, None, env))
+        argv = list(build_argv(rank_spec, workdir, spec.output_dir, None, env,
+                               **_argv_vendor_kw(vendor)))
         if rank.cpu_ids:
             # taskset sets the affinity mask on itself and then execs, so every
             # descendant — apptainer, and the workload inside it — inherits it.
