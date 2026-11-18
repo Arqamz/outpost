@@ -1,0 +1,26 @@
+# Static SSH AMD Instinct (ROCm) GPU-worker manifest — join a pre-provisioned
+# AMD GPU box (e.g. a DigitalOcean MI300X droplet) as a worker the cluster runs
+# `apptainer exec --rocm` jobs on over ssh:
+#   cluster add-node --spec node.amd-mi300x.example.yaml
+#
+# Copy to node.<name>.yaml (gitignored — it holds a real IP) and edit.
+#
+# Prereqs on the box before it passes bootstrap (docs/05-gpu-and-apptainer.md):
+#   - the amdgpu kernel driver loaded (/dev/kfd + /dev/dri present) — ROCm on
+#     the HOST is optional (apptainer --rocm binds a few host libs if present;
+#     the image brings its own ROCm userspace), but amd-smi on the host is what
+#     the topology probe and gpu_vendor auto-detection read
+#   - apptainer on the ssh user's non-login PATH (Ubuntu 24.04: the official
+#     PPA, `add-apt-repository -y ppa:apptainer/ppa && apt-get install -y apptainer`)
+#   - the control plane's ssh key authorized for ssh_user
+
+name: fp-mi300x-1                   # unique node name in the registry
+ip: 203.0.113.7                     # public IP (ssh-reachable from the control plane)
+ssh_user: root                      # DO droplets log in as root
+ssh_key: ~/.ssh/tashkil             # PRIVATE key on the control plane
+gpu: true
+gpu_vendor: amd                     # nvidia (default) | amd. Omit it and add-node
+                                    # detects it on the box (nvidia-smi, then amd-smi)
+runtime: apptainer
+# gpu_binds: leave empty — apptainer --rocm finds /dev/kfd, /dev/dri and the
+# host's ROCm libs on its own on Ubuntu.

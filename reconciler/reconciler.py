@@ -414,6 +414,17 @@ class Reconciler:
         This is what makes it fake-able in tests the same way run() already is.
         """
         raw = self._adapter_for(node).probe_topology(node, job_id)
+        # The probe sees which GPU stack the node really has. If that is not
+        # what the node was registered as, the plan would pin AMD UUIDs through
+        # CUDA_VISIBLE_DEVICES (or the reverse) and the job would get no GPU;
+        # refuse here, naming the fix, instead.
+        probed = raw.get("gpu_vendor") or ("nvidia" if raw.get("gpus") else None)
+        registered = getattr(node, "gpu_vendor", "") or "nvidia"
+        if node.gpu and probed and probed != registered:
+            raise RuntimeError(
+                f"{node.name} is registered gpu_vendor: {registered} but its topology probe "
+                f"found {probed} GPUs — re-register it (remove-node, then add-node with "
+                f"gpu_vendor: {probed})")
         return normalize_topology(raw, node.name)
 
     def _phase_plan(self, job: JobRecord) -> None:

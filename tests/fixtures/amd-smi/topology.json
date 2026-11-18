@@ -1,0 +1,21 @@
+[
+    {
+        "gpu": 0,
+        "bdf": "0000:83:00.0",
+        "links": [
+            {
+                "gpu": 0,
+                "bdf": "0000:83:00.0",
+                "weight": 0,
+                "link_status": "ENABLED",
+                "link_type": "SELF",
+                "num_hops": 0,
+                "bandwidth": "N/A",
+                "coherent": "SELF",
+                "atomics": "SELF",
+                "dma": "SELF",
+                "bi_dir": "SELF"
+            }
+        ]
+    }
+]

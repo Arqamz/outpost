@@ -89,6 +89,8 @@ job.k8s.example.yaml        k8s-backend JobSpec (gang of N pods on one GPU, KAI+
 job.k8s.small.example.yaml  k8s-backend JobSpec (node_count: 2, for quick/concurrency tests)
 node.ec2.example.yaml       static-ssh CPU worker manifest (cluster add-node)
 node.pc-gpu.example.yaml    static-ssh GPU worker manifest (remote apptainer --nv + gpu_binds)
+node.amd-mi300x.example.yaml static-ssh AMD GPU worker manifest (gpu_vendor: amd -> apptainer --rocm)
+job.gpu.amd.example.yaml    AMD GPU JobSpec (rocminfo + HIP kernel, launch-planned, ROCR_VISIBLE_DEVICES)
 env.sh                      source on a non-nix host (Ubuntu) in place of the dev shell
 ```
 
@@ -179,7 +181,10 @@ add-node --spec node.ec2.example.yaml` (a YAML manifest: name/ip/ssh_user/
 ssh_key/gpu/runtime); per-node `ssh_user`/`ssh_key` let it use its own
 credentials instead of the cluster fabric's. AWS launch template + first-boot
 apptainer install + full walkthrough live in `infra/aws/`. Spot reclamation surfaces as an ssh failure → the existing
-failure→quarantine path. Keep static nodes `launcher: single` (multi-node
+failure→quarantine path. A static GPU node may be `gpu_vendor: amd` (AMD Instinct/ROCm): `apptainer
+--rocm`, planned launches pin GPUs via `ROCR_VISIBLE_DEVICES` (ROCr UUIDs), topology
+from `amd-smi`; every other adapter refuses an AMD node (`require_nvidia`), see
+docs/05. Keep static nodes `launcher: single` (multi-node
 `mpirun` across a WAN is latency-bound and trips the hybrid fabric pinning).
 
 `k8s` → `KubernetesAdapter` — the whole KAI+HAMi cluster as a backend. Unlike

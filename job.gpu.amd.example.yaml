@@ -1,0 +1,65 @@
+# AMD (ROCm) GPU JobSpec — the same open interface, routed to an AMD static-ssh
+# node (gpu_vendor: amd), which runs it as `apptainer exec --rocm`.
+#
+#   cluster submit --spec job.gpu.amd.example.yaml
+#
+# params.node_name pins the AMD box: an unpinned `gpu: true` job takes ANY free
+# GPU node, NVIDIA or AMD, and a ROCm image cannot use an NVIDIA GPU.
+#
+# The launch block makes outpost resolve a placement against the node's real
+# topology (amd-smi + sysfs), pin the GPU by its ROCr UUID through
+# ROCR_VISIBLE_DEVICES, run the preflight probe, and write
+# launch-{intent,plan,receipt}.yaml beside stdout.log. Drop it for a plain run
+# (the whole GPU set visible, no receipt).
+#
+# The job checks the ROCm stack end to end: rocminfo sees the gfx942 agent,
+# amd-smi works in the container, and a HIP kernel (y = 2x + 1 over 1M floats)
+# compiled for gfx942 runs on the GPU and validates its result.
+
+name: rocm-smoke
+gpu: true
+node_count: 1
+runtime: apptainer
+launcher: single
+# rocm/dev-ubuntu-24.04:10.2.0-full, digest-pinned (apptainer refuses a ref with BOTH a tag and a digest)
+image: "docker://rocm/dev-ubuntu-24.04@sha256:21801c0ba1bc4aba31f81ab11fe576c43daa7f2c7f42bac7baaa4d2f75273f86"
+command:
+  - sh
+  - -c
+  - |
+    set -e
+    echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}" | tee /out/visible.txt
+    rocminfo > /out/rocminfo.txt
+    grep -E 'Marketing Name|Name: +gfx|Uuid: +GPU' /out/rocminfo.txt
+    amd-smi list | tee /out/amd-smi-list.txt
+    cat > /tmp/axpb.hip <<'HIP'
+    #include <hip/hip_runtime.h>
+    #include <cstdio>
+    __global__ void axpb(float* y, const float* x, float a, float b, int n) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = a * x[i] + b; }
+    int main() {
+      int n = 1 << 20, c = 0; hipGetDeviceCount(&c); if (!c) { printf("no GPU\n"); return 2; }
+      hipDeviceProp_t p; hipGetDeviceProperties(&p, 0);
+      float *x, *y; hipMallocManaged(&x, n * 4); hipMallocManaged(&y, n * 4);
+      for (int i = 0; i < n; i++) x[i] = i;
+      axpb<<<(n + 255) / 256, 256>>>(y, x, 2.f, 1.f, n); hipDeviceSynchronize();
+      double m = 0; for (int i = 0; i < n; i++) { double d = y[i] - (2.0 * i + 1); if (d < 0) d = -d; if (d > m) m = d; }
+      printf("devices=%d device0=%s arch=%s axpb n=%d max_abs_err=%g\n", c, p.name, p.gcnArchName, n, m);
+      return m > 0; }
+    HIP
+    hipcc --offload-arch=gfx942 -o /tmp/axpb /tmp/axpb.hip 2>/dev/null
+    /tmp/axpb | tee /out/hip-axpb.txt
+output_dir: "/out"
+env: {}
+params:
+  node_name: fp-mi300x-1
+launch:
+  schema_version: launch-intent/v1
+  approval: auto
+  process: { ranks_per_node: null, threads_per_rank: 1 }
+  cpu: { cores_per_rank: 8, strategy: closest_to_gpu, binding_unit: core,
+         smt: physical_only, allow_overlap: false, explicit_cpu_ids: null }
+  memory: { strategy: local }
+  gpu: { gpus_per_rank: 1, strategy: one_per_rank, ordering: pci_bus,
+         allow_sharing: false, explicit_gpu_uuids: null }
+  validation: { mode: strict, require_preflight: true }

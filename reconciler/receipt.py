@@ -23,6 +23,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .models import gpu_visible_env
 from .placement import LaunchPlan
 
 # Runs ONCE PER RANK, under the same launcher rendering as the benchmark, and
@@ -102,7 +103,7 @@ def _observations_by_rank(observations: list[dict]) -> dict[int, dict]:
 
 
 def _verify_rank(planned, observation: dict | None,
-                 report: dict | None) -> RankVerification:
+                 report: dict | None, vendor: str = "nvidia") -> RankVerification:
     mismatches: list[str] = []
     notes: list[str] = []
 
@@ -146,15 +147,19 @@ def _verify_rank(planned, observation: dict | None,
     if report is not None and report.get("bound") is False and planned.cpu_ids:
         mismatches.append(f"the launcher reported this rank as not bound: {report['claim']}")
 
-    observed_raw = (observation.get("cuda_visible_devices") or "").strip() or None
+    # The variable the launcher set for this rank's vendor (CUDA_VISIBLE_DEVICES
+    # or ROCR_VISIBLE_DEVICES); placement-probe.sh records each under its own
+    # lower-cased name.
+    visible_var = gpu_visible_env(vendor)
+    observed_raw = (observation.get(visible_var.lower()) or "").strip() or None
     observed_gpus = tuple(u.strip() for u in (observed_raw or "").split(",") if u.strip())
     if planned.gpu_uuids:
-        # Order-sensitive: CUDA_VISIBLE_DEVICES order IS the visible-index
+        # Order-sensitive: the visible-devices order IS the visible-index
         # order the plan promised, not just set membership.
         if observed_gpus != planned.gpu_uuids:
             mismatches.append(
                 f"planned GPU(s) {list(planned.gpu_uuids)} but the rank was given "
-                f"CUDA_VISIBLE_DEVICES={observed_raw!r}")
+                f"{visible_var}={observed_raw!r}")
         driver = {d.strip() for d in (observation.get("driver_gpu_uuids") or "").split(",")
                  if d.strip()}
         missing = [u for u in planned.gpu_uuids if u not in driver]
@@ -183,7 +188,8 @@ def _verify_rank(planned, observation: dict | None,
 
 def build_receipt(plan: LaunchPlan, observations: list[dict], *,
                   binding_report: str | None = None,
-                  preflight_ran: bool = True) -> LaunchReceipt:
+                  preflight_ran: bool = True,
+                  gpu_vendors: dict[str, str] | None = None) -> LaunchReceipt:
     """Reconcile a plan against what its ranks reported. Never raises.
 
     Failure is DATA here, not an exception: a mismatched receipt is exactly the
@@ -194,6 +200,10 @@ def build_receipt(plan: LaunchPlan, observations: list[dict], *,
     reason `unverified` exists as a status distinct from `mismatched`. Nothing
     contradicted the plan, but nothing confirmed it either — reporting that as a
     mismatch would cry wolf, and reporting it as verified would be a lie.
+
+    `gpu_vendors` maps node name -> GPU vendor; a rank on an AMD node is checked
+    against ROCR_VISIBLE_DEVICES instead of CUDA_VISIBLE_DEVICES. None (every
+    caller before vendors existed) = all NVIDIA.
     """
     keyed = _observations_by_rank(observations)
     report = parse_binding_report(binding_report)
@@ -216,7 +226,9 @@ def build_receipt(plan: LaunchPlan, observations: list[dict], *,
             sources={"observations": 0, "planned_ranks": len(plan.ranks),
                      "binding_report": bool(report), "preflight_ran": False})
 
-    ranks = tuple(_verify_rank(p, keyed.get(p.global_rank), report.get(p.global_rank))
+    vendors = gpu_vendors or {}
+    ranks = tuple(_verify_rank(p, keyed.get(p.global_rank), report.get(p.global_rank),
+                               vendors.get(p.node) or "nvidia")
                   for p in plan.ranks)
 
     mismatches = [f"rank {r.global_rank}: {m}" for r in ranks for m in r.mismatches]
@@ -250,5 +262,11 @@ def build_receipt(plan: LaunchPlan, observations: list[dict], *,
             # Neither confirms the application enumerated it at a given index —
             # that needs a CUDA runtime in the container, which is not assumed.
             "gpu_visibility_verified_by": "env + driver enumeration, not CUDA",
+            # Which variable each node's ranks were checked against — only
+            # recorded when some node is not NVIDIA, so an all-NVIDIA receipt
+            # is unchanged.
+            **({"gpu_visibility_env": {node: gpu_visible_env(v)
+                                       for node, v in sorted(vendors.items())}}
+               if any((v or "nvidia") != "nvidia" for v in vendors.values()) else {}),
         },
     )

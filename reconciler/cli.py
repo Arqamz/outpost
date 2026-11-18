@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 from .adapter import REPO_ROOT, LIBVIRT_DIR, job_log_path
-from .models import JobSpec, NodeRecord
+from .models import GPU_VENDORS, JobSpec, NodeRecord, normalize_gpu_vendor
 from .reconciler import Reconciler, GLOBAL_LOG, clear_jobs
 from .states import NodeState
 from .store import open_store
@@ -225,6 +225,8 @@ def cmd_nodes(args):
             extra += f" ctx={n.kube_context}"
         if n.gpu_binds:
             extra += f" binds={n.gpu_binds}"
+        if n.gpu and n.gpu_vendor != "nvidia":
+            extra += f" vendor={n.gpu_vendor}"
         print(f"{n.name:<16} idx={n.index} {n.ip:<15} {n.state:<12} "
               f"{caps:<10} {n.adapter_key:<11} {n.runtime:<10} owner={n.owner_job or '-'}{extra}")
 
@@ -292,6 +294,25 @@ def _probe_host_memory(ip: str, user: str, key: str) -> int:
         return 0
 
 
+def _probe_gpu_vendor(ip: str, user: str, key: str) -> str:
+    """Which GPU stack the node has, read from the node itself: "nvidia" when
+    nvidia-smi can list a GPU, else "amd" when amd-smi can, else "" (nothing
+    detected / unreachable). NVIDIA is checked first so a box with both tools
+    keeps today's behaviour. Like _probe_host_memory, failure is not an error."""
+    import subprocess
+    from .adapter import ssh_base
+    script = ("if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q '^GPU'; "
+              "then echo nvidia; elif command -v amd-smi >/dev/null 2>&1 && "
+              "amd-smi list --csv 2>/dev/null | grep -q '^[0-9]'; then echo amd; fi")
+    try:
+        out = subprocess.run([*ssh_base(ip, user or None, key or None), script],
+                             capture_output=True, text=True, timeout=60)
+        v = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+        return v if v in GPU_VENDORS else ""
+    except Exception:
+        return ""
+
+
 def cmd_add_node(args):
     """Register a pre-provisioned, already-running ssh host (e.g. an EC2
     instance) as a worker, from a YAML manifest (see node.ec2.example.yaml).
@@ -309,6 +330,21 @@ def cmd_add_node(args):
     if store.get_node(d["name"]):
         sys.exit(f"node already registered: {d['name']} (remove it first, or pick another name)")
     key = d.get("ssh_key", "") or ""
+    # gpu_vendor: stated in the manifest, else (for a GPU node) detected on the
+    # node, else nvidia — the default every node had before vendors existed.
+    vendor_note = ""
+    if d.get("gpu_vendor"):
+        try:
+            gpu_vendor = normalize_gpu_vendor(str(d["gpu_vendor"]))
+        except ValueError as e:
+            sys.exit(f"node spec {args.spec}: {e}")
+    elif d.get("gpu"):
+        detected = _probe_gpu_vendor(str(d["ip"]), d.get("ssh_user", "") or "",
+                                     os.path.expanduser(key) if key else "")
+        gpu_vendor = detected or "nvidia"
+        vendor_note = " detected" if detected else " (default; nothing detected)"
+    else:
+        gpu_vendor = "nvidia"
     node = NodeRecord(
         node_id=d["name"], name=d["name"], index=-1, ip=str(d["ip"]),
         state=NodeState.AVAILABLE.value, gpu=bool(d.get("gpu", False)), local=False,
@@ -318,6 +354,7 @@ def cmd_add_node(args):
         # gpu_binds: this node's OWN `apptainer --nv` driver binds (a NixOS GPU
         # worker needs /nix/store,/run/opengl-driver; Ubuntu leaves it empty).
         gpu_binds=d.get("gpu_binds", "") or "",
+        gpu_vendor=gpu_vendor,
         # cluster_ip: the address PEER ranks use for MPI (see
         # NodeRecord.mpi_ip) when it differs from `ip` (the orchestrator's ssh
         # target) — e.g. a NAT'd cloud where `ip` is a public address never
@@ -334,6 +371,7 @@ def cmd_add_node(args):
     print(f"added static-ssh node {node.name} at {node.ip} "
           f"({'gpu' if node.gpu else 'cpu'}, ssh {node.ssh_user or '<cluster-default>'}"
           f"@{node.ip} key={node.ssh_key or '<cluster-default>'}, runtime {node.runtime}"
+          f"{f', gpu_vendor={node.gpu_vendor}{vendor_note}' if node.gpu else ''}"
           f"{f', gpu_binds={node.gpu_binds}' if node.gpu_binds else ''}"
           f"{f', cluster_ip={node.cluster_ip} (MPI-facing)' if node.cluster_ip else ''}"
           f", host_memory="

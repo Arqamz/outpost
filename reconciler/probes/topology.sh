@@ -160,6 +160,25 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   # GPU-to-GPU link class — which is what an NCCL collective actually rides — and
   # its NIC rows are what a later `closest_to_nic` policy will read.
   topo_matrix="$(nvidia-smi topo -m 2>/dev/null || true)"
+elif command -v amd-smi >/dev/null 2>&1; then
+  # ── AMD (ROCm) GPUs ─────────────────────────────────────────────────────
+  # amd-smi speaks JSON, but parsing JSON in POSIX sh is exactly the kind of
+  # guess this probe avoids, so its three views are captured VERBATIM and
+  # topology.py turns them into the same `gpus` shape the NVIDIA path emits
+  # (where the parsing can be unit-tested against fixtures from a real node).
+  # sysfs supplies what amd-smi does not report here: each device's NUMA node
+  # and the kernel's own list of CPUs local to it (local_cpulist), keyed by
+  # the PCI address amd-smi's CSV listing gives.
+  gpu_vendor="amd"
+  amd_list="$(amd-smi list --json 2>/dev/null || true)"
+  amd_static="$(amd-smi static --asic --bus --vram --json 2>/dev/null || true)"
+  amd_topology="$(amd-smi topology --json 2>/dev/null || true)"
+  amd_pci=""
+  for bdf in $(amd-smi list --csv 2>/dev/null | awk -F, 'NR>1 && $2 != "" {print $2}'); do
+    d="/sys/bus/pci/devices/$(printf '%s' "$bdf" | tr 'A-Z' 'a-z')"
+    amd_pci="${amd_pci}${bdf} $(read_first "$d/numa_node") $(read_first "$d/local_cpulist")
+"
+  done
 fi
 
 # ── the launcher that will actually place the ranks ───────────────────────
@@ -186,4 +205,10 @@ printf '"gpus":[%s],' "$gpus"
 printf '"topo_matrix":%s,' "$(jblob "$topo_matrix")"
 printf '"launcher":{"type":%s,"version":%s}' \
   "$(jstr "$launcher_type")" "$(jstr "$launcher_version")"
+# AMD-only keys, so an NVIDIA node's probe output is unchanged.
+if [ "${gpu_vendor:-}" = "amd" ]; then
+  printf ',"gpu_vendor":"amd","amd_smi":{"list":%s,"static":%s,"topology":%s,"pci":%s}' \
+    "$(jblob "$amd_list")" "$(jblob "$amd_static")" "$(jblob "$amd_topology")" \
+    "$(jblob "$amd_pci")"
+fi
 printf '}\n'
